@@ -9,37 +9,115 @@ pub struct VulkanCore {
     pub instance: ash::Instance,
 }
 
-// A helper for scoring a device's dedication to graphics processing.
-fn score_device_type(device_type: ash::vk::PhysicalDeviceType) -> u8 {
-    match device_type {
-        ash::vk::PhysicalDeviceType::DISCRETE_GPU => 4,
-        ash::vk::PhysicalDeviceType::INTEGRATED_GPU => 3,
-        ash::vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
-        ash::vk::PhysicalDeviceType::CPU => 1,
-        _ => 0,
+/// Query the extended properties of a physical device to determine if it supports ray tracing.
+//  TODO: Consider refactoring to allow chaining of device features before performing the final query.
+pub fn physical_supports_rtx(
+    instance: &ash::Instance,
+    physical_device: ash::vk::PhysicalDevice,
+) -> Option<ash::vk::PhysicalDeviceRayTracingPipelinePropertiesKHR> {
+    // Query the physical device for ray tracing support features.
+    let mut ray_query = ash::vk::PhysicalDeviceRayQueryFeaturesKHR::default();
+    let mut ray_tracing = ash::vk::PhysicalDeviceRayTracingPipelineFeaturesKHR {
+        p_next: &mut ray_query as *mut _ as *mut std::ffi::c_void,
+        ..Default::default()
+    };
+    let mut acceleration_structure = ash::vk::PhysicalDeviceAccelerationStructureFeaturesKHR {
+        p_next: &mut ray_tracing as *mut _ as *mut std::ffi::c_void,
+        ..Default::default()
+    };
+    let mut features = ash::vk::PhysicalDeviceFeatures2 {
+        p_next: &mut acceleration_structure as *mut _ as *mut std::ffi::c_void,
+        ..Default::default()
+    };
+    unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
+
+    // If the physical device supports ray tracing, return the ray tracing pipeline properties.
+    if acceleration_structure.acceleration_structure > 0
+        && ray_tracing.ray_tracing_pipeline > 0
+        && ray_query.ray_query > 0
+    {
+        let mut ray_tracing_pipeline =
+            ash::vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
+        let mut properties = ash::vk::PhysicalDeviceProperties2 {
+            p_next: (&mut ray_tracing_pipeline) as *mut _ as *mut std::ffi::c_void,
+            ..Default::default()
+        };
+        unsafe { instance.get_physical_device_properties2(physical_device, &mut properties) };
+        Some(ray_tracing_pipeline)
+    } else {
+        None
     }
 }
 
-/// Try to find the best physical device for the application.
-pub fn find_best_physical_device(
+/// Get all physical devices that support Vulkan 1.3 and the required extensions. Sort them by their likelyhood of being the desired device.
+//  TODO: Investigate if `enumerate_physical_devices` can be replaced with something I can pass a `SmallVec` ref to.
+pub fn get_physical_devices(
     instance: &ash::Instance,
-    required_device_extensions: &[*const i8],
-) -> Option<ash::vk::PhysicalDevice> {
-    let mut physical_devices = unsafe {
+    required_extensions: &[*const i8],
+) -> SmallVec<[(ash::vk::PhysicalDevice, ash::vk::PhysicalDeviceProperties); 4]> {
+    /// A helper for scoring a device's dedication to graphics processing.
+    fn score_device_type(device_type: ash::vk::PhysicalDeviceType) -> u8 {
+        match device_type {
+            ash::vk::PhysicalDeviceType::DISCRETE_GPU => 4,
+            ash::vk::PhysicalDeviceType::INTEGRATED_GPU => 3,
+            ash::vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+            ash::vk::PhysicalDeviceType::CPU => 1,
+            _ => 0,
+        }
+    }
+
+    // Get all physical devices that support Vulkan 1.3.
+    let physical_devices = unsafe {
         instance
             .enumerate_physical_devices()
             .expect("Unable to enumerate physical devices")
-    }
-    .into_iter()
-    .map(|device| unsafe { (device, instance.get_physical_device_properties(device)) })
-    .collect::<Vec<_>>();
+    };
+
+    let mut physical_devices = physical_devices
+        .into_iter()
+        .filter_map(|device| {
+            // Query basic properties of the physical device.
+            let properties = unsafe { instance.get_physical_device_properties(device) };
+
+            // Ensure every device has their properties printed in debug mode. Called before filtering starts.
+            #[cfg(debug_assertions)]
+            println!("Physical device {device:?}: {properties:?}");
+
+            // Ensure the device supports Vulkan 1.3.
+            if properties.api_version < ash::vk::API_VERSION_1_3 {
+                return None;
+            }
+
+            // Query for the basic extensions of the physical device.
+            let extensions = unsafe {
+                instance
+                    .enumerate_device_extension_properties(device)
+                    .expect("Unable to enumerate device extensions")
+            };
+
+            // Ensure the device supports all required extensions.
+            if required_extensions.iter().all(|&req| {
+                let req = unsafe { CStr::from_ptr(req) };
+                extensions.iter().any(|e| {
+                    e.extension_name_as_c_str()
+                        .expect("Available extension name is not a valid C string")
+                        == req
+                })
+            }) {
+                Some((device, properties))
+            } else {
+                None
+            }
+        })
+        .collect::<SmallVec<[(ash::vk::PhysicalDevice, ash::vk::PhysicalDeviceProperties); 4]>>();
 
     // Sort the physical devices by the device type with preference for GPU's, then descending by graphics dedication.
-    // If device types are equivalent, then sort by the maximum push constants size, since this is both practical and indicative of performance.
     physical_devices.sort_by(|(_, a), (_, b)| {
-        // Sorting order is reversed to get the best device first.
+        // Sorting order is reversed (`b.cmp(a)`) to sort the highest scoring device first.
         let device_type_cmp =
             score_device_type(b.device_type).cmp(&score_device_type(a.device_type));
+
+        // If device types are equivalent, then sort by the maximum push constants size.
         if device_type_cmp == std::cmp::Ordering::Equal {
             b.limits
                 .max_push_constants_size
@@ -49,40 +127,16 @@ pub fn find_best_physical_device(
         }
     });
 
-    // Find the first physical device that supports the required extensions and API.
     physical_devices
-        .into_iter()
-        .find_map(|(device, properties)| {
-            if properties.api_version < ash::vk::API_VERSION_1_3 {
-                return None;
-            }
-
-            let extensions = unsafe {
-                instance
-                    .enumerate_device_extension_properties(device)
-                    .expect("Unable to enumerate device extensions")
-            };
-
-            if required_device_extensions.iter().all(|&req| {
-                let req = unsafe { CStr::from_ptr(req) };
-                extensions.iter().any(|e| {
-                    e.extension_name_as_c_str()
-                        .expect("Available extension name is not a valid C string")
-                        == req
-                })
-            }) {
-                Some(device)
-            } else {
-                None
-            }
-        })
 }
 
 /// Available queue family types and their indices.
+/// Also, a map of queue family indices to the number of queues that may be and are currently allocated.
 pub struct QueueFamilies {
     pub graphics: Option<u32>,
     pub compute: Option<u32>,
     pub present: Option<u32>,
+    pub queue_families: Vec<ash::vk::QueueFamilyProperties>,
 }
 
 #[derive(strum_macros::EnumCount)]
@@ -108,27 +162,17 @@ pub fn new_device(
             .get_physical_device_queue_family_properties(physical_device)
     };
 
+    #[cfg(debug_assertions)]
+    println!("Queue families: {queue_families:?}");
+
     // Find the first queue families for each desired queue type.
     // Use an array with indices to allow compile-time guarantees about the number of queue types.
     // TODO: Consider maintaining a list of queue family indices for each type of queue.
+    //       This will also make it easier to put different queue types on different families if they are available.
+    // TODO: Make this logic its own function.
     let mut all_queue_families = [None; QueueType::COUNT];
     for (family_index, queue_family) in queue_families.iter().enumerate() {
-        if all_queue_families[QueueType::Graphics as usize].is_none()
-            && queue_family
-                .queue_flags
-                .contains(ash::vk::QueueFlags::GRAPHICS)
-        {
-            all_queue_families[QueueType::Graphics as usize] = Some(family_index as u32);
-        }
-
-        if all_queue_families[QueueType::Compute as usize].is_none()
-            && queue_family
-                .queue_flags
-                .contains(ash::vk::QueueFlags::COMPUTE)
-        {
-            all_queue_families[QueueType::Compute as usize] = Some(family_index as u32);
-        }
-
+        // Get a present queue family.
         if all_queue_families[QueueType::Present as usize].is_none() {
             let is_present_supported = unsafe {
                 ash::khr::surface::Instance::new(&vulkan.api, &vulkan.instance)
@@ -142,6 +186,24 @@ pub fn new_device(
             if is_present_supported {
                 all_queue_families[QueueType::Present as usize] = Some(family_index as u32);
             }
+        }
+
+        // Get a graphics queue family.
+        if all_queue_families[QueueType::Graphics as usize].is_none()
+            && queue_family
+                .queue_flags
+                .contains(ash::vk::QueueFlags::GRAPHICS)
+        {
+            all_queue_families[QueueType::Graphics as usize] = Some(family_index as u32);
+        }
+
+        // Get a compute queue family.
+        if all_queue_families[QueueType::Compute as usize].is_none()
+            && queue_family
+                .queue_flags
+                .contains(ash::vk::QueueFlags::COMPUTE)
+        {
+            all_queue_families[QueueType::Compute as usize] = Some(family_index as u32);
         }
 
         // Break early if all families are found.
@@ -159,7 +221,7 @@ pub fn new_device(
         .expect("Unable to find a present queue family");
 
     // Aggregate queue family indices and count the number of queues each family may need allocated.
-    let mut family_map = SmallVec::<[u32; 16]>::from_elem(0, queue_families.len());
+    let mut family_map = SmallVec::<[u32; 8]>::from_elem(0, queue_families.len());
     let all_family_types = [graphics_family, compute_family, present_family];
     for family in all_family_types {
         family_map[family as usize] += 1;
@@ -176,7 +238,7 @@ pub fn new_device(
         );
     }
 
-    // Describe the queue families that will be used.
+    // Describe the queue families that will be used with the new logical device.
     let queue_info = family_map
         .iter()
         .enumerate()
@@ -194,17 +256,15 @@ pub fn new_device(
         })
         .collect::<Vec<_>>();
 
-    // Describe the device extensions that will be used, along with queue info.
-    let device_info = ash::vk::DeviceCreateInfo {
-        queue_create_info_count: queue_info.len() as u32,
-        p_queue_create_infos: queue_info.as_ptr(),
-        enabled_extension_count: device_extensions.len() as u32,
-        pp_enabled_extension_names: device_extensions.as_ptr(),
-        ..Default::default()
-    };
-
     // Create the logical device with the desired queue families and extensions.
     let device = unsafe {
+        let device_info = ash::vk::DeviceCreateInfo {
+            queue_create_info_count: queue_info.len() as u32,
+            p_queue_create_infos: queue_info.as_ptr(),
+            enabled_extension_count: device_extensions.len() as u32,
+            pp_enabled_extension_names: device_extensions.as_ptr(),
+            ..Default::default()
+        };
         vulkan
             .instance
             .create_device(physical_device, &device_info, None)
@@ -217,6 +277,7 @@ pub fn new_device(
             graphics: Some(graphics_family),
             compute: Some(compute_family),
             present: Some(present_family),
+            queue_families,
         },
     )
 }

@@ -7,14 +7,24 @@ const DEFAULT_WINDOWS_SIZE: winit::dpi::LogicalSize<f32> = winit::dpi::LogicalSi
 
 mod utils;
 
+// Store the SPIR-V representation of the shaders in the binary.
+mod shaders {
+    pub const VERTEX: &'static [u32] =
+        inline_spirv::include_spirv!("src/shaders/bb_triangle_vert.glsl", vert, glsl);
+    pub const FRAGMENT: &'static [u32] =
+        inline_spirv::include_spirv!("src/shaders/bb_triangle_frag.glsl", frag, glsl);
+}
+
 fn main() {
-    // Initialize the manager of the event loop and windowing.
+    // Initialize `event_loop`, the manager of windowing and related events.
     let event_loop = winit::event_loop::EventLoop::<PompeiiEvent>::with_user_event()
         .build()
         .expect("Unable to initialize winit event loop");
+
+    // Attempt to dynamically load the Vulkan API from platform-specific shared libraries.
     let vulkan_api = unsafe { ash::Entry::load().expect("Unable to load Vulkan libraries") };
 
-    // Get Vulkan extensions required by the windowing system. Platform-specific windowing extensions are determined.
+    // Get Vulkan extensions required by the windowing system, including platform-specific ones.
     let mut extension_names = ash_window::enumerate_required_extensions(
         event_loop
             .display_handle()
@@ -23,6 +33,9 @@ fn main() {
     )
     .expect("Unable to enumerate required extensions for the window")
     .to_vec();
+
+    // Add the ability to check and specify additional device features. This is required for ray-tracing.
+    extension_names.push(ash::khr::get_physical_device_properties2::NAME.as_ptr());
 
     // Add the debug utility extension if in debug mode.
     #[cfg(debug_assertions)]
@@ -47,6 +60,38 @@ fn main() {
         }
     }
 
+    // Enable validation layers when using a debug build.
+    #[cfg(debug_assertions)]
+    let layer_names = {
+        // Enable the main validation layer from the Khronos Group when using a debug build.
+        const DEBUG_LAYERS: [*const i8; 1] = [c"VK_LAYER_KHRONOS_validation".as_ptr()];
+
+        // Check which layers are available at runtime.
+        let available_layers = unsafe {
+            vulkan_api
+                .enumerate_instance_layer_properties()
+                .expect("Unable to enumerate available Vulkan layers")
+        };
+        println!("Available layers: {available_layers:?}");
+
+        // Check that all the desired debug layers are available.
+        if DEBUG_LAYERS.iter().all(|&d| {
+            available_layers.iter().any(|a| {
+                a.layer_name_as_c_str()
+                    .expect("Available layer name is not a valid C string")
+                    == unsafe { CStr::from_ptr(d) }
+            })
+        }) {
+            DEBUG_LAYERS
+        } else {
+            panic!("Required debug layers are not available");
+        }
+    };
+    // Disable validation layers when using a release build.
+    #[cfg(not(debug_assertions))]
+    let layer_names = [];
+
+    // Create a Vulkan instance with the given extensions and layers.
     let vulkan_instance = {
         let application_info = ash::vk::ApplicationInfo {
             p_application_name: c"Pompeii".as_ptr().cast(),
@@ -56,32 +101,6 @@ fn main() {
             ..Default::default()
         };
         let instance_info = {
-            #[cfg(debug_assertions)]
-            let available_layers = unsafe {
-                vulkan_api
-                    .enumerate_instance_layer_properties()
-                    .expect("Unable to enumerate available Vulkan layers")
-            };
-            #[cfg(debug_assertions)]
-            let layer_names = {
-                const DEBUG_LAYERS: [*const i8; 1] = [c"VK_LAYER_KHRONOS_validation".as_ptr()];
-
-                // Check that all the debug layers are available.
-                if DEBUG_LAYERS.iter().all(|&d| {
-                    available_layers.iter().any(|a| {
-                        a.layer_name_as_c_str()
-                            .expect("Available layer name is not a valid C string")
-                            == unsafe { CStr::from_ptr(d) }
-                    })
-                }) {
-                    DEBUG_LAYERS
-                } else {
-                    panic!("Required debug layers are not available");
-                }
-            };
-            #[cfg(not(debug_assertions))]
-            let layer_names = [];
-
             ash::vk::InstanceCreateInfo {
                 p_application_info: &application_info,
                 enabled_layer_count: layer_names.len() as u32,
@@ -113,6 +132,8 @@ fn create_window(
     let window_attributes: winit::window::WindowAttributes =
         winit::window::Window::default_attributes()
             .with_title(title)
+            .with_enabled_buttons(winit::window::WindowButtons::CLOSE | winit::window::WindowButtons::MINIMIZE)
+            .with_resizable(false) // TODO: Support window resizing (swapchain recreation).
             .with_inner_size(size);
     event_loop.create_window(window_attributes)
 }
@@ -176,9 +197,14 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
             };
 
             // Use simple heuristics to find the best suitable physical device.
-            let physical_device =
-                utils::find_best_physical_device(&self.vulkan.instance, &DEVICE_EXTENSIONS)
-                    .expect("Unable to find a suitable physical device");
+            let physical_device = {
+                let devices =
+                    utils::get_physical_devices(&self.vulkan.instance, &DEVICE_EXTENSIONS);
+                devices
+                    .first()
+                    .expect("Unable to find a suitable physical device")
+                    .0
+            };
 
             // Create a logical device capable of rendering to the surface and performing compute.
             let (device, queue_families) =
@@ -187,6 +213,7 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
                 graphics: Some(graphics),
                 compute: Some(compute),
                 present: Some(present),
+                ..
             } = queue_families
             else {
                 panic!("Unable to find suitable queue families");
