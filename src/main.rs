@@ -40,10 +40,6 @@ fn create_window(
     let window_attributes: winit::window::WindowAttributes =
         winit::window::Window::default_attributes()
             .with_title(title)
-            .with_enabled_buttons(
-                winit::window::WindowButtons::CLOSE | winit::window::WindowButtons::MINIMIZE,
-            )
-            .with_resizable(false) // TODO: Support window resizing (swapchain recreation).
             .with_inner_size(size);
     event_loop.create_window(window_attributes)
 }
@@ -362,6 +358,40 @@ impl PompeiiApp {
             Err(e) => panic!("Unable to present swapchain image: {:?}", e),
         }
     }
+
+    fn handle_keyboard_input(&mut self, key_event: winit::event::KeyEvent) {
+        let PompeiiState::Windowed { window, .. } = &mut self.state else {
+            return;
+        };
+
+        // Handle keyboard input events.
+        let winit::event::KeyEvent {
+            state,
+            logical_key: key,
+            ..
+        } = key_event;
+        if state == winit::event::ElementState::Pressed {
+            match key.as_ref() {
+                winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) => {
+                    if matches!(window.fullscreen(), Some(_)) {
+                        // Exit fullscreen mode.
+                        window.set_fullscreen(None);
+                    }
+                }
+                winit::keyboard::Key::Character("f")
+                | winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11) => {
+                    if matches!(window.fullscreen(), Some(_)) {
+                        // Exit fullscreen mode.
+                        window.set_fullscreen(None);
+                    } else {
+                        // Enter fullscreen mode in borderless mode, defaulting to the active monitor.
+                        window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                    }
+                }
+                _ => (),
+            }
+        }
+    }
 }
 
 /// Create a `winit` compliant interface for managing the application state.
@@ -465,6 +495,8 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
             );
 
             // Create a pool for allocating new commands.
+            // NOTE: https://developer.nvidia.com/blog/vulkan-dos-donts/ Recommends `image_count * recording_thread_count` many command pools for optimal command buffer allocation.
+            //       However, we currently only reuse existing command buffers and do not need to allocate new ones.
             let command_pool = unsafe {
                 logical_device
                     .create_command_pool(
@@ -563,6 +595,11 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
 
             // Redraw the window surface when requested.
             winit::event::WindowEvent::RedrawRequested => self.redraw(),
+
+            // Handle keyboard input events.
+            winit::event::WindowEvent::KeyboardInput { event, .. } => {
+                self.handle_keyboard_input(event)
+            }
 
             // Ignore other events.
             _ => (),
