@@ -134,6 +134,8 @@ impl PompeiiApp {
         self.tick_count += 1;
 
         // Check that the current window size won't affect rendering.
+        // TODO: Consider catching window resizes and minimizes as events, then checking for a flag here.
+        //       This would reduce CPU overhead in the draw loop.
         {
             let window_size = window.inner_size();
             let swapchain_size = swapchain.extent();
@@ -244,6 +246,8 @@ impl PompeiiApp {
                 .expect("Unable to begin command buffer");
         }
 
+        let extent = swapchain.extent();
+
         // Begin the render pass for the current frame.
         unsafe {
             renderer.logical_device.cmd_begin_render_pass(
@@ -253,13 +257,37 @@ impl PompeiiApp {
                     framebuffer: renderer.framebuffers[image_index as usize],
                     render_area: ash::vk::Rect2D {
                         offset: ash::vk::Offset2D::default(),
-                        extent: swapchain.extent(),
+                        extent,
                     },
                     clear_value_count: 1,
                     p_clear_values: &ash::vk::ClearValue::default(),
                     ..Default::default()
                 },
                 ash::vk::SubpassContents::INLINE,
+            );
+        }
+
+        // Set the viewport and scissor since we specified they would be set dynamically.
+        unsafe {
+            renderer.logical_device.cmd_set_viewport(
+                command_buffer,
+                0,
+                &[ash::vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: extent.width as f32,
+                    height: extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            renderer.logical_device.cmd_set_scissor(
+                command_buffer,
+                0,
+                &[ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D::default(),
+                    extent,
+                }],
             );
         }
 
@@ -487,7 +515,6 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
 
             // Create the graphics pipeline that will be used to render the application.
             let graphics_pipeline = engine::create_graphics_pipeline(
-                &swapchain,
                 &logical_device,
                 vertex_module,
                 fragment_module,

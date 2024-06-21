@@ -148,7 +148,6 @@ pub fn create_framebuffer(
 
 /// Create the graphics pipeline capable of rendering this application's scene.
 pub fn create_graphics_pipeline(
-    swapchain: &utils::Swapchain,
     device: &ash::Device,
     vertex_module: ash::vk::ShaderModule,
     fragment_module: ash::vk::ShaderModule,
@@ -181,25 +180,10 @@ pub fn create_graphics_pipeline(
         ..Default::default()
     };
 
-    // Define the viewport rectangle that this pipeline will render to.
-    let extent = swapchain.extent();
-    let viewport = ash::vk::Viewport {
-        x: 0.,
-        y: 0.,
-        width: extent.width as f32,
-        height: extent.height as f32,
-        min_depth: 0.,
-        max_depth: 1.,
-    };
-    let scissor = ash::vk::Rect2D {
-        offset: ash::vk::Offset2D::default(),
-        extent,
-    };
+    // Define a dynamic viewport and scissor will be used with this pipeline.
     let viewport_state = ash::vk::PipelineViewportStateCreateInfo {
         viewport_count: 1,
-        p_viewports: &viewport,
         scissor_count: 1,
-        p_scissors: &scissor,
         ..Default::default()
     };
 
@@ -257,6 +241,11 @@ pub fn create_graphics_pipeline(
     //     ..Default::default()
     // };
 
+    let dynamic_states = [
+        ash::vk::DynamicState::VIEWPORT,
+        ash::vk::DynamicState::SCISSOR,
+    ];
+
     *unsafe {
         device.create_graphics_pipelines(
             ash::vk::PipelineCache::null(),
@@ -270,7 +259,11 @@ pub fn create_graphics_pipeline(
                 p_multisample_state: &multisampling,
                 p_depth_stencil_state: &depth_stencil_state,
                 p_color_blend_state: &color_blending,
-                p_dynamic_state: &ash::vk::PipelineDynamicStateCreateInfo::default(), // TODO: Allow for the extent to have a dynamic state.
+                p_dynamic_state: &ash::vk::PipelineDynamicStateCreateInfo {
+                    dynamic_state_count: dynamic_states.len() as u32,
+                    p_dynamic_states: dynamic_states.as_ptr(),
+                    ..Default::default()
+                },
                 layout: pipeline_layout,
                 render_pass,
                 subpass: 0, // Optional, but a good reminder that pipelines are associated with a subpass.
