@@ -121,6 +121,31 @@ pub fn create_render_pass(
     .expect("Unable to create the application render pass")
 }
 
+/// Create a framebuffer that can be used with this render pass.
+pub fn create_framebuffer(
+    device: &ash::Device,
+    render_pass: ash::vk::RenderPass,
+    image_view: &ash::vk::ImageView,
+    extent: ash::vk::Extent2D,
+) -> ash::vk::Framebuffer {
+    let ash::vk::Extent2D { width, height } = extent;
+    unsafe {
+        device.create_framebuffer(
+            &ash::vk::FramebufferCreateInfo {
+                render_pass,
+                attachment_count: 1,
+                p_attachments: image_view,
+                width,
+                height,
+                layers: 1,
+                ..Default::default()
+            },
+            None,
+        )
+    }
+    .expect("Unable to create framebuffer")
+}
+
 /// Create the graphics pipeline capable of rendering this application's scene.
 pub fn create_graphics_pipeline(
     swapchain: &utils::Swapchain,

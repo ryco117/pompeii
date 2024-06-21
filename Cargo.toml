@@ -6,9 +6,12 @@ edition = "2021"
 [dependencies]
 ash = "0.38"
 ash-window = "0.13"
-inline-spirv = "0.2.1"
+clap = "4.5"
+gpu-allocator = "0.26.0" # Determine whether this is preferrable to vk-mem, the AMD implementation in C
+inline-spirv = "0.2"
 shaderc = "0.8"
 smallvec = "1.13"
 strum = "0.26"
 strum_macros = "0.26"
+vk-mem = "0.4"
 winit = "0.30"

@@ -3,7 +3,16 @@ use std::{ffi::CStr, num::NonZeroU32};
 use smallvec::SmallVec;
 use strum::EnumCount as _;
 
+/// Set a sane value for the maximum expected number of queue families.
+/// A heap allocation is required if the number of queue families exceeds this value.
 const EXPECTED_MAX_QUEUE_FAMILIES: usize = 8;
+
+/// Set a sane value for the maximum expected number of instance extensions.
+/// A heap allocation is required if the number of instance extensions exceeds this value.
+const EXPECTED_MAX_INSTANCE_EXTENSIONS: usize = 16;
+
+/// The number of nanoseconds in five seconds.
+pub const FIVE_SECONDS_IN_NANOSECONDS: u64 = 5_000_000_000;
 
 /// The main Vulkan library interface. Contains the entry to the Vulkan library and an instance for this app.
 pub struct VulkanCore {
@@ -34,7 +43,7 @@ impl VulkanCore {
                 panic!("Required extension {ext:?} is not available. All extensions: {available_extensions:?}");
             }
         }
-        let extension_name_ptrs: SmallVec<[*const i8; 16]> =
+        let extension_name_pointers: SmallVec<[*const i8; EXPECTED_MAX_INSTANCE_EXTENSIONS]> =
             extension_names.iter().map(|&e| e.as_ptr()).collect();
 
         // Enable validation layers when using a debug build.
@@ -82,8 +91,8 @@ impl VulkanCore {
                     p_application_info: &application_info,
                     enabled_layer_count: layer_names.len() as u32,
                     pp_enabled_layer_names: layer_names.as_ptr(),
-                    enabled_extension_count: extension_name_ptrs.len() as u32,
-                    pp_enabled_extension_names: extension_name_ptrs.as_ptr(),
+                    enabled_extension_count: extension_name_pointers.len() as u32,
+                    pp_enabled_extension_names: extension_name_pointers.as_ptr(),
                     ..Default::default()
                 }
             };
@@ -482,6 +491,7 @@ pub struct Swapchain {
     images: Vec<ash::vk::Image>,
     image_views: Vec<ash::vk::ImageView>,
     format: ash::vk::Format,
+    color_space: ash::vk::ColorSpaceKHR,
     present_mode: ash::vk::PresentModeKHR,
     extent: ash::vk::Extent2D,
     image_available: ash::vk::Semaphore,
@@ -500,6 +510,7 @@ impl Swapchain {
         preferred_format: Option<ash::vk::Format>,
         preferred_color_space: Option<ash::vk::ColorSpaceKHR>,
         preferred_present_mode: Option<ash::vk::PresentModeKHR>,
+        old_swapchain: Option<ash::vk::SwapchainKHR>,
     ) -> Self {
         let khr_instance = ash::khr::surface::Instance::new(&vulkan.api, &vulkan.instance);
         let surface_capabilities = unsafe {
@@ -561,8 +572,7 @@ impl Swapchain {
                         Some((mode, min_images.max(2)))
                     }
 
-                    // More exotic present mode.
-                    // TODO: Figure out how many images are needed for each other mode.
+                    // No other named present modes currently exist, unknown how to handle them.
                     _ => None,
                 }
             })
@@ -574,6 +584,10 @@ impl Swapchain {
                 .get_physical_device_surface_formats(physical_device, surface)
                 .expect("Unable to get supported surface formats")
         };
+
+        #[cfg(debug_assertions)]
+        println!("Supported surface formats: {supported_formats:?}\n");
+
         let &ash::vk::SurfaceFormatKHR {
             format: image_format,
             color_space: image_color_space,
@@ -643,6 +657,7 @@ impl Swapchain {
             composite_alpha,
             present_mode,
             clipped: ash::vk::TRUE, // Allow shaders to avoid updating regions that are obscured (by other windows, etc.)
+            old_swapchain: old_swapchain.unwrap_or_default(),
             ..Default::default()
         };
 
@@ -668,6 +683,8 @@ impl Swapchain {
             .collect();
 
         // Create synchronization objects. Semaphores synchronize between different operations on the GPU; fences synchronize operations between the CPU and GPU.
+        // TODO: The Vulkan tutorial published by the Khronos Group uses an image available and image rendered semaphore for each frame in flight. Not clear whether this is necessary, but should monitor.
+        //       https://docs.vulkan.org/tutorial/latest/03_Drawing_a_triangle/03_Drawing/03_Frames_in_flight.html
         let image_available = unsafe {
             logical_device
                 .create_semaphore(&Default::default(), None)
@@ -697,6 +714,7 @@ impl Swapchain {
             images,
             image_views,
             format: image_format,
+            color_space: image_color_space,
             present_mode,
             extent,
             image_available,
@@ -706,14 +724,79 @@ impl Swapchain {
         }
     }
 
-    /// Acquire the next image in the swapchain. Maintain the index of the acquired image.
-    pub fn acquire_next_image(&mut self, device: &ash::Device) -> (ash::vk::ImageView, u32, bool) {
-        const ONE_SECOND_IN_NANOSECONDS: u64 = 1_000_000_000;
+    /// Recreate the swapchain using the existing one.
+    /// This is useful when the window is resized, or the window is moved to a different monitor.
+    pub fn recreate_swapchain(
+        &mut self,
+        vulkan: &VulkanCore,
+        physical_device: ash::vk::PhysicalDevice,
+        logical_device: &ash::Device,
+        surface: ash::vk::SurfaceKHR,
+        framebuffers: &mut Vec<ash::vk::Framebuffer>,
+        create_framebuffer: impl Fn(&ash::vk::ImageView, ash::vk::Extent2D) -> ash::vk::Framebuffer,
+    ) {
+        let new_swapchain = Self::new(
+            vulkan,
+            physical_device,
+            logical_device,
+            surface,
+            Some(self.format),
+            Some(self.color_space),
+            Some(self.present_mode),
+            Some(self.swapchain),
+        );
 
+        // Wait for the logical device to finish its operations on the swapchain.
+        unsafe {
+            logical_device
+                .device_wait_idle()
+                .expect("Unable to wait for the logical device to finish its operations");
+        }
+
+        // TODO: Ensure that the new swapchain is compatible with the old one. Some changes may require the graphics pipeline to be recreated.
+
+        // Destroy the existing swapchain and its associated resources.
+        // TODO: Reuse more resources from the old swapchain if possible.
+        unsafe {
+            logical_device
+                .wait_for_fences(&[self.acquire_fence], true, FIVE_SECONDS_IN_NANOSECONDS)
+                .expect("Unable to wait for the acquire fence");
+            logical_device.destroy_fence(self.acquire_fence, None);
+            logical_device.destroy_semaphore(self.image_rendered, None);
+            logical_device.destroy_semaphore(self.image_available, None);
+
+            for framebuffer in framebuffers.drain(..) {
+                logical_device.destroy_framebuffer(framebuffer, None);
+            }
+
+            for &image_view in self.image_views.iter() {
+                logical_device.destroy_image_view(image_view, None);
+            }
+
+            self.swapchain_device
+                .destroy_swapchain(self.swapchain, None);
+        }
+
+        // Replace the original swapchain with the new one, drop the old one.
+        std::mem::drop(std::mem::replace(self, new_swapchain));
+
+        // Recreate the framebuffers using the new swapchain's image views.
+        *framebuffers = self
+            .image_views
+            .iter()
+            .map(|image_view| create_framebuffer(image_view, self.extent))
+            .collect();
+    }
+
+    /// Acquire the next image in the swapchain. Maintain the index of the acquired image.
+    pub fn acquire_next_image(
+        &mut self,
+        device: &ash::Device,
+    ) -> ash::prelude::VkResult<(ash::vk::ImageView, u32, bool)> {
         // Wait for the last acquire to complete its operation within the swapchain.
         unsafe {
             device
-                .wait_for_fences(&[self.acquire_fence], true, ONE_SECOND_IN_NANOSECONDS)
+                .wait_for_fences(&[self.acquire_fence], true, FIVE_SECONDS_IN_NANOSECONDS)
                 .expect("Failed to wait for the acquire fence");
             device
                 .reset_fences(&[self.acquire_fence])
@@ -722,24 +805,22 @@ impl Swapchain {
 
         // Acquire the next image in the swapchain, using the same fence to signal completion.
         let (acquired_index, suboptimal) = unsafe {
-            self.swapchain_device
-                .acquire_next_image(
-                    self.swapchain,
-                    ONE_SECOND_IN_NANOSECONDS,
-                    self.image_available,
-                    self.acquire_fence,
-                )
-                .expect("Unable to acquire next image")
+            self.swapchain_device.acquire_next_image(
+                self.swapchain,
+                FIVE_SECONDS_IN_NANOSECONDS,
+                self.image_available,
+                self.acquire_fence,
+            )?
         };
 
         // Update our internal state with the acquired image's index.
         self.acquired_index = Some(acquired_index);
 
-        (
+        Ok((
             self.image_views[acquired_index as usize],
             acquired_index,
             suboptimal,
-        )
+        ))
     }
 
     /// Present the next image in the swapchain. Return whether the swapchain is suboptimal for the surface on success.
@@ -749,18 +830,17 @@ impl Swapchain {
             .take()
             .expect("No image has been acquired by the swapchain before presenting");
         unsafe {
-            self.swapchain_device
-                .queue_present(
-                    present_queue,
-                    &ash::vk::PresentInfoKHR {
-                        wait_semaphore_count: 1,
-                        p_wait_semaphores: &self.image_rendered,
-                        swapchain_count: 1,
-                        p_swapchains: &self.swapchain,
-                        p_image_indices: &acquired_index,
-                        ..Default::default()
-                    },
-                )
+            self.swapchain_device.queue_present(
+                present_queue,
+                &ash::vk::PresentInfoKHR {
+                    wait_semaphore_count: 1,
+                    p_wait_semaphores: &self.image_rendered,
+                    swapchain_count: 1,
+                    p_swapchains: &self.swapchain,
+                    p_image_indices: &acquired_index, // Needs to have the same number of entries as `swapchain_count`, i.e. 1.
+                    ..Default::default()
+                },
+            )
         }
     }
 

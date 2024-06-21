@@ -124,6 +124,9 @@ impl PompeiiApp {
             return;
         };
 
+        // Request a redraw of the window surface whenever possible.
+        window.request_redraw();
+
         // Increment the tick count for the application.
         if self.tick_count % 6_000 == 0 {
             println!(
@@ -134,19 +137,86 @@ impl PompeiiApp {
         }
         self.tick_count += 1;
 
-        // Get the next image to render to. Has internal synchronization to ensure the previous acquire completed on the GPU.
-        let (_image, image_index, suboptimal) =
-            swapchain.acquire_next_image(&renderer.logical_device);
-
-        // TODO: Handle suboptimal swapchain recreation.
-        if suboptimal {
-            println!("Swapchain is suboptimal, needs to be recreated.");
-
-            // let new_swapchain = ...
-
-            // self.swapchain = ...
-            return;
+        // Check that the current window size won't affect rendering.
+        {
+            let window_size = window.inner_size();
+            let swapchain_size = swapchain.extent();
+            if window_size.width != swapchain_size.width
+                || window_size.height != swapchain_size.height
+            {
+                if window_size.width == 0 || window_size.height == 0 {
+                    // Skip all operations if the window contains no pixels.
+                    #[cfg(debug_assertions)]
+                    println!("Window size is zero, skipping frame");
+                } else {
+                    println!(
+                        "Swapchain is out of date at window-size check, needs to be recreated."
+                    );
+                    swapchain.recreate_swapchain(
+                        &self.vulkan,
+                        renderer.physical_device,
+                        &renderer.logical_device,
+                        *surface,
+                        &mut renderer.framebuffers,
+                        |img, extent| {
+                            engine::create_framebuffer(
+                                &renderer.logical_device,
+                                renderer.render_pass,
+                                img,
+                                extent,
+                            )
+                        },
+                    );
+                }
+                return;
+            }
         }
+
+        // Get the next image to render to. Has internal synchronization to ensure the previous acquire completed on the GPU.
+        let (_image, image_index) = match swapchain.acquire_next_image(&renderer.logical_device) {
+            Ok((image, index, false)) => (image, index),
+
+            // TODO: Consider accepting suboptimal for this draw, but set a flag to recreate the swapchain next frame.
+            Ok((_, _, true)) | Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                let khr_instance =
+                    ash::khr::surface::Instance::new(&self.vulkan.api, &self.vulkan.instance);
+                let surface_capabilities = unsafe {
+                    khr_instance
+                        .get_physical_device_surface_capabilities(
+                            renderer.physical_device,
+                            *surface,
+                        )
+                        .expect("Unable to get surface capabilities")
+                };
+                if surface_capabilities.max_image_extent.width == 0
+                    || surface_capabilities.max_image_extent.height == 0
+                {
+                    #[cfg(debug_assertions)]
+                    println!("Surface capabilities are zero at image acquire, skipping swapchain recreation");
+                    return;
+                }
+
+                println!("Swapchain is out of date at image acquire, needs to be recreated.");
+                swapchain.recreate_swapchain(
+                    &self.vulkan,
+                    renderer.physical_device,
+                    &renderer.logical_device,
+                    *surface,
+                    &mut renderer.framebuffers,
+                    |img, extent| {
+                        engine::create_framebuffer(
+                            &renderer.logical_device,
+                            renderer.render_pass,
+                            img,
+                            extent,
+                        )
+                    },
+                );
+                return;
+            }
+
+            Err(e) => panic!("Unable to acquire next image from swapchain: {e}"),
+        };
 
         // Synchronize the CPU with the GPU for the resources previously used for this image index.
         // TODO: Make this into its own utils function because it is a common pattern.
@@ -157,7 +227,7 @@ impl PompeiiApp {
         unsafe {
             renderer
                 .logical_device
-                .wait_for_fences(&[resource_fence], true, std::u64::MAX)
+                .wait_for_fences(&[resource_fence], true, utils::FIVE_SECONDS_IN_NANOSECONDS)
                 .expect("Unable to wait for fence to begin frame");
             renderer
                 .logical_device
@@ -252,18 +322,45 @@ impl PompeiiApp {
         match swapchain.present(renderer.presentation_queue) {
             Ok(false) => (),
             Ok(true) | Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                println!("Swapchain is out of date, needs to be recreated.");
+                // TODO: Refactor into a function for all swapchain recreation.
+                let khr_instance =
+                    ash::khr::surface::Instance::new(&self.vulkan.api, &self.vulkan.instance);
+                let surface_capabilities = unsafe {
+                    khr_instance
+                        .get_physical_device_surface_capabilities(
+                            renderer.physical_device,
+                            *surface,
+                        )
+                        .expect("Unable to get surface capabilities")
+                };
+                if surface_capabilities.max_image_extent.width == 0
+                    && surface_capabilities.max_image_extent.height == 0
+                {
+                    #[cfg(debug_assertions)]
+                    println!("Surface capabilities are zero at image presentation, skipping swapchain recreation");
+                    return;
+                }
 
-                // let new_swapchain = ...
-
-                // self.swapchain = ...
+                println!("Swapchain is out of date at image presentation, needs to be recreated.");
+                swapchain.recreate_swapchain(
+                    &self.vulkan,
+                    renderer.physical_device,
+                    &renderer.logical_device,
+                    *surface,
+                    &mut renderer.framebuffers,
+                    |img, extent| {
+                        engine::create_framebuffer(
+                            &renderer.logical_device,
+                            renderer.render_pass,
+                            img,
+                            extent,
+                        )
+                    },
+                );
                 return;
             }
             Err(e) => panic!("Unable to present swapchain image: {:?}", e),
         }
-
-        // Request a redraw of the window surface.
-        window.request_redraw();
     }
 }
 
@@ -306,7 +403,12 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
             };
 
             #[cfg(debug_assertions)]
-            println!("Selected physical device: {:?}", device_properties.device_name_as_c_str().expect("Unable to get device name"));
+            println!(
+                "Selected physical device: {:?}",
+                device_properties
+                    .device_name_as_c_str()
+                    .expect("Unable to get device name")
+            );
 
             // Create a logical device capable of rendering to the surface and performing compute operations.
             // TODO: Support having a list of queue families for each type for greater flexibility.
@@ -337,6 +439,7 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
                 None,
                 None,
                 Some(ash::vk::PresentModeKHR::MAILBOX),
+                None,
             );
             let image_count = swapchain.image_count();
             #[cfg(debug_assertions)]
@@ -413,26 +516,12 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
 
             // Create the framebuffers for this application.
             // TODO: Create framebuffers with the render pass because the render pass defines the framebuffer topology.
-            let ash::vk::Extent2D { width, height } = swapchain.extent();
-            let framebuffers: Vec<_> = swapchain
+            let extent = swapchain.extent();
+            let framebuffers = swapchain
                 .image_views()
                 .iter()
-                .map(|img| {
-                    unsafe {
-                        logical_device.create_framebuffer(
-                            &ash::vk::FramebufferCreateInfo {
-                                render_pass,
-                                attachment_count: 1,
-                                p_attachments: img,
-                                width,
-                                height,
-                                layers: 1,
-                                ..Default::default()
-                            },
-                            None,
-                        )
-                    }
-                    .expect("Unable to create framebuffer")
+                .map(|image_view| {
+                    engine::create_framebuffer(&logical_device, render_pass, image_view, extent)
                 })
                 .collect();
 
