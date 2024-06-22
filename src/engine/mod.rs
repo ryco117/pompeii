@@ -277,3 +277,220 @@ pub fn create_graphics_pipeline(
     .first()
     .expect("vkCreateGraphicsPipelines returned an empty list of pipelines")
 }
+
+/// Define which rendering objects are necessary for this application.
+pub struct Renderer {
+    pub physical_device: ash::vk::PhysicalDevice,
+    pub logical_device: ash::Device,
+    pub surface: ash::vk::SurfaceKHR,
+    pub swapchain: utils::Swapchain,
+    pub render_pass: ash::vk::RenderPass,
+    pub graphics_pipeline: ash::vk::Pipeline,
+    pub graphics_queue: ash::vk::Queue,
+    pub presentation_queue: ash::vk::Queue,
+    pub command_buffers: Vec<ash::vk::CommandBuffer>,
+    pub framebuffers: Vec<ash::vk::Framebuffer>,
+    pub fences_and_state: Vec<(ash::vk::Fence, bool)>,
+}
+
+impl Renderer {
+    /// Attempt to render the next frame of the application. If there is a recoverable error the swapchain is recreated and the function bails early without rendering.
+    pub fn render_frame(&mut self, vulkan: &utils::VulkanCore) {
+        // Get the next image to render to. Has internal synchronization to ensure the previous acquire completed on the GPU.
+        let (_image, image_index) = match self.swapchain.acquire_next_image(&self.logical_device) {
+            Ok((image, index, false)) => (image, index),
+
+            // TODO: Consider accepting suboptimal for this draw, but set a flag to recreate the swapchain next frame.
+            Ok((_, _, true)) | Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                let khr_instance = ash::khr::surface::Instance::new(&vulkan.api, &vulkan.instance);
+                let surface_capabilities = unsafe {
+                    khr_instance
+                        .get_physical_device_surface_capabilities(
+                            self.physical_device,
+                            self.surface,
+                        )
+                        .expect("Unable to get surface capabilities")
+                };
+                if surface_capabilities.max_image_extent.width == 0
+                    || surface_capabilities.max_image_extent.height == 0
+                {
+                    println!("WARN: Surface capabilities are zero at image acquire, skipping swapchain recreation");
+                    return;
+                }
+
+                println!("WARN: Swapchain is out of date at image acquire, needs to be recreated.");
+                self.swapchain.recreate_swapchain(
+                    &vulkan,
+                    self.physical_device,
+                    &self.logical_device,
+                    self.surface,
+                    &mut self.framebuffers,
+                    |img, extent| {
+                        create_framebuffer(&self.logical_device, self.render_pass, img, extent)
+                    },
+                );
+                return;
+            }
+
+            Err(e) => panic!("Unable to acquire next image from swapchain: {e}"),
+        };
+
+        // Synchronize the CPU with the GPU for the resources previously used for this image index.
+        // TODO: Make this into its own utils function because it is a common pattern.
+        // TODO: Example code [here](https://github.com/PacktPublishing/The-Modern-Vulkan-Cookbook/blob/81d96f600eeb54cbaa0c84967d233ab000841ab5/source/vulkancore/CommandQueueManager.cpp#L130)
+        //       uses different indices than the swapchain image to synchronize the fences and the command buffers. Consider whether this would be necessary or beneficial.
+        let resource_fence = self.fences_and_state[image_index as usize].0;
+        let command_buffer = self.command_buffers[image_index as usize];
+        unsafe {
+            self.logical_device
+                .wait_for_fences(&[resource_fence], true, utils::FIVE_SECONDS_IN_NANOSECONDS)
+                .expect("Unable to wait for fence to begin frame");
+            self.logical_device
+                .reset_command_buffer(
+                    command_buffer,
+                    ash::vk::CommandBufferResetFlags::RELEASE_RESOURCES,
+                )
+                .expect("Unable to reset command buffer");
+            self.logical_device
+                .begin_command_buffer(
+                    command_buffer,
+                    &ash::vk::CommandBufferBeginInfo {
+                        flags: ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                        ..Default::default()
+                    },
+                )
+                .expect("Unable to begin command buffer");
+        }
+
+        let extent = self.swapchain.extent();
+
+        // Begin the render pass for the current frame.
+        unsafe {
+            self.logical_device.cmd_begin_render_pass(
+                command_buffer,
+                &ash::vk::RenderPassBeginInfo {
+                    render_pass: self.render_pass,
+                    framebuffer: self.framebuffers[image_index as usize],
+                    render_area: ash::vk::Rect2D {
+                        offset: ash::vk::Offset2D::default(),
+                        extent,
+                    },
+                    clear_value_count: 1,
+                    p_clear_values: &ash::vk::ClearValue::default(),
+                    ..Default::default()
+                },
+                ash::vk::SubpassContents::INLINE,
+            );
+        }
+
+        // Set the viewport and scissor in the command buffer because we specified they would be set dynamically in the pipeline.
+        unsafe {
+            self.logical_device.cmd_set_viewport(
+                command_buffer,
+                0,
+                &[ash::vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: extent.width as f32,
+                    height: extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            self.logical_device.cmd_set_scissor(
+                command_buffer,
+                0,
+                &[ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D::default(),
+                    extent,
+                }],
+            );
+        }
+
+        // Bind the graphics pipeline to the command buffer.
+        unsafe {
+            self.logical_device.cmd_bind_pipeline(
+                command_buffer,
+                ash::vk::PipelineBindPoint::GRAPHICS,
+                self.graphics_pipeline,
+            );
+        }
+
+        // TODO: Update descriptor sets here when we have them.
+
+        // Draw the example triangle.
+        unsafe {
+            self.logical_device.cmd_draw(command_buffer, 3, 1, 0, 0);
+        }
+
+        // End the render pass for the current frame.
+        unsafe {
+            self.logical_device.cmd_end_render_pass(command_buffer);
+            self.logical_device
+                .end_command_buffer(command_buffer)
+                .expect("Unable to end the graphics command buffer");
+        }
+
+        // Submit the draw command buffer to the GPU.
+        let submit_info = ash::vk::SubmitInfo {
+            wait_semaphore_count: 1,
+            p_wait_semaphores: &self.swapchain.image_available(),
+            p_wait_dst_stage_mask: &ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            command_buffer_count: 1,
+            p_command_buffers: &command_buffer,
+            signal_semaphore_count: 1,
+            p_signal_semaphores: &self.swapchain.image_rendered(),
+            ..Default::default()
+        };
+        unsafe {
+            self.logical_device
+                .reset_fences(&[resource_fence])
+                .expect("Unable to reset fence for this frame's resources");
+            self.logical_device
+                .queue_submit(self.graphics_queue, &[submit_info], resource_fence)
+                .expect("Unable to submit command buffer");
+
+            // Note that this fence has been submitted.
+            // TODO: Determine if this is useful.
+            self.fences_and_state[image_index as usize].1 = true;
+        }
+
+        // Queue the presentation of the swapchain image.
+        match self.swapchain.present(self.presentation_queue) {
+            Ok(false) => (),
+            Ok(true) | Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                // TODO: Refactor into a function for all swapchain recreation.
+                let khr_instance = ash::khr::surface::Instance::new(&vulkan.api, &vulkan.instance);
+                let surface_capabilities = unsafe {
+                    khr_instance
+                        .get_physical_device_surface_capabilities(
+                            self.physical_device,
+                            self.surface,
+                        )
+                        .expect("Unable to get surface capabilities")
+                };
+                if surface_capabilities.max_image_extent.width == 0
+                    && surface_capabilities.max_image_extent.height == 0
+                {
+                    #[cfg(debug_assertions)]
+                    println!("Surface capabilities are zero at image presentation, skipping swapchain recreation");
+                    return;
+                }
+
+                println!("Swapchain is out of date at image presentation, needs to be recreated.");
+                self.swapchain.recreate_swapchain(
+                    &vulkan,
+                    self.physical_device,
+                    &self.logical_device,
+                    self.surface,
+                    &mut self.framebuffers,
+                    |img, extent| {
+                        create_framebuffer(&self.logical_device, self.render_pass, img, extent)
+                    },
+                );
+                return;
+            }
+            Err(e) => panic!("Unable to present swapchain image: {:?}", e),
+        }
+    }
+}
