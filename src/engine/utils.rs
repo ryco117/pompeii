@@ -11,6 +11,10 @@ const EXPECTED_MAX_QUEUE_FAMILIES: usize = 8;
 /// A heap allocation is required if the number of instance extensions exceeds this value.
 const EXPECTED_MAX_INSTANCE_EXTENSIONS: usize = 16;
 
+/// Set a sane value for the maximum expected number of physical devices.
+/// A heap allocation is required if the number of physical devices exceeds this value.
+const EXPECTED_MAX_VULKAN_PHYSICAL_DEVICES: usize = 4;
+
 /// The number of nanoseconds in five seconds.
 pub const FIVE_SECONDS_IN_NANOSECONDS: u64 = 5_000_000_000;
 
@@ -22,7 +26,7 @@ pub struct VulkanCore {
 
 impl VulkanCore {
     /// Create a new `VulkanCore` with the specified extensions.
-    pub fn new<'a>(extension_names: &[&'a CStr]) -> Self {
+    pub fn new(extension_names: &[&CStr]) -> Self {
         // Attempt to dynamically load the Vulkan API from platform-specific shared libraries.
         let vulkan_api = unsafe { ash::Entry::load().expect("Unable to load Vulkan libraries") };
 
@@ -122,15 +126,15 @@ pub fn physical_supports_rtx(
     // Query the physical device for ray tracing support features.
     let mut ray_query = ash::vk::PhysicalDeviceRayQueryFeaturesKHR::default();
     let mut ray_tracing = ash::vk::PhysicalDeviceRayTracingPipelineFeaturesKHR {
-        p_next: &mut ray_query as *mut _ as *mut std::ffi::c_void,
+        p_next: std::ptr::from_mut(&mut ray_query).cast(),
         ..Default::default()
     };
     let mut acceleration_structure = ash::vk::PhysicalDeviceAccelerationStructureFeaturesKHR {
-        p_next: &mut ray_tracing as *mut _ as *mut std::ffi::c_void,
+        p_next: std::ptr::from_mut(&mut ray_tracing).cast(),
         ..Default::default()
     };
     let mut features = ash::vk::PhysicalDeviceFeatures2 {
-        p_next: &mut acceleration_structure as *mut _ as *mut std::ffi::c_void,
+        p_next: std::ptr::from_mut(&mut acceleration_structure).cast(),
         ..Default::default()
     };
     unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
@@ -143,7 +147,7 @@ pub fn physical_supports_rtx(
         let mut ray_tracing_pipeline =
             ash::vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
         let mut properties = ash::vk::PhysicalDeviceProperties2 {
-            p_next: (&mut ray_tracing_pipeline) as *mut _ as *mut std::ffi::c_void,
+            p_next: std::ptr::from_mut(&mut ray_tracing_pipeline).cast(),
             ..Default::default()
         };
         unsafe { instance.get_physical_device_properties2(physical_device, &mut properties) };
@@ -154,11 +158,13 @@ pub fn physical_supports_rtx(
 }
 
 /// Get all physical devices that support Vulkan 1.3 and the required extensions. Sort them by their likelihood of being the desired device.
-//  TODO: Investigate if `enumerate_physical_devices` can be replaced with something I can pass a `SmallVec` ref to.
-pub fn get_physical_devices(
+pub fn get_sorted_physical_devices(
     instance: &ash::Instance,
     required_extensions: &[*const i8],
-) -> SmallVec<[(ash::vk::PhysicalDevice, ash::vk::PhysicalDeviceProperties); 4]> {
+) -> SmallVec<
+    [(ash::vk::PhysicalDevice, ash::vk::PhysicalDeviceProperties);
+        EXPECTED_MAX_VULKAN_PHYSICAL_DEVICES],
+> {
     /// A helper for scoring a device's dedication to graphics processing.
     fn score_device_type(device_type: ash::vk::PhysicalDeviceType) -> u8 {
         match device_type {
@@ -171,6 +177,7 @@ pub fn get_physical_devices(
     }
 
     // Get all physical devices that support Vulkan 1.3.
+    // TODO: Investigate if `enumerate_physical_devices` can be replaced with something I can pass a `SmallVec` ref to.
     let physical_devices = unsafe {
         instance
             .enumerate_physical_devices()
@@ -699,12 +706,12 @@ impl Swapchain {
         //       https://docs.vulkan.org/tutorial/latest/03_Drawing_a_triangle/03_Drawing/03_Frames_in_flight.html
         let image_available = unsafe {
             logical_device
-                .create_semaphore(&Default::default(), None)
+                .create_semaphore(&ash::vk::SemaphoreCreateInfo::default(), None)
                 .expect("Unable to create image available semaphore")
         };
         let image_rendered = unsafe {
             logical_device
-                .create_semaphore(&Default::default(), None)
+                .create_semaphore(&ash::vk::SemaphoreCreateInfo::default(), None)
                 .expect("Unable to create render finished semaphore")
         };
         let acquire_fence = unsafe {
@@ -749,7 +756,7 @@ impl Swapchain {
         surface: ash::vk::SurfaceKHR,
         framebuffers: &mut Vec<ash::vk::Framebuffer>,
         preferences: SwapchainPreferences,
-        create_framebuffer: impl Fn(&ash::vk::ImageView, ash::vk::Extent2D) -> ash::vk::Framebuffer,
+        create_framebuffer: impl Fn(ash::vk::ImageView, ash::vk::Extent2D) -> ash::vk::Framebuffer,
     ) {
         let new_swapchain = Self::new(
             vulkan,
@@ -783,7 +790,7 @@ impl Swapchain {
                 logical_device.destroy_framebuffer(framebuffer, None);
             }
 
-            for &image_view in self.image_views.iter() {
+            for &image_view in &self.image_views {
                 logical_device.destroy_image_view(image_view, None);
             }
 
@@ -798,7 +805,7 @@ impl Swapchain {
         *framebuffers = self
             .image_views
             .iter()
-            .map(|image_view| create_framebuffer(image_view, self.extent))
+            .map(|image_view| create_framebuffer(*image_view, self.extent))
             .collect();
     }
 
@@ -858,6 +865,7 @@ impl Swapchain {
         }
     }
 
+    // Swapchain getters.
     pub fn extent(&self) -> ash::vk::Extent2D {
         self.extent
     }
