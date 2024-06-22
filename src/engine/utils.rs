@@ -33,6 +33,9 @@ impl VulkanCore {
                 .expect("Unable to enumerate available Vulkan extensions")
         };
 
+        #[cfg(debug_assertions)]
+        println!("Available instance extensions: {available_extensions:?}\n");
+
         // Check that the required extensions are available.
         for &ext in extension_names {
             if !available_extensions.iter().any(|a| {
@@ -180,9 +183,17 @@ pub fn get_physical_devices(
             // Query basic properties of the physical device.
             let properties = unsafe { instance.get_physical_device_properties(device) };
 
+            // Query for the basic extensions available to this physical device.
+            // Note that instance extension `VK_KHR_get_physical_device_properties2` enables use of function `vkGetPhysicalDeviceFeatures2KHR` for additional features, but is not called here.
+            let extensions = unsafe {
+                instance
+                    .enumerate_device_extension_properties(device)
+                    .expect("Unable to enumerate device extensions")
+            };
+
             // Ensure every device has their properties printed in debug mode. Called before filtering starts.
             #[cfg(debug_assertions)]
-            println!("Physical device {device:?}: {properties:?}\n");
+            println!("Physical device {device:?}: {properties:?}\nPhysical device available extensions: {extensions:?}\n");
 
             // Ensure the device supports Vulkan 1.3.
             if properties.api_version < ash::vk::API_VERSION_1_3 {
@@ -190,13 +201,6 @@ pub fn get_physical_devices(
                 println!("Physical device {device:?} does not support a sufficiently high Vulkan version");
                 return None;
             }
-
-            // Query for the basic extensions of the physical device.
-            let extensions = unsafe {
-                instance
-                    .enumerate_device_extension_properties(device)
-                    .expect("Unable to enumerate device extensions")
-            };
 
             // Ensure the device supports all required extensions.
             if required_extensions.iter().all(|&req| {
@@ -257,7 +261,7 @@ pub struct QueueFamilies {
     pub queue_families: Vec<ash::vk::QueueFamilyProperties>,
 }
 
-#[derive(strum_macros::EnumCount)]
+#[derive(strum::EnumCount)]
 #[repr(usize)]
 enum QueueType {
     Graphics,
@@ -485,6 +489,14 @@ pub fn create_image_view(
     }
 }
 
+/// Preferences for the image and behavior used with a new swapchain.
+#[derive(Clone, Copy, Default)]
+pub struct SwapchainPreferences {
+    pub format: Option<ash::vk::Format>,
+    pub color_space: Option<ash::vk::ColorSpaceKHR>,
+    pub present_mode: Option<ash::vk::PresentModeKHR>,
+}
+
 pub struct Swapchain {
     swapchain_device: ash::khr::swapchain::Device,
     swapchain: ash::vk::SwapchainKHR,
@@ -507,9 +519,7 @@ impl Swapchain {
         physical_device: ash::vk::PhysicalDevice,
         logical_device: &ash::Device,
         surface: ash::vk::SurfaceKHR,
-        preferred_format: Option<ash::vk::Format>,
-        preferred_color_space: Option<ash::vk::ColorSpaceKHR>,
-        preferred_present_mode: Option<ash::vk::PresentModeKHR>,
+        preferences: SwapchainPreferences,
         old_swapchain: Option<ash::vk::SwapchainKHR>,
     ) -> Self {
         let khr_instance = ash::khr::surface::Instance::new(&vulkan.api, &vulkan.instance);
@@ -536,8 +546,9 @@ impl Swapchain {
         println!("Supported present modes: {supported_present_modes:?}\n");
 
         // Default to what is guaranteed to be available.
-        let preferred_present_mode =
-            preferred_present_mode.unwrap_or(ash::vk::PresentModeKHR::FIFO);
+        let preferred_present_mode = preferences
+            .present_mode
+            .unwrap_or(ash::vk::PresentModeKHR::FIFO);
 
         // Attempt to use the preferred present mode, or fallback to a default mode.
         // Choose the number of images based on the present mode and the minimum images required.
@@ -592,9 +603,10 @@ impl Swapchain {
             format: image_format,
             color_space: image_color_space,
         } = {
-            let fmt = preferred_format.unwrap_or(ash::vk::Format::B8G8R8A8_SRGB);
-            let color_space =
-                preferred_color_space.unwrap_or(ash::vk::ColorSpaceKHR::SRGB_NONLINEAR);
+            let fmt = preferences.format.unwrap_or(ash::vk::Format::B8G8R8A8_SRGB);
+            let color_space = preferences
+                .color_space
+                .unwrap_or(ash::vk::ColorSpaceKHR::SRGB_NONLINEAR);
             if let Some(format) = supported_formats
                 .iter()
                 .find(|f| f.format == fmt && f.color_space == color_space)
@@ -708,6 +720,9 @@ impl Swapchain {
                 .expect("Unable to create the acquire fence")
         };
 
+        #[cfg(debug_assertions)]
+        println!("New Swapchain: Present mode: {image_count} * {present_mode:?}\n");
+
         Self {
             swapchain_device,
             swapchain,
@@ -733,6 +748,7 @@ impl Swapchain {
         logical_device: &ash::Device,
         surface: ash::vk::SurfaceKHR,
         framebuffers: &mut Vec<ash::vk::Framebuffer>,
+        preferences: SwapchainPreferences,
         create_framebuffer: impl Fn(&ash::vk::ImageView, ash::vk::Extent2D) -> ash::vk::Framebuffer,
     ) {
         let new_swapchain = Self::new(
@@ -740,9 +756,7 @@ impl Swapchain {
             physical_device,
             logical_device,
             surface,
-            Some(self.format),
-            Some(self.color_space),
-            Some(self.present_mode),
+            preferences,
             Some(self.swapchain),
         );
 

@@ -291,6 +291,8 @@ pub struct Renderer {
     pub command_buffers: Vec<ash::vk::CommandBuffer>,
     pub framebuffers: Vec<ash::vk::Framebuffer>,
     pub fences_and_state: Vec<(ash::vk::Fence, bool)>,
+
+    pub swapchain_preferences: utils::SwapchainPreferences,
 }
 
 impl Renderer {
@@ -325,6 +327,7 @@ impl Renderer {
                     &self.logical_device,
                     self.surface,
                     &mut self.framebuffers,
+                    self.swapchain_preferences,
                     |img, extent| {
                         create_framebuffer(&self.logical_device, self.render_pass, img, extent)
                     },
@@ -484,6 +487,7 @@ impl Renderer {
                     &self.logical_device,
                     self.surface,
                     &mut self.framebuffers,
+                    self.swapchain_preferences,
                     |img, extent| {
                         create_framebuffer(&self.logical_device, self.render_pass, img, extent)
                     },

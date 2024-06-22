@@ -8,6 +8,7 @@ use winit::{
 const WINDOW_TITLE: &str = "Pompeii";
 const DEFAULT_WINDOWS_SIZE: winit::dpi::LogicalSize<f32> = winit::dpi::LogicalSize::new(800., 600.);
 
+mod cli;
 mod engine;
 use engine::utils;
 
@@ -20,12 +21,16 @@ mod shaders {
 }
 
 fn main() {
+    // Parse the command-line arguments.
+    use clap::Parser as _;
+    let cli_args = cli::Args::parse();
+
     // Initialize `event_loop`, the manager of windowing and related events.
     let event_loop = winit::event_loop::EventLoop::<PompeiiEvent>::with_user_event()
         .build()
         .expect("Unable to initialize winit event loop");
 
-    let mut app = PompeiiApp::new(&event_loop);
+    let mut app = PompeiiApp::new(cli_args, &event_loop);
     event_loop
         .run_app(&mut app)
         .expect("Error during event loop");
@@ -58,6 +63,7 @@ enum PompeiiState {
 
 /// The main application state and event handler.
 struct PompeiiApp {
+    args: cli::Args,
     vulkan: utils::VulkanCore,
     state: PompeiiState,
     tick_count: u64,
@@ -66,7 +72,7 @@ struct PompeiiApp {
 impl PompeiiApp {
     /// Create a new Pompeii application with the given Vulkan API and instance.
     /// Creation of the swapchain and other objects are deferred until the application is resumed, when a window will be available.
-    fn new(event_loop: &EventLoop<PompeiiEvent>) -> Self {
+    fn new(args: cli::Args, event_loop: &EventLoop<PompeiiEvent>) -> Self {
         // Get Vulkan extensions required by the windowing system, including platform-specific ones.
         let mut extension_names = ash_window::enumerate_required_extensions(
             event_loop
@@ -79,7 +85,7 @@ impl PompeiiApp {
         .map(|&e| unsafe { CStr::from_ptr(e) })
         .collect::<Vec<_>>();
 
-        // Add the ability to check and specify additional device features. This is required for ray-tracing.
+        // Add the ability to check and specify additional device features. This is required for ray-tracing through the `vkGetPhysicalDeviceFeatures2KHR` call.
         extension_names.push(ash::khr::get_physical_device_properties2::NAME);
 
         // Add the debug utility extension if in debug mode.
@@ -88,6 +94,7 @@ impl PompeiiApp {
 
         // Create a Vulkan instance for our application initialized with the `Empty` state.
         PompeiiApp {
+            args,
             vulkan: utils::VulkanCore::new(&extension_names),
             state: PompeiiState::Empty,
             tick_count: 0,
@@ -138,6 +145,7 @@ impl PompeiiApp {
                         &renderer.logical_device,
                         renderer.surface,
                         &mut renderer.framebuffers,
+                        renderer.swapchain_preferences,
                         |img, extent| {
                             engine::create_framebuffer(
                                 &renderer.logical_device,
@@ -156,6 +164,7 @@ impl PompeiiApp {
         renderer.render_frame(&self.vulkan)
     }
 
+    /// Handle keyboard input events.
     fn handle_keyboard_input(&mut self, key_event: winit::event::KeyEvent) {
         let PompeiiState::Windowed { window, .. } = &mut self.state else {
             return;
@@ -197,6 +206,7 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         println!("Application resuming...");
         if matches!(self.state, PompeiiState::Empty) {
+            // Required device extensions for the swapchain.
             const DEVICE_EXTENSIONS: [*const i8; 1] = [ash::khr::swapchain::NAME.as_ptr()];
 
             let window = create_window(event_loop, WINDOW_TITLE, DEFAULT_WINDOWS_SIZE)
@@ -257,23 +267,20 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
             let presentation_queue = unsafe { logical_device.get_device_queue(present_index, 0) };
 
             // Create an object to manage the swapchain, its images, and synchronization primitives.
-            // TODO: Allow for a command-line argument to set the present mode.
+            // TODO: Allow the CLI to specify the image format and color-space preferences.
+            let swapchain_preferences = utils::SwapchainPreferences {
+                present_mode: Some(self.args.present_mode.into()),
+                ..Default::default()
+            };
             let swapchain = utils::Swapchain::new(
                 &self.vulkan,
                 physical_device,
                 &logical_device,
                 surface,
-                None,
-                None,
-                Some(ash::vk::PresentModeKHR::MAILBOX),
+                swapchain_preferences,
                 None,
             );
             let image_count = swapchain.image_count();
-            #[cfg(debug_assertions)]
-            {
-                let present_mode = swapchain.present_mode();
-                println!("Present mode: {present_mode:?} * {image_count}\n")
-            }
 
             // Create the render pass that will orchestrate usage of the attachments in a framebuffer's render.
             let render_pass = engine::create_render_pass(&logical_device, &swapchain);
@@ -368,6 +375,7 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
                     command_buffers,
                     framebuffers,
                     fences_and_state,
+                    swapchain_preferences,
                 },
             };
         }

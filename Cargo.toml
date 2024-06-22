@@ -6,11 +6,10 @@ edition = "2021"
 [dependencies]
 ash = "0.38"
 ash-window = "0.13"
-clap = "4.5"
+clap = { version = "4.5.7", features = ["derive"] }
 gpu-allocator = "0.26"
 inline-spirv = "0.2"
 shaderc = "0.8"
 smallvec = "1.13"
-strum = "0.26"
-strum_macros = "0.26"
+strum = { version = "0.26", features = ["derive"] }
 winit = "0.30"
