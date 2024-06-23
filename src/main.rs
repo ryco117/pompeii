@@ -50,7 +50,6 @@ enum PompeiiEvent {}
 /// The graphics-specific state. Needs to be initialized after the event loop has begun.
 struct PompeiiGraphics {
     window: winit::window::Window,
-    surface: ash::vk::SurfaceKHR,
     renderer: engine::Renderer,
 }
 
@@ -66,7 +65,7 @@ impl PompeiiApp {
     /// Create a new Pompeii application with the given Vulkan API and instance.
     /// Creation of the swapchain and other objects are deferred until the application is resumed, when a window will be available.
     fn new(args: cli::Args, event_loop: &EventLoop<PompeiiEvent>) -> Self {
-        // Get Vulkan extensions required by the windowing system, including platform-specific ones.
+        // Get Vulkan extensions required by the windowing system, including `VK_KHR_surface` and platform-specific ones.
         let mut extension_names = ash_window::enumerate_required_extensions(
             event_loop
                 .display_handle()
@@ -216,19 +215,23 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
 
         // Create a renderer specific to this application's needs.
         // TODO: Allow the CLI to specify the image format and color-space preferences.
-        let renderer = engine::Renderer::new(
-            &self.vulkan,
-            surface,
+        let swapchain_preferences = if self.args.hdr && self.vulkan.enabled_colorspace_ext {
+            utils::SwapchainPreferences {
+                format: Some(ash::vk::Format::A2B10G10R10_UNORM_PACK32),
+                color_space: Some(ash::vk::ColorSpaceKHR::HDR10_ST2084_EXT),
+                present_mode: Some(self.args.present_mode.into()),
+            }
+        } else {
             utils::SwapchainPreferences {
                 present_mode: Some(self.args.present_mode.into()),
                 ..Default::default()
-            },
-        );
+            }
+        };
+        let renderer = engine::Renderer::new(&self.vulkan, surface, swapchain_preferences);
 
         // Complete the state transition to windowed mode.
         self.graphics = Some(PompeiiGraphics {
             window,
-            surface,
             renderer,
         });
 
@@ -277,10 +280,7 @@ impl Drop for PompeiiApp {
             }
 
             // Destroy the main Pompeii renderer and Vulkan resources.
-            graphics.renderer.destroy();
-
-            // Destroy the Vulkan surface.
-            unsafe { self.vulkan.khr.destroy_surface(graphics.surface, None) }
+            graphics.renderer.destroy(&self.vulkan);
         }
 
         // Destroy the Vulkan instance.

@@ -23,6 +23,7 @@ pub struct VulkanCore {
     pub api: ash::Entry,
     pub instance: ash::Instance,
     pub khr: ash::khr::surface::Instance,
+    pub enabled_colorspace_ext: bool,
 }
 
 impl VulkanCore {
@@ -41,18 +42,31 @@ impl VulkanCore {
         #[cfg(debug_assertions)]
         println!("Available instance extensions: {available_extensions:?}\n");
 
-        // Check that the required extensions are available.
-        for &ext in extension_names {
-            if !available_extensions.iter().any(|a| {
-                a.extension_name_as_c_str()
+        let available_contains = |ext: &CStr| {
+            available_extensions.iter().any(|p| {
+                p.extension_name_as_c_str()
                     .expect("Available extension name is not a valid C string")
                     == ext
-            }) {
-                panic!("Required extension {ext:?} is not available. All extensions: {available_extensions:?}");
-            }
+            })
+        };
+
+        // Check that the required extensions are available.
+        for &ext in extension_names {
+            assert!(available_contains(ext), "Required extension {ext:?} is not available. All extensions: {available_extensions:?}");
         }
-        let extension_name_pointers: SmallVec<[*const i8; EXPECTED_MAX_INSTANCE_EXTENSIONS]> =
+
+        let mut extension_name_pointers: SmallVec<[*const i8; EXPECTED_MAX_INSTANCE_EXTENSIONS]> =
             extension_names.iter().map(|&e| e.as_ptr()).collect();
+
+        // Optionally, enable `VK_EXT_swapchain_colorspace` if is is available and the dependent `VK_KHR_surface` is requested.
+        let supports_colorspace_ext = extension_names.contains(&ash::khr::surface::NAME)
+            && available_contains(ash::ext::swapchain_colorspace::NAME);
+        if supports_colorspace_ext {
+            #[cfg(debug_assertions)]
+            println!("Enabling VK_EXT_swapchain_colorspace extension");
+
+            extension_name_pointers.push(ash::ext::swapchain_colorspace::NAME.as_ptr());
+        }
 
         // Enable validation layers when using a debug build.
         #[cfg(debug_assertions)]
@@ -116,6 +130,7 @@ impl VulkanCore {
             api: vulkan_api,
             instance: vulkan_instance,
             khr,
+            enabled_colorspace_ext: supports_colorspace_ext,
         }
     }
 }
@@ -265,9 +280,9 @@ pub fn get_sorted_physical_devices(
 /// Available queue family types and their indices.
 /// Also, a map of queue family indices to the number of queues that may be and are currently allocated.
 pub struct QueueFamilies {
-    pub graphics: Option<u32>,
-    pub compute: Option<u32>,
-    pub present: Option<u32>,
+    pub graphics: Vec<u32>,
+    pub compute: Vec<u32>,
+    pub present: Vec<u32>,
     pub queue_families: Vec<ash::vk::QueueFamilyProperties>,
 }
 
@@ -297,12 +312,10 @@ pub fn get_queue_families(
 
     // Find the first queue families for each desired queue type.
     // Use an array with indices to allow compile-time guarantees about the number of queue types.
-    // TODO: Consider maintaining a list of queue family indices for each type of queue.
-    //       This will also make it easier to put different queue types on different families if they are available.
-    let mut all_queue_families = [None; QueueType::COUNT];
+    let mut all_queue_families = [const { Vec::<u32>::new() }; QueueType::COUNT];
     for (family_index, queue_family) in queue_families.iter().enumerate() {
         // Get a present queue family.
-        if all_queue_families[QueueType::Present as usize].is_none() {
+        if all_queue_families[QueueType::Present as usize].is_empty() {
             let is_present_supported = unsafe {
                 vulkan
                     .khr
@@ -314,43 +327,36 @@ pub fn get_queue_families(
                     .expect("Unable to check if 'present' is supported")
             };
             if is_present_supported {
-                all_queue_families[QueueType::Present as usize] = Some(family_index as u32);
+                all_queue_families[QueueType::Present as usize].push(family_index as u32);
             }
         }
 
         // Get a graphics queue family.
-        if all_queue_families[QueueType::Graphics as usize].is_none()
-            && queue_family
-                .queue_flags
-                .contains(ash::vk::QueueFlags::GRAPHICS)
+        if queue_family
+            .queue_flags
+            .contains(ash::vk::QueueFlags::GRAPHICS)
         {
-            all_queue_families[QueueType::Graphics as usize] = Some(family_index as u32);
+            all_queue_families[QueueType::Graphics as usize].push(family_index as u32);
         }
 
         // Get a compute queue family.
-        if all_queue_families[QueueType::Compute as usize].is_none()
-            && queue_family
-                .queue_flags
-                .contains(ash::vk::QueueFlags::COMPUTE)
+        if queue_family
+            .queue_flags
+            .contains(ash::vk::QueueFlags::COMPUTE)
         {
-            all_queue_families[QueueType::Compute as usize] = Some(family_index as u32);
-        }
-
-        // Break early if all families are found.
-        if all_queue_families.iter().all(Option::is_some) {
-            break;
+            all_queue_families[QueueType::Compute as usize].push(family_index as u32);
         }
     }
 
     // TODO: Allow the caller to choose which queue types are needed.
-    let graphics_family = all_queue_families[QueueType::Graphics as usize];
-    let compute_family = all_queue_families[QueueType::Compute as usize];
-    let present_family = all_queue_families[QueueType::Present as usize];
+    let graphics = std::mem::take(&mut all_queue_families[QueueType::Graphics as usize]);
+    let compute = std::mem::take(&mut all_queue_families[QueueType::Compute as usize]);
+    let present = std::mem::take(&mut all_queue_families[QueueType::Present as usize]);
 
     QueueFamilies {
-        graphics: graphics_family,
-        compute: compute_family,
-        present: present_family,
+        graphics,
+        compute,
+        present,
         queue_families,
     }
 }
@@ -366,26 +372,22 @@ pub fn new_device(
     // Get the necessary queue family indices for the logical device.
     let queue_families = get_queue_families(vulkan, physical_device, surface);
 
-    let graphics_family = queue_families
-        .graphics
-        .expect("Unable to find a graphics queue family");
-    let compute_family = queue_families
-        .compute
-        .expect("Unable to find a compute queue family");
-    let present_family = queue_families
-        .present
-        .expect("Unable to find a present queue family");
-
     // Aggregate queue family indices and count the number of queues each family may need allocated.
     let mut family_map = SmallVec::<[u32; EXPECTED_MAX_QUEUE_FAMILIES]>::from_elem(
         0,
         queue_families.queue_families.len(),
     );
-    let all_family_types = [graphics_family, compute_family, present_family];
+    let all_family_types = [
+        &queue_families.graphics,
+        &queue_families.compute,
+        &queue_families.present,
+    ];
     for family in all_family_types {
-        family_map[family as usize] += 1;
+        for index in family {
+            family_map[*index as usize] += 1;
+        }
     }
-    let priorities = [1.; QueueType::COUNT];
+    let priorities = vec![1.; queue_families.queue_families.len()];
 
     // Print a message if the queue family map has spilled over to the heap.
     #[cfg(debug_assertions)]
@@ -633,21 +635,23 @@ impl Swapchain {
             format: image_format,
             color_space: image_color_space,
         } = {
-            let fmt = preferences.format.unwrap_or(ash::vk::Format::B8G8R8A8_SRGB);
+            let lazy_is_color = |f| !is_depth_format(f) && !is_stencil_format(f);
             let color_space = preferences
                 .color_space
                 .unwrap_or(ash::vk::ColorSpaceKHR::SRGB_NONLINEAR);
-            if let Some(format) = supported_formats
-                .iter()
-                .find(|f| f.format == fmt && f.color_space == color_space)
-            {
+            if let Some(format) = supported_formats.iter().find(|f| {
+                preferences
+                    .format
+                    .map_or_else(|| lazy_is_color(f.format), |fmt| f.format == fmt)
+                    && f.color_space == color_space
+            }) {
                 // Use the preferred format if it is supported.
                 format
             } else {
                 // Otherwise, use the first supported format that is neither a depth nor a stencil format.
                 supported_formats
                     .iter()
-                    .find(|f| !is_depth_format(f.format) && !is_stencil_format(f.format))
+                    .find(|f| lazy_is_color(f.format))
                     .expect("Unable to find a suitable image format")
             }
         };
@@ -801,6 +805,9 @@ impl Swapchain {
 
     /// Recreate the swapchain using the existing one.
     /// This is useful when the window is resized, or the window is moved to a different monitor.
+    /// # Notes
+    /// * This function will wait for the logical device to finish its operations on the swapchain before recreating it.
+    /// * This will
     pub fn recreate_swapchain(
         &mut self,
         vulkan: &VulkanCore,
@@ -809,7 +816,6 @@ impl Swapchain {
         surface: ash::vk::SurfaceKHR,
         framebuffers: &mut Vec<ash::vk::Framebuffer>,
         preferences: SwapchainPreferences,
-        create_framebuffer: impl Fn(ash::vk::ImageView, ash::vk::Extent2D) -> ash::vk::Framebuffer,
     ) {
         let mut stack_var_swapchain = Self::new(
             vulkan,
@@ -827,20 +833,11 @@ impl Swapchain {
                 .expect("Unable to wait for the logical device to finish its operations");
         }
 
-        // TODO: Ensure that the new swapchain is compatible with the old one. Some changes may require the graphics pipeline to be recreated.
-
         // Swap the original swapchain (`self`) with the new one.
         std::mem::swap(self, &mut stack_var_swapchain);
 
         // Destroy the old swapchain and its associated resources.
         stack_var_swapchain.destroy(logical_device, framebuffers);
-
-        // Recreate the framebuffers using the new swapchain's image views.
-        *framebuffers = self
-            .image_views
-            .iter()
-            .map(|image_view| create_framebuffer(*image_view, self.extent))
-            .collect();
     }
 
     /// Acquire the next image in the swapchain. Maintain the index of the acquired image.

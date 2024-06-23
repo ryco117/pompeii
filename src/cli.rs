@@ -22,7 +22,11 @@ impl From<PresentMode> for ash::vk::PresentModeKHR {
 /// The command-line interface for Pompeii.
 #[derive(clap::Parser)]
 pub struct Args {
-    /// The preferred present mode to use. Immediate and double buffer relaxed may show screen tearing.
+    /// The preferred present mode to use. Immediate and double-buffer relaxed may show screen tearing.
     #[arg(short, long, default_value_t, value_enum)]
     pub present_mode: PresentMode,
+
+    /// Prefer presenting to an HDR colorspace if available.
+    #[arg(long, default_value_t)]
+    pub hdr: bool,
 }

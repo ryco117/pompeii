@@ -21,19 +21,18 @@ const ENTRY_POINT_MAIN: &CStr = c"main";
 /// Create the render pass capable of orchestrating the rendering of framebuffers for this application.
 pub fn create_render_pass(
     device: &ash::Device,
-    swapchain: &utils::Swapchain,
+    image_format: ash::vk::Format,
 ) -> ash::vk::RenderPass {
     let mut color_attachment_references =
         SmallVec::<[ash::vk::AttachmentReference; EXPECTED_MAX_COLOR_ATTACHMENTS]>::new();
     let mut depth_stencil_attachment_reference = None;
 
     // TODO: Allow for a list of attachment images with different formats, layouts, etc.
-    let format = swapchain.image_format();
-    let is_stencil = utils::is_stencil_format(format);
-    let is_depth = utils::is_depth_format(format);
+    let is_stencil = utils::is_stencil_format(image_format);
+    let is_depth = utils::is_depth_format(image_format);
 
     let attachment_descriptor = ash::vk::AttachmentDescription {
-        format,
+        format: image_format,
         samples: ash::vk::SampleCountFlags::TYPE_1,
         load_op: ash::vk::AttachmentLoadOp::CLEAR, // Clear the framebuffer before rendering.
         store_op: ash::vk::AttachmentStoreOp::STORE, // Store the framebuffer after rendering.
@@ -313,6 +312,12 @@ impl Pipeline {
     }
 }
 
+/// Store the shader modules used by the renderer.
+pub struct Shaders {
+    vertex_module: ash::vk::ShaderModule,
+    fragment_module: ash::vk::ShaderModule,
+}
+
 /// Define which rendering objects are necessary for this application.
 pub struct Renderer {
     pub physical_device: ash::vk::PhysicalDevice,
@@ -320,7 +325,7 @@ pub struct Renderer {
     pub surface: ash::vk::SurfaceKHR,
     pub swapchain: utils::Swapchain,
     pub render_pass: ash::vk::RenderPass,
-    pub shaders: Vec<ash::vk::ShaderModule>,
+    pub shaders: Shaders,
     pub graphics_pipeline: Pipeline,
     pub graphics_queue: ash::vk::Queue,
     pub presentation_queue: ash::vk::Queue,
@@ -360,16 +365,19 @@ impl Renderer {
         );
 
         // Create a logical device capable of rendering to the surface and performing compute operations.
-        // TODO: Support having a list of queue families for each type for greater flexibility.
         let (logical_device, queue_families) =
             utils::new_device(vulkan, physical_device, surface, &DEVICE_EXTENSIONS);
-        let utils::QueueFamilies {
-            graphics: Some(graphics_index),
-            present: Some(present_index),
-            ..
-        } = queue_families
-        else {
-            panic!("Unable to find suitable queue families");
+        let (graphics_index, present_index) = {
+            let graphics = *queue_families
+                .graphics
+                .first()
+                .expect("Unable to find a graphics queue family");
+            let present = *queue_families
+                .present
+                .first()
+                .expect("Unable to find a present queue family");
+
+            (graphics, present)
         };
 
         // Create a queue capable of performing graphics commands.
@@ -390,7 +398,7 @@ impl Renderer {
         let image_count = swapchain.image_count();
 
         // Create the render pass that will orchestrate usage of the attachments in a framebuffer's render.
-        let render_pass = create_render_pass(&logical_device, &swapchain);
+        let render_pass = create_render_pass(&logical_device, swapchain.image_format());
 
         // Process the shaders that will be used in the graphics pipeline.
         let vertex_module = utils::create_shader_module(&logical_device, shaders::VERTEX);
@@ -467,7 +475,10 @@ impl Renderer {
             surface,
             swapchain,
             render_pass,
-            shaders: vec![vertex_module, fragment_module],
+            shaders: Shaders {
+                vertex_module,
+                fragment_module,
+            },
             graphics_pipeline,
             graphics_queue,
             presentation_queue,
@@ -482,35 +493,51 @@ impl Renderer {
     /// Destroy the Pompeii renderer and its dependent resources.
     /// # Safety
     /// This function **must** only be called when the owned resources are not currently being processed by the GPU.
-    pub fn destroy(mut self) {
+    pub fn destroy(mut self, vulkan: &utils::VulkanCore) {
         unsafe {
+            // Destroy all fences.
             for (fence, _) in self.fences_and_state {
                 self.logical_device.destroy_fence(fence, None);
             }
 
+            // Destroy all command buffers and the command pool.
             self.logical_device
                 .free_command_buffers(self.command_pool, &self.command_buffers);
             self.logical_device
                 .destroy_command_pool(self.command_pool, None);
 
+            // Destroy the graphics pipeline and its dependent resources.
             self.graphics_pipeline.destroy(&self.logical_device);
-            for shader in self.shaders {
-                self.logical_device.destroy_shader_module(shader, None);
-            }
 
+            // Destroy all currently open shader modules.
+            self.logical_device
+                .destroy_shader_module(self.shaders.vertex_module, None);
+            self.logical_device
+                .destroy_shader_module(self.shaders.fragment_module, None);
+
+            // Destroy the render pass.
             self.logical_device
                 .destroy_render_pass(self.render_pass, None);
 
+            // Destroy the swapchain and its dependent resources, including framebuffers.
             self.swapchain
                 .destroy(&self.logical_device, &mut self.framebuffers);
 
+            // Destroy the logical device itself.
             self.logical_device.destroy_device(None);
+
+            // Destroy the Vulkan surface.
+            vulkan.khr.destroy_surface(self.surface, None);
         }
     }
 
     /// Recreate the swapchain, including the framebuffers and image views for the frames owned by the swapchain.
     /// The `self.swapchain_preferences` are used to recreate the swapchain and do not need to match those used with the initial swapchain creation.
     pub fn recreate_swapchain(&mut self, vulkan: &utils::VulkanCore) {
+        let old_format = self.swapchain.image_format();
+
+        // Recreate the swapchain using the new preferences.
+        // Note the framebuffers are emptied and will need to be recreated separately.
         self.swapchain.recreate_swapchain(
             vulkan,
             self.physical_device,
@@ -518,8 +545,48 @@ impl Renderer {
             self.surface,
             &mut self.framebuffers,
             self.swapchain_preferences,
-            |img, extent| create_framebuffer(&self.logical_device, self.render_pass, img, extent),
         );
+
+        // Check if the image format has changed and recreate the render pass and graphics pipeline if necessary.
+        if self.swapchain.image_format() != old_format {
+            let new_render_pass =
+                create_render_pass(&self.logical_device, self.swapchain.image_format());
+            let mut stack_pipeline = Pipeline::new_graphics(
+                &self.logical_device,
+                self.shaders.vertex_module,
+                self.shaders.fragment_module,
+                new_render_pass,
+            );
+
+            // Swap the new graphics pipeline with the old one.
+            std::mem::swap(&mut self.graphics_pipeline, &mut stack_pipeline);
+
+            unsafe {
+                self.logical_device
+                    .device_wait_idle()
+                    .expect("Unable to wait for device to become idle");
+            }
+
+            // Destroy the old graphics pipeline and render pass.
+            stack_pipeline.destroy(&self.logical_device);
+            unsafe {
+                self.logical_device
+                    .destroy_render_pass(self.render_pass, None);
+            }
+
+            self.render_pass = new_render_pass;
+        }
+
+        // Recreate the framebuffers using the new swapchain's image views.
+        let extent = self.swapchain.extent();
+        self.framebuffers = self
+            .swapchain
+            .image_views()
+            .iter()
+            .map(|image_view| {
+                create_framebuffer(&self.logical_device, self.render_pass, *image_view, extent)
+            })
+            .collect();
     }
 
     /// Attempt to render the next frame of the application. If there is a recoverable error, then the swapchain is recreated and the function bails early without rendering.
