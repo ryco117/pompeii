@@ -22,6 +22,7 @@ pub const FIVE_SECONDS_IN_NANOSECONDS: u64 = 5_000_000_000;
 pub struct VulkanCore {
     pub api: ash::Entry,
     pub instance: ash::Instance,
+    pub khr: ash::khr::surface::Instance,
 }
 
 impl VulkanCore {
@@ -110,9 +111,11 @@ impl VulkanCore {
             }
         };
 
+        let khr = ash::khr::surface::Instance::new(&vulkan_api, &vulkan_instance);
         Self {
             api: vulkan_api,
             instance: vulkan_instance,
+            khr,
         }
     }
 }
@@ -276,14 +279,12 @@ enum QueueType {
     Present,
 }
 
-/// Create a Vulkan logical device capable of graphics, compute, and presentation queues.
-/// Returns the device and the queue family indices that were requested for use.
-pub fn new_device(
+/// Get the necessary queue family indices for a logical device capable of graphics, compute, and presentation.
+pub fn get_queue_families(
     vulkan: &VulkanCore,
     physical_device: ash::vk::PhysicalDevice,
     surface: ash::vk::SurfaceKHR,
-    device_extensions: &[*const i8],
-) -> (ash::Device, QueueFamilies) {
+) -> QueueFamilies {
     // Get the list of available queue families for this device.
     let queue_families = unsafe {
         vulkan
@@ -298,13 +299,13 @@ pub fn new_device(
     // Use an array with indices to allow compile-time guarantees about the number of queue types.
     // TODO: Consider maintaining a list of queue family indices for each type of queue.
     //       This will also make it easier to put different queue types on different families if they are available.
-    // TODO: Make this logic its own function, `get_queue_families()`.
     let mut all_queue_families = [None; QueueType::COUNT];
     for (family_index, queue_family) in queue_families.iter().enumerate() {
         // Get a present queue family.
         if all_queue_families[QueueType::Present as usize].is_none() {
             let is_present_supported = unsafe {
-                ash::khr::surface::Instance::new(&vulkan.api, &vulkan.instance)
+                vulkan
+                    .khr
                     .get_physical_device_surface_support(
                         physical_device,
                         family_index as u32,
@@ -342,16 +343,44 @@ pub fn new_device(
     }
 
     // TODO: Allow the caller to choose which queue types are needed.
-    let graphics_family = all_queue_families[QueueType::Graphics as usize]
+    let graphics_family = all_queue_families[QueueType::Graphics as usize];
+    let compute_family = all_queue_families[QueueType::Compute as usize];
+    let present_family = all_queue_families[QueueType::Present as usize];
+
+    QueueFamilies {
+        graphics: graphics_family,
+        compute: compute_family,
+        present: present_family,
+        queue_families,
+    }
+}
+
+/// Create a Vulkan logical device capable of graphics, compute, and presentation queues.
+/// Returns the device and the queue family indices that were requested for use.
+pub fn new_device(
+    vulkan: &VulkanCore,
+    physical_device: ash::vk::PhysicalDevice,
+    surface: ash::vk::SurfaceKHR,
+    device_extensions: &[*const i8],
+) -> (ash::Device, QueueFamilies) {
+    // Get the necessary queue family indices for the logical device.
+    let queue_families = get_queue_families(vulkan, physical_device, surface);
+
+    let graphics_family = queue_families
+        .graphics
         .expect("Unable to find a graphics queue family");
-    let compute_family = all_queue_families[QueueType::Compute as usize]
+    let compute_family = queue_families
+        .compute
         .expect("Unable to find a compute queue family");
-    let present_family = all_queue_families[QueueType::Present as usize]
+    let present_family = queue_families
+        .present
         .expect("Unable to find a present queue family");
 
     // Aggregate queue family indices and count the number of queues each family may need allocated.
-    let mut family_map =
-        SmallVec::<[u32; EXPECTED_MAX_QUEUE_FAMILIES]>::from_elem(0, queue_families.len());
+    let mut family_map = SmallVec::<[u32; EXPECTED_MAX_QUEUE_FAMILIES]>::from_elem(
+        0,
+        queue_families.queue_families.len(),
+    );
     let all_family_types = [graphics_family, compute_family, present_family];
     for family in all_family_types {
         family_map[family as usize] += 1;
@@ -363,7 +392,7 @@ pub fn new_device(
     if family_map.spilled() {
         println!(
             "INFO: Queue family map has spilled over to the heap. Family count {} greater than inline size {}",
-            queue_families.len(),
+            queue_families.queue_families.len(),
             family_map.inline_size(),
         );
     }
@@ -379,7 +408,7 @@ pub fn new_device(
             let priorities = &priorities[..count as usize];
 
             // Limit to the number of available queues. Guaranteed to be non-zero.
-            let queue_count = count.min(queue_families[index].queue_count);
+            let queue_count = count.min(queue_families.queue_families[index].queue_count);
 
             Some(ash::vk::DeviceQueueCreateInfo {
                 queue_family_index: index as u32,
@@ -405,15 +434,7 @@ pub fn new_device(
             .expect("Unable to create logical device")
     };
 
-    (
-        device,
-        QueueFamilies {
-            graphics: Some(graphics_family),
-            compute: Some(compute_family),
-            present: Some(present_family),
-            queue_families,
-        },
-    )
+    (device, queue_families)
 }
 
 /// A helper for creating shader modules on a logical device.
@@ -529,9 +550,9 @@ impl Swapchain {
         preferences: SwapchainPreferences,
         old_swapchain: Option<ash::vk::SwapchainKHR>,
     ) -> Self {
-        let khr_instance = ash::khr::surface::Instance::new(&vulkan.api, &vulkan.instance);
         let surface_capabilities = unsafe {
-            khr_instance
+            vulkan
+                .khr
                 .get_physical_device_surface_capabilities(physical_device, surface)
                 .expect("Unable to get surface capabilities")
         };
@@ -544,7 +565,8 @@ impl Swapchain {
 
         // Determine which present modes are available.
         let supported_present_modes = unsafe {
-            khr_instance
+            vulkan
+                .khr
                 .get_physical_device_surface_present_modes(physical_device, surface)
                 .expect("Unable to get supported present modes")
         };
@@ -598,7 +620,8 @@ impl Swapchain {
 
         // Determine the image format that is supported and compare it to what is preferred.
         let supported_formats = unsafe {
-            khr_instance
+            vulkan
+                .khr
                 .get_physical_device_surface_formats(physical_device, surface)
                 .expect("Unable to get supported surface formats")
         };
@@ -728,7 +751,7 @@ impl Swapchain {
         };
 
         #[cfg(debug_assertions)]
-        println!("New Swapchain: Present mode: {image_count} * {present_mode:?}\n");
+        println!("New Swapchain: Present mode: {image_count} * {present_mode:?}: Format {image_format:?} in {image_color_space:?}\n");
 
         Self {
             swapchain_device,
@@ -746,38 +769,15 @@ impl Swapchain {
         }
     }
 
-    /// Recreate the swapchain using the existing one.
-    /// This is useful when the window is resized, or the window is moved to a different monitor.
-    pub fn recreate_swapchain(
-        &mut self,
-        vulkan: &VulkanCore,
-        physical_device: ash::vk::PhysicalDevice,
+    /// Delete the swapchain and its associated resources before dropping ownership.
+    /// # Safety
+    /// This function **must** only be called when the owned resources are not currently being processed by the GPU.
+    pub fn destroy(
+        self,
         logical_device: &ash::Device,
-        surface: ash::vk::SurfaceKHR,
         framebuffers: &mut Vec<ash::vk::Framebuffer>,
-        preferences: SwapchainPreferences,
-        create_framebuffer: impl Fn(ash::vk::ImageView, ash::vk::Extent2D) -> ash::vk::Framebuffer,
     ) {
-        let new_swapchain = Self::new(
-            vulkan,
-            physical_device,
-            logical_device,
-            surface,
-            preferences,
-            Some(self.swapchain),
-        );
-
-        // Wait for the logical device to finish its operations on the swapchain.
-        unsafe {
-            logical_device
-                .device_wait_idle()
-                .expect("Unable to wait for the logical device to finish its operations");
-        }
-
-        // TODO: Ensure that the new swapchain is compatible with the old one. Some changes may require the graphics pipeline to be recreated.
-
-        // Destroy the existing swapchain and its associated resources.
-        // TODO: Reuse more resources from the old swapchain if possible.
+        // Destroy resources in the reverse order they were created.
         unsafe {
             logical_device
                 .wait_for_fences(&[self.acquire_fence], true, FIVE_SECONDS_IN_NANOSECONDS)
@@ -797,9 +797,43 @@ impl Swapchain {
             self.swapchain_device
                 .destroy_swapchain(self.swapchain, None);
         }
+    }
 
-        // Replace the original swapchain with the new one, drop the old one.
-        std::mem::drop(std::mem::replace(self, new_swapchain));
+    /// Recreate the swapchain using the existing one.
+    /// This is useful when the window is resized, or the window is moved to a different monitor.
+    pub fn recreate_swapchain(
+        &mut self,
+        vulkan: &VulkanCore,
+        physical_device: ash::vk::PhysicalDevice,
+        logical_device: &ash::Device,
+        surface: ash::vk::SurfaceKHR,
+        framebuffers: &mut Vec<ash::vk::Framebuffer>,
+        preferences: SwapchainPreferences,
+        create_framebuffer: impl Fn(ash::vk::ImageView, ash::vk::Extent2D) -> ash::vk::Framebuffer,
+    ) {
+        let mut stack_var_swapchain = Self::new(
+            vulkan,
+            physical_device,
+            logical_device,
+            surface,
+            preferences,
+            Some(self.swapchain),
+        );
+
+        // Wait for the logical device to finish its operations on the swapchain.
+        unsafe {
+            logical_device
+                .device_wait_idle()
+                .expect("Unable to wait for the logical device to finish its operations");
+        }
+
+        // TODO: Ensure that the new swapchain is compatible with the old one. Some changes may require the graphics pipeline to be recreated.
+
+        // Swap the original swapchain (`self`) with the new one.
+        std::mem::swap(self, &mut stack_var_swapchain);
+
+        // Destroy the old swapchain and its associated resources.
+        stack_var_swapchain.destroy(logical_device, framebuffers);
 
         // Recreate the framebuffers using the new swapchain's image views.
         *framebuffers = self

@@ -159,6 +159,7 @@ pub fn create_framebuffer(
 /// Manage the graphics pipeline and dependent resources.
 pub struct Pipeline {
     pub handle: ash::vk::Pipeline,
+    pub layout: ash::vk::PipelineLayout,
 }
 
 impl Pipeline {
@@ -233,7 +234,7 @@ impl Pipeline {
             ..Default::default()
         };
 
-        // TODO: Enable other common pipeline features including descriptor sets, dynamic state, etc.
+        // TODO: Enable other common pipeline features including descriptor sets, push-constant ranges, etc.
 
         let pipeline_layout = unsafe {
             device
@@ -257,11 +258,13 @@ impl Pipeline {
         //     ..Default::default()
         // };
 
+        // Assert that the viewport and scissor will be assigned dynamically by the command buffers at render time.
         let dynamic_states = [
             ash::vk::DynamicState::VIEWPORT,
             ash::vk::DynamicState::SCISSOR,
         ];
 
+        // Create the graphics pipeline using the parameters above.
         let pipeline = *unsafe {
             device.create_graphics_pipelines(
                 ash::vk::PipelineCache::null(),
@@ -293,7 +296,20 @@ impl Pipeline {
         .first()
         .expect("vkCreateGraphicsPipelines returned an empty list of pipelines");
 
-        Self { handle: pipeline }
+        Self {
+            handle: pipeline,
+            layout: pipeline_layout,
+        }
+    }
+
+    /// Destroy the graphics pipeline and its dependent resources.
+    /// # Safety
+    /// This function **must** only be called when the owned resources are not currently being processed by the GPU.
+    pub fn destroy(self, device: &ash::Device) {
+        unsafe {
+            device.destroy_pipeline(self.handle, None);
+            device.destroy_pipeline_layout(self.layout, None);
+        }
     }
 }
 
@@ -304,9 +320,11 @@ pub struct Renderer {
     pub surface: ash::vk::SurfaceKHR,
     pub swapchain: utils::Swapchain,
     pub render_pass: ash::vk::RenderPass,
+    pub shaders: Vec<ash::vk::ShaderModule>,
     pub graphics_pipeline: Pipeline,
     pub graphics_queue: ash::vk::Queue,
     pub presentation_queue: ash::vk::Queue,
+    pub command_pool: ash::vk::CommandPool,
     pub command_buffers: Vec<ash::vk::CommandBuffer>,
     pub framebuffers: Vec<ash::vk::Framebuffer>,
     pub fences_and_state: Vec<(ash::vk::Fence, bool)>,
@@ -435,7 +453,7 @@ impl Renderer {
         };
 
         // Create the framebuffers for this application.
-        // TODO: Create framebuffers with the render pass because the render pass defines the framebuffer topology.
+        // TODO: Create framebuffers in the same function as the render pass because the render pass defines the framebuffer topology.
         let extent = swapchain.extent();
         let framebuffers = swapchain
             .image_views()
@@ -449,13 +467,44 @@ impl Renderer {
             surface,
             swapchain,
             render_pass,
+            shaders: vec![vertex_module, fragment_module],
             graphics_pipeline,
             graphics_queue,
             presentation_queue,
+            command_pool,
             command_buffers,
             framebuffers,
             fences_and_state,
             swapchain_preferences,
+        }
+    }
+
+    /// Destroy the Pompeii renderer and its dependent resources.
+    /// # Safety
+    /// This function **must** only be called when the owned resources are not currently being processed by the GPU.
+    pub fn destroy(mut self) {
+        unsafe {
+            for (fence, _) in self.fences_and_state {
+                self.logical_device.destroy_fence(fence, None);
+            }
+
+            self.logical_device
+                .free_command_buffers(self.command_pool, &self.command_buffers);
+            self.logical_device
+                .destroy_command_pool(self.command_pool, None);
+
+            self.graphics_pipeline.destroy(&self.logical_device);
+            for shader in self.shaders {
+                self.logical_device.destroy_shader_module(shader, None);
+            }
+
+            self.logical_device
+                .destroy_render_pass(self.render_pass, None);
+
+            self.swapchain
+                .destroy(&self.logical_device, &mut self.framebuffers);
+
+            self.logical_device.destroy_device(None);
         }
     }
 
@@ -481,9 +530,9 @@ impl Renderer {
 
             // TODO: Consider accepting suboptimal for this draw, but set a flag to recreate the swapchain next frame.
             Ok((_, _, true)) | Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                let khr_instance = ash::khr::surface::Instance::new(&vulkan.api, &vulkan.instance);
                 let surface_capabilities = unsafe {
-                    khr_instance
+                    vulkan
+                        .khr
                         .get_physical_device_surface_capabilities(
                             self.physical_device,
                             self.surface,
@@ -627,9 +676,9 @@ impl Renderer {
         match self.swapchain.present(self.presentation_queue) {
             Ok(false) => (),
             Ok(true) | Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                let khr_instance = ash::khr::surface::Instance::new(&vulkan.api, &vulkan.instance);
                 let surface_capabilities = unsafe {
-                    khr_instance
+                    vulkan
+                        .khr
                         .get_physical_device_surface_capabilities(
                             self.physical_device,
                             self.surface,

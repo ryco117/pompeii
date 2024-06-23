@@ -24,6 +24,8 @@ fn main() {
 
     // Create the Pompeii application initialized with the CLI arguments and specifics of the event loop at runtime (i.e., platform-dependent windowing).
     let mut app = PompeiiApp::new(cli_args, &event_loop);
+
+    // Run the application event loop.
     event_loop
         .run_app(&mut app)
         .expect("Error during event loop");
@@ -48,6 +50,7 @@ enum PompeiiEvent {}
 /// The graphics-specific state. Needs to be initialized after the event loop has begun.
 struct PompeiiGraphics {
     window: winit::window::Window,
+    surface: ash::vk::SurfaceKHR,
     renderer: engine::Renderer,
 }
 
@@ -93,7 +96,10 @@ impl PompeiiApp {
 
     /// Redraw the window surface if we have initialized the relevant components.
     fn redraw(&mut self) {
-        let Some(PompeiiGraphics { window, renderer }) = &mut self.graphics else {
+        let Some(PompeiiGraphics {
+            window, renderer, ..
+        }) = &mut self.graphics
+        else {
             return;
         };
 
@@ -220,7 +226,11 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
         );
 
         // Complete the state transition to windowed mode.
-        self.graphics = Some(PompeiiGraphics { window, renderer });
+        self.graphics = Some(PompeiiGraphics {
+            window,
+            surface,
+            renderer,
+        });
 
         println!("Application started");
     }
@@ -250,5 +260,35 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
             // Ignore other events.
             _ => (),
         }
+    }
+}
+
+impl Drop for PompeiiApp {
+    /// Clean up the Vulkan instance and any associated resources.
+    fn drop(&mut self) {
+        if let Some(graphics) = self.graphics.take() {
+            // Wait for the device to finish before cleaning up.
+            unsafe {
+                graphics
+                    .renderer
+                    .logical_device
+                    .device_wait_idle()
+                    .expect("Unable to wait for device idle");
+            }
+
+            // Destroy the main Pompeii renderer and Vulkan resources.
+            graphics.renderer.destroy();
+
+            // Destroy the Vulkan surface.
+            unsafe { self.vulkan.khr.destroy_surface(graphics.surface, None) }
+        }
+
+        // Destroy the Vulkan instance.
+        unsafe {
+            self.vulkan.instance.destroy_instance(None);
+        }
+
+        #[cfg(debug_assertions)]
+        println!("Freed all Vulkan resources used during the application's lifetime.");
     }
 }
