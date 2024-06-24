@@ -550,12 +550,7 @@ pub struct Swapchain {
     color_space: ash::vk::ColorSpaceKHR,
     present_mode: ash::vk::PresentModeKHR,
     extent: ash::vk::Extent2D,
-
-    // TODO: Create a smallvec of `frames_in_flight` size to store synchronization objects.
-    image_available: ash::vk::Semaphore,
-    image_rendered: ash::vk::Semaphore,
-    acquire_fence: ash::vk::Fence,
-
+    frame_syncs: SmallVec<[FrameInFlightSync; EXPECTED_MAX_FRAMES_IN_FLIGHT]>,
     current_frame: usize,
     acquired_index: Option<u32>,
 }
@@ -753,30 +748,26 @@ impl Swapchain {
             .collect();
 
         // Create synchronization objects. Semaphores synchronize between different operations on the GPU; fences synchronize operations between the CPU and GPU.
-        // TODO: The Vulkan tutorial published by the Khronos Group uses an image available and image rendered semaphore for each frame in flight. Not clear whether this is necessary, but should monitor.
-        //       https://docs.vulkan.org/tutorial/latest/03_Drawing_a_triangle/03_Drawing/03_Frames_in_flight.html
-        let image_available = unsafe {
-            logical_device
-                .create_semaphore(&ash::vk::SemaphoreCreateInfo::default(), None)
-                .expect("Unable to create image available semaphore")
-        };
-        let image_rendered = unsafe {
-            logical_device
-                .create_semaphore(&ash::vk::SemaphoreCreateInfo::default(), None)
-                .expect("Unable to create render finished semaphore")
-        };
-        let acquire_fence = unsafe {
-            // Create the acquire fence in the signaled state to avoid waiting on the first acquire.
-            logical_device
-                .create_fence(
-                    &ash::vk::FenceCreateInfo {
-                        flags: ash::vk::FenceCreateFlags::SIGNALED,
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .expect("Unable to create the acquire fence")
-        };
+        // We will have a frame in flight for each image in the swapchain, and at least two so that a new command can be recorded while another is read.
+        let frames_in_flight = image_count.max(2) as usize;
+        let frame_syncs = std::iter::repeat_with(|| {
+            let image_available = unsafe {
+                logical_device
+                    .create_semaphore(&ash::vk::SemaphoreCreateInfo::default(), None)
+                    .expect("Unable to create image available semaphore")
+            };
+            let image_rendered = unsafe {
+                logical_device
+                    .create_semaphore(&ash::vk::SemaphoreCreateInfo::default(), None)
+                    .expect("Unable to create render finished semaphore")
+            };
+            FrameInFlightSync {
+                image_available,
+                image_rendered,
+            }
+        })
+        .take(frames_in_flight)
+        .collect();
 
         #[cfg(debug_assertions)]
         println!("New Swapchain: Present mode: {image_count} * {present_mode:?}: Format {image_format:?} in {image_color_space:?}\n");
@@ -790,9 +781,7 @@ impl Swapchain {
             color_space: image_color_space,
             present_mode,
             extent,
-            image_available,
-            image_rendered,
-            acquire_fence,
+            frame_syncs,
             current_frame: 0,
             acquired_index: None,
         }
@@ -808,18 +797,17 @@ impl Swapchain {
     ) {
         // Destroy resources in the reverse order they were created.
         unsafe {
-            logical_device
-                .wait_for_fences(&[self.acquire_fence], true, FIVE_SECONDS_IN_NANOSECONDS)
-                .expect("Unable to wait for the acquire fence");
-            logical_device.destroy_fence(self.acquire_fence, None);
-            logical_device.destroy_semaphore(self.image_rendered, None);
-            logical_device.destroy_semaphore(self.image_available, None);
+            // Destroy the synchronization objects.
+            for sync in self.frame_syncs {
+                logical_device.destroy_semaphore(sync.image_available, None);
+                logical_device.destroy_semaphore(sync.image_rendered, None);
+            }
 
+            // Destroy the framebuffers, image views, and finally the images.
             for framebuffer in framebuffers.drain(..) {
                 logical_device.destroy_framebuffer(framebuffer, None);
             }
-
-            for &image_view in &self.image_views {
+            for image_view in self.image_views {
                 logical_device.destroy_image_view(image_view, None);
             }
 
@@ -866,30 +854,14 @@ impl Swapchain {
     }
 
     /// Acquire the next image in the swapchain. Maintain the index of the acquired image.
-    pub fn acquire_next_frame(
-        &mut self,
-        device: &ash::Device,
-    ) -> ash::prelude::VkResult<NextFrame> {
-        // Advance the current frame index to the next.
-        self.current_frame = (self.current_frame + 1) % self.images.len();
-
-        // Wait for the last acquire to complete its operation within the swapchain.
-        unsafe {
-            device
-                .wait_for_fences(&[self.acquire_fence], true, FIVE_SECONDS_IN_NANOSECONDS)
-                .expect("Failed to wait for the acquire fence");
-            device
-                .reset_fences(&[self.acquire_fence])
-                .expect("Failed to reset the acquire fence");
-        }
-
+    pub fn acquire_next_image(&mut self) -> ash::prelude::VkResult<NextFrame> {
         // Acquire the next image in the swapchain, using the same fence to signal completion.
         let (acquired_index, suboptimal) = unsafe {
             self.swapchain_device.acquire_next_image(
                 self.swapchain,
                 FIVE_SECONDS_IN_NANOSECONDS,
-                self.image_available,
-                self.acquire_fence,
+                self.image_available(),
+                ash::vk::Fence::null(),
             )?
         };
 
@@ -910,36 +882,45 @@ impl Swapchain {
             .acquired_index
             .take()
             .expect("No image has been acquired by the swapchain before presenting");
-        unsafe {
+
+        let result = unsafe {
             self.swapchain_device.queue_present(
                 present_queue,
                 &ash::vk::PresentInfoKHR {
                     wait_semaphore_count: 1,
-                    p_wait_semaphores: &self.image_rendered,
+                    p_wait_semaphores: &self.image_rendered(),
                     swapchain_count: 1,
                     p_swapchains: &self.swapchain,
                     p_image_indices: &acquired_index, // Needs to have the same number of entries as `swapchain_count`, i.e. 1.
                     ..Default::default()
                 },
             )
-        }
+        };
+
+        // Advance the current frame index to the next after successfully submitting the presentation command.
+        self.current_frame = (self.current_frame + 1) % self.frame_syncs.len();
+
+        result
     }
 
     // Swapchain getters.
+    pub fn current_frame(&self) -> usize {
+        self.current_frame
+    }
     pub fn extent(&self) -> ash::vk::Extent2D {
         self.extent
     }
-    pub fn image_available(&self) -> ash::vk::Semaphore {
-        self.image_available
+    pub fn frames_in_flight(&self) -> usize {
+        self.frame_syncs.len()
     }
-    pub fn image_count(&self) -> usize {
-        self.images.len()
+    pub fn image_available(&self) -> ash::vk::Semaphore {
+        self.frame_syncs[self.current_frame].image_available
     }
     pub fn image_format(&self) -> ash::vk::Format {
         self.format
     }
     pub fn image_rendered(&self) -> ash::vk::Semaphore {
-        self.image_rendered
+        self.frame_syncs[self.current_frame].image_rendered
     }
     pub fn image_views(&self) -> &[ash::vk::ImageView] {
         &self.image_views
