@@ -592,11 +592,15 @@ impl Renderer {
     /// Attempt to render the next frame of the application. If there is a recoverable error, then the swapchain is recreated and the function bails early without rendering.
     pub fn render_frame(&mut self, vulkan: &utils::VulkanCore) {
         // Get the next image to render to. Has internal synchronization to ensure the previous acquire completed on the GPU.
-        let (_image, image_index) = match self.swapchain.acquire_next_image(&self.logical_device) {
-            Ok((image, index, false)) => (image, index),
+        let utils::NextFrame {
+            current_frame,
+            image_index,
+            ..
+        } = match self.swapchain.acquire_next_frame(&self.logical_device) {
+            Ok(f) if !f.suboptimal => f,
 
             // TODO: Consider accepting suboptimal for this draw, but set a flag to recreate the swapchain next frame.
-            Ok((_, _, true)) | Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+            Ok(_) | Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 let surface_capabilities = unsafe {
                     vulkan
                         .khr
@@ -622,9 +626,10 @@ impl Renderer {
         };
 
         // Synchronize the CPU with the GPU for the resources previously used for this image index.
+        // Specifically, the command buffer cannot be reused until the fence is signaled.
         // TODO: Make this into its own utils function because it is a common pattern.
-        let resource_fence = self.fences_and_state[image_index as usize].0;
-        let command_buffer = self.command_buffers[image_index as usize];
+        let resource_fence = self.fences_and_state[current_frame as usize].0;
+        let command_buffer = self.command_buffers[current_frame as usize];
         unsafe {
             self.logical_device
                 .wait_for_fences(&[resource_fence], true, utils::FIVE_SECONDS_IN_NANOSECONDS)
@@ -736,7 +741,7 @@ impl Renderer {
 
             // Note that this fence has been submitted.
             // TODO: Determine if this is useful.
-            self.fences_and_state[image_index as usize].1 = true;
+            self.fences_and_state[current_frame as usize].1 = true;
         }
 
         // Queue the presentation of the swapchain image.

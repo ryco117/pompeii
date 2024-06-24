@@ -15,6 +15,9 @@ const EXPECTED_MAX_INSTANCE_EXTENSIONS: usize = 16;
 /// A heap allocation is required if the number of physical devices exceeds this value.
 const EXPECTED_MAX_VULKAN_PHYSICAL_DEVICES: usize = 4;
 
+/// Sane maximum number of frames in flight before certain heap allocations are required.
+const EXPECTED_MAX_FRAMES_IN_FLIGHT: usize = 3;
+
 /// The number of nanoseconds in five seconds.
 pub const FIVE_SECONDS_IN_NANOSECONDS: u64 = 5_000_000_000;
 
@@ -64,8 +67,14 @@ impl VulkanCore {
         if supports_colorspace_ext {
             #[cfg(debug_assertions)]
             println!("Enabling VK_EXT_swapchain_colorspace extension");
-
             extension_name_pointers.push(ash::ext::swapchain_colorspace::NAME.as_ptr());
+        }
+
+        // Add the debug utility extension if in debug mode.
+        #[cfg(debug_assertions)]
+        if available_contains(ash::ext::debug_utils::NAME) {
+            println!("Enabling VK_EXT_debug_utils extension");
+            extension_name_pointers.push(ash::ext::debug_utils::NAME.as_ptr());
         }
 
         // Enable validation layers when using a debug build.
@@ -527,6 +536,11 @@ pub struct SwapchainPreferences {
     pub present_mode: Option<ash::vk::PresentModeKHR>,
 }
 
+struct FrameInFlightSync {
+    image_available: ash::vk::Semaphore,
+    image_rendered: ash::vk::Semaphore,
+}
+
 pub struct Swapchain {
     swapchain_device: ash::khr::swapchain::Device,
     swapchain: ash::vk::SwapchainKHR,
@@ -536,10 +550,22 @@ pub struct Swapchain {
     color_space: ash::vk::ColorSpaceKHR,
     present_mode: ash::vk::PresentModeKHR,
     extent: ash::vk::Extent2D,
+
+    // TODO: Create a smallvec of `frames_in_flight` size to store synchronization objects.
     image_available: ash::vk::Semaphore,
     image_rendered: ash::vk::Semaphore,
     acquire_fence: ash::vk::Fence,
+
+    current_frame: usize,
     acquired_index: Option<u32>,
+}
+
+/// The result of acquiring the next image from the swapchain and advancing to the next frame in flight.
+pub struct NextFrame {
+    pub current_frame: usize,
+    pub image_view: ash::vk::ImageView,
+    pub image_index: u32,
+    pub suboptimal: bool,
 }
 
 impl Swapchain {
@@ -677,16 +703,14 @@ impl Swapchain {
 
         // Massage the current extent to ensure it is within the bounds of the surface.
         let extent = ash::vk::Extent2D {
-            width: surface_capabilities
-                .current_extent
-                .width
-                .max(surface_capabilities.min_image_extent.width)
-                .min(surface_capabilities.max_image_extent.width),
-            height: surface_capabilities
-                .current_extent
-                .height
-                .max(surface_capabilities.min_image_extent.height)
-                .min(surface_capabilities.max_image_extent.height),
+            width: surface_capabilities.current_extent.width.clamp(
+                surface_capabilities.min_image_extent.width,
+                surface_capabilities.max_image_extent.width,
+            ),
+            height: surface_capabilities.current_extent.height.clamp(
+                surface_capabilities.min_image_extent.height,
+                surface_capabilities.max_image_extent.height,
+            ),
         };
 
         // Create the swapchain with the specified parameters.
@@ -769,6 +793,7 @@ impl Swapchain {
             image_available,
             image_rendered,
             acquire_fence,
+            current_frame: 0,
             acquired_index: None,
         }
     }
@@ -841,10 +866,13 @@ impl Swapchain {
     }
 
     /// Acquire the next image in the swapchain. Maintain the index of the acquired image.
-    pub fn acquire_next_image(
+    pub fn acquire_next_frame(
         &mut self,
         device: &ash::Device,
-    ) -> ash::prelude::VkResult<(ash::vk::ImageView, u32, bool)> {
+    ) -> ash::prelude::VkResult<NextFrame> {
+        // Advance the current frame index to the next.
+        self.current_frame = (self.current_frame + 1) % self.images.len();
+
         // Wait for the last acquire to complete its operation within the swapchain.
         unsafe {
             device
@@ -868,11 +896,12 @@ impl Swapchain {
         // Update our internal state with the acquired image's index.
         self.acquired_index = Some(acquired_index);
 
-        Ok((
-            self.image_views[acquired_index as usize],
-            acquired_index,
+        Ok(NextFrame {
+            current_frame: self.current_frame,
+            image_view: self.image_views[acquired_index as usize],
+            image_index: acquired_index,
             suboptimal,
-        ))
+        })
     }
 
     /// Present the next image in the swapchain. Return whether the swapchain is suboptimal for the surface on success.

@@ -80,10 +80,6 @@ impl PompeiiApp {
         // Add the ability to check and specify additional device features. This is required for ray-tracing through the `vkGetPhysicalDeviceFeatures2KHR` call.
         extension_names.push(ash::khr::get_physical_device_properties2::NAME);
 
-        // Add the debug utility extension if in debug mode.
-        #[cfg(debug_assertions)]
-        extension_names.push(ash::ext::debug_utils::NAME);
-
         // Create a Vulkan instance for our application initialized with the `Empty` state.
         PompeiiApp {
             args,
@@ -230,10 +226,7 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
         let renderer = engine::Renderer::new(&self.vulkan, surface, swapchain_preferences);
 
         // Complete the state transition to windowed mode.
-        self.graphics = Some(PompeiiGraphics {
-            window,
-            renderer,
-        });
+        self.graphics = Some(PompeiiGraphics { window, renderer });
 
         println!("Application started");
     }
