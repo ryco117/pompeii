@@ -5,35 +5,54 @@ use strum::EnumCount as _;
 
 /// Set a sane value for the maximum expected number of queue families.
 /// A heap allocation is required if the number of queue families exceeds this value.
-const EXPECTED_MAX_QUEUE_FAMILIES: usize = 8;
+pub const EXPECTED_MAX_QUEUE_FAMILIES: usize = 8;
 
 /// Set a sane value for the maximum expected number of instance extensions.
 /// A heap allocation is required if the number of instance extensions exceeds this value.
-const EXPECTED_MAX_INSTANCE_EXTENSIONS: usize = 16;
+pub const EXPECTED_MAX_ENABLED_INSTANCE_EXTENSIONS: usize = 16;
 
 /// Set a sane value for the maximum expected number of physical devices.
 /// A heap allocation is required if the number of physical devices exceeds this value.
-const EXPECTED_MAX_VULKAN_PHYSICAL_DEVICES: usize = 4;
+pub const EXPECTED_MAX_VULKAN_PHYSICAL_DEVICES: usize = 4;
 
 /// Sane maximum number of frames in flight before certain heap allocations are required.
-const EXPECTED_MAX_FRAMES_IN_FLIGHT: usize = 3;
+pub const EXPECTED_MAX_FRAMES_IN_FLIGHT: usize = 4;
 
-/// The number of nanoseconds in five seconds.
+/// The number of nanoseconds in five seconds. Used for sane timeouts on synchronization objects.
 pub const FIVE_SECONDS_IN_NANOSECONDS: u64 = 5_000_000_000;
+
+/// Check if a list of extensions contains a specific extension name.
+pub fn extensions_list_contains(list: &[ash::vk::ExtensionProperties], ext: &CStr) -> bool {
+    list.iter().any(|p| {
+        p.extension_name_as_c_str()
+            .expect("Extension name received from Vulkan is not a valid C-string")
+            == ext
+    })
+}
+
+/// The possible errors that may occur when creating a `VulkanCore`.
+#[derive(Debug)]
+pub enum VulkanCoreError {
+    Loading(ash::LoadingError),
+    MissingExtension(String),
+    MissingLayer(String),
+}
 
 /// The main Vulkan library interface. Contains the entry to the Vulkan library and an instance for this app.
 pub struct VulkanCore {
+    pub version: u32,
     pub api: ash::Entry,
     pub instance: ash::Instance,
     pub khr: ash::khr::surface::Instance,
     pub enabled_colorspace_ext: bool,
+    pub enabled_surface_maintenance: bool,
 }
 
 impl VulkanCore {
-    /// Create a new `VulkanCore` with the specified extensions.
-    pub fn new(extension_names: &[&CStr]) -> Self {
+    /// Create a new `VulkanCore` with the specified instance extensions.
+    pub fn new(extension_names: &[&CStr], api_version: u32) -> Result<Self, VulkanCoreError> {
         // Attempt to dynamically load the Vulkan API from platform-specific shared libraries.
-        let vulkan_api = unsafe { ash::Entry::load().expect("Unable to load Vulkan libraries") };
+        let vulkan_api = unsafe { ash::Entry::load().map_err(VulkanCoreError::Loading)? };
 
         // Determine which extensions are available at runtime.
         let available_extensions = unsafe {
@@ -45,21 +64,19 @@ impl VulkanCore {
         #[cfg(debug_assertions)]
         println!("Available instance extensions: {available_extensions:?}\n");
 
-        let available_contains = |ext: &CStr| {
-            available_extensions.iter().any(|p| {
-                p.extension_name_as_c_str()
-                    .expect("Available extension name is not a valid C string")
-                    == ext
-            })
-        };
+        // Helper lambda for checking if an extension is available.
+        let available_contains = |ext: &CStr| extensions_list_contains(&available_extensions, ext);
 
         // Check that the required extensions are available.
-        for &ext in extension_names {
-            assert!(available_contains(ext), "Required extension {ext:?} is not available. All extensions: {available_extensions:?}");
+        if let Some(missing) = extension_names.iter().find(|ext| !available_contains(ext)) {
+            return Err(VulkanCoreError::MissingExtension(
+                missing.to_string_lossy().into_owned(),
+            ));
         }
 
-        let mut extension_name_pointers: SmallVec<[*const i8; EXPECTED_MAX_INSTANCE_EXTENSIONS]> =
-            extension_names.iter().map(|&e| e.as_ptr()).collect();
+        let mut extension_name_pointers: SmallVec<
+            [*const i8; EXPECTED_MAX_ENABLED_INSTANCE_EXTENSIONS],
+        > = extension_names.iter().map(|&e| e.as_ptr()).collect();
 
         // Optionally, enable `VK_EXT_swapchain_colorspace` if is is available and the dependent `VK_KHR_surface` is requested.
         let supports_colorspace_ext = extension_names.contains(&ash::khr::surface::NAME)
@@ -68,6 +85,17 @@ impl VulkanCore {
             #[cfg(debug_assertions)]
             println!("Enabling VK_EXT_swapchain_colorspace extension");
             extension_name_pointers.push(ash::ext::swapchain_colorspace::NAME.as_ptr());
+        }
+
+        // Optionally, enable `VK_KHR_get_surface_capabilities2` and `VK_EXT_surface_maintenance1` if they are available and the dependent `VK_KHR_surface` is requested.
+        let supports_surface_maintenance = extension_names.contains(&ash::khr::surface::NAME)
+            && available_contains(ash::khr::get_surface_capabilities2::NAME)
+            && available_contains(ash::ext::surface_maintenance1::NAME);
+        if supports_surface_maintenance {
+            #[cfg(debug_assertions)]
+            println!("Enabling VK_KHR_get_surface_capabilities2 and VK_EXT_surface_maintenance1 extensions");
+            extension_name_pointers.push(ash::khr::get_surface_capabilities2::NAME.as_ptr());
+            extension_name_pointers.push(ash::ext::surface_maintenance1::NAME.as_ptr());
         }
 
         // Add the debug utility extension if in debug mode.
@@ -92,17 +120,26 @@ impl VulkanCore {
             println!("Available layers: {available_layers:?}\n");
 
             // Check that all the desired debug layers are available.
-            if DEBUG_LAYERS.iter().all(|&d| {
-                available_layers.iter().any(|a| {
+            if let Some(missing) = DEBUG_LAYERS.iter().find_map(|&layer_ptr| {
+                let layer_cstr = unsafe { CStr::from_ptr(layer_ptr) };
+                let layer_exists = available_layers.iter().any(|a| {
                     a.layer_name_as_c_str()
-                        .expect("Available layer name is not a valid C string")
-                        == unsafe { CStr::from_ptr(d) }
-                })
+                        .expect("Available layer name is not a valid C-string")
+                        == layer_cstr
+                });
+
+                if layer_exists {
+                    // This layer is not missing from the available layers.
+                    None
+                } else {
+                    // This layer is missing, return it as a `String` to the `find_map`.
+                    Some(layer_cstr.to_string_lossy().into_owned())
+                }
             }) {
-                DEBUG_LAYERS
-            } else {
-                panic!("Required debug layers are not available");
+                return Err(VulkanCoreError::MissingLayer(missing));
             }
+
+            DEBUG_LAYERS
         };
         // Disable validation layers when using a release build.
         #[cfg(not(debug_assertions))]
@@ -112,9 +149,10 @@ impl VulkanCore {
         let vulkan_instance = {
             let application_info = ash::vk::ApplicationInfo {
                 p_application_name: c"Pompeii".as_ptr().cast(),
+                application_version: ash::vk::make_api_version(0, 0, 1, 0),
                 p_engine_name: c"Pompeii".as_ptr().cast(),
-                api_version: ash::vk::API_VERSION_1_3,
                 engine_version: ash::vk::make_api_version(0, 0, 1, 0),
+                api_version,
                 ..Default::default()
             };
             let instance_info = {
@@ -135,12 +173,14 @@ impl VulkanCore {
         };
 
         let khr = ash::khr::surface::Instance::new(&vulkan_api, &vulkan_instance);
-        Self {
+        Ok(Self {
+            version: api_version,
             api: vulkan_api,
             instance: vulkan_instance,
             khr,
             enabled_colorspace_ext: supports_colorspace_ext,
-        }
+            enabled_surface_maintenance: supports_surface_maintenance,
+        })
     }
 }
 
@@ -160,10 +200,8 @@ pub fn physical_supports_rtx(
         p_next: std::ptr::from_mut(&mut ray_tracing).cast(),
         ..Default::default()
     };
-    let mut features = ash::vk::PhysicalDeviceFeatures2 {
-        p_next: std::ptr::from_mut(&mut acceleration_structure).cast(),
-        ..Default::default()
-    };
+    let mut features =
+        ash::vk::PhysicalDeviceFeatures2::default().push_next(&mut acceleration_structure);
     unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
 
     // If the physical device supports ray tracing, return the ray tracing pipeline properties.
@@ -173,10 +211,8 @@ pub fn physical_supports_rtx(
     {
         let mut ray_tracing_pipeline =
             ash::vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
-        let mut properties = ash::vk::PhysicalDeviceProperties2 {
-            p_next: std::ptr::from_mut(&mut ray_tracing_pipeline).cast(),
-            ..Default::default()
-        };
+        let mut properties =
+            ash::vk::PhysicalDeviceProperties2::default().push_next(&mut ray_tracing_pipeline);
         unsafe { instance.get_physical_device_properties2(physical_device, &mut properties) };
         Some(ray_tracing_pipeline)
     } else {
@@ -184,9 +220,10 @@ pub fn physical_supports_rtx(
     }
 }
 
-/// Get all physical devices that support Vulkan 1.3 and the required extensions. Sort them by their likelihood of being the desired device.
+/// Get all physical devices that support the minimum Vulkan API and the required extensions. Sort them by their likelihood of being the desired device.
 pub fn get_sorted_physical_devices(
     instance: &ash::Instance,
+    minimum_version: u32,
     required_extensions: &[*const i8],
 ) -> SmallVec<
     [(ash::vk::PhysicalDevice, ash::vk::PhysicalDeviceProperties);
@@ -230,7 +267,7 @@ pub fn get_sorted_physical_devices(
             println!("Physical device {device:?}: {properties:?}\nPhysical device available extensions: {extensions:?}\n");
 
             // Ensure the device supports Vulkan 1.3.
-            if properties.api_version < ash::vk::API_VERSION_1_3 {
+            if properties.api_version < minimum_version {
                 #[cfg(debug_assertions)]
                 println!("Physical device {device:?} does not support a sufficiently high Vulkan version");
                 return None;
@@ -239,11 +276,7 @@ pub fn get_sorted_physical_devices(
             // Ensure the device supports all required extensions.
             if required_extensions.iter().all(|&req| {
                 let req = unsafe { CStr::from_ptr(req) };
-                let exists = extensions.iter().any(|e| {
-                    e.extension_name_as_c_str()
-                        .expect("Available extension name is not a valid C string")
-                        == req
-                });
+                let exists = extensions_list_contains(&extensions, req);
 
                 #[cfg(debug_assertions)]
                 if !exists {
@@ -291,6 +324,7 @@ pub fn get_sorted_physical_devices(
 pub struct QueueFamilies {
     pub graphics: Vec<u32>,
     pub compute: Vec<u32>,
+    pub transfer: Vec<u32>,
     pub present: Vec<u32>,
     pub queue_families: Vec<ash::vk::QueueFamilyProperties>,
 }
@@ -301,6 +335,7 @@ enum QueueType {
     Graphics,
     Compute,
     Present,
+    Transfer,
 }
 
 /// Get the necessary queue family indices for a logical device capable of graphics, compute, and presentation.
@@ -319,12 +354,12 @@ pub fn get_queue_families(
     #[cfg(debug_assertions)]
     println!("Queue families: {queue_families:?}\n");
 
-    // Find the first queue families for each desired queue type.
+    // Find the queue families for each desired queue type.
     // Use an array with indices to allow compile-time guarantees about the number of queue types.
-    let mut all_queue_families = [const { Vec::<u32>::new() }; QueueType::COUNT];
+    let mut type_indices = [const { Vec::<u32>::new() }; QueueType::COUNT];
     for (family_index, queue_family) in queue_families.iter().enumerate() {
         // Get a present queue family.
-        if all_queue_families[QueueType::Present as usize].is_empty() {
+        if type_indices[QueueType::Present as usize].is_empty() {
             let is_present_supported = unsafe {
                 vulkan
                     .khr
@@ -336,7 +371,7 @@ pub fn get_queue_families(
                     .expect("Unable to check if 'present' is supported")
             };
             if is_present_supported {
-                all_queue_families[QueueType::Present as usize].push(family_index as u32);
+                type_indices[QueueType::Present as usize].push(family_index as u32);
             }
         }
 
@@ -345,7 +380,7 @@ pub fn get_queue_families(
             .queue_flags
             .contains(ash::vk::QueueFlags::GRAPHICS)
         {
-            all_queue_families[QueueType::Graphics as usize].push(family_index as u32);
+            type_indices[QueueType::Graphics as usize].push(family_index as u32);
         }
 
         // Get a compute queue family.
@@ -353,18 +388,28 @@ pub fn get_queue_families(
             .queue_flags
             .contains(ash::vk::QueueFlags::COMPUTE)
         {
-            all_queue_families[QueueType::Compute as usize].push(family_index as u32);
+            type_indices[QueueType::Compute as usize].push(family_index as u32);
+        }
+
+        // Get a transfer queue family.
+        if queue_family
+            .queue_flags
+            .contains(ash::vk::QueueFlags::TRANSFER)
+        {
+            type_indices[QueueType::Transfer as usize].push(family_index as u32);
         }
     }
 
     // TODO: Allow the caller to choose which queue types are needed.
-    let graphics = std::mem::take(&mut all_queue_families[QueueType::Graphics as usize]);
-    let compute = std::mem::take(&mut all_queue_families[QueueType::Compute as usize]);
-    let present = std::mem::take(&mut all_queue_families[QueueType::Present as usize]);
+    let graphics = std::mem::take(&mut type_indices[QueueType::Graphics as usize]);
+    let compute = std::mem::take(&mut type_indices[QueueType::Compute as usize]);
+    let transfer = std::mem::take(&mut type_indices[QueueType::Transfer as usize]);
+    let present = std::mem::take(&mut type_indices[QueueType::Present as usize]);
 
     QueueFamilies {
         graphics,
         compute,
+        transfer,
         present,
         queue_families,
     }
@@ -396,7 +441,15 @@ pub fn new_device(
             family_map[*index as usize] += 1;
         }
     }
-    let priorities = vec![1.; queue_families.queue_families.len()];
+
+    // Allocate a vector of queue priorities capable of handling the largest queue count among all families.
+    let priorities = vec![
+        1.;
+        queue_families
+            .queue_families
+            .iter()
+            .fold(0, |acc, f| acc.max(f.queue_count as usize))
+    ];
 
     // Print a message if the queue family map has spilled over to the heap.
     #[cfg(debug_assertions)]
@@ -416,10 +469,10 @@ pub fn new_device(
             if count == 0 {
                 return None;
             }
-            let priorities = &priorities[..count as usize];
 
             // Limit to the number of available queues. Guaranteed to be non-zero.
             let queue_count = count.min(queue_families.queue_families[index].queue_count);
+            let priorities = &priorities[..queue_count as usize];
 
             Some(ash::vk::DeviceQueueCreateInfo {
                 queue_family_index: index as u32,
@@ -506,10 +559,10 @@ pub fn create_image_view(
     };
 
     // Create the image view with the specified parameters.
-    // TODO: More parameters will be needed when supporting VR and 3D images.
+    // TODO: More parameters will be needed when supporting XR and 3D images.
     let view_info = ash::vk::ImageViewCreateInfo {
         image,
-        view_type: ash::vk::ImageViewType::TYPE_2D, // 2D image. Use 2D array for 3D images and VR.
+        view_type: ash::vk::ImageViewType::TYPE_2D, // 2D image. Use 2D array for multi-view/XR.
         format,
         components: ash::vk::ComponentMapping::default(),
         subresource_range: ash::vk::ImageSubresourceRange {
@@ -534,17 +587,30 @@ pub struct SwapchainPreferences {
     pub format: Option<ash::vk::Format>,
     pub color_space: Option<ash::vk::ColorSpaceKHR>,
     pub present_mode: Option<ash::vk::PresentModeKHR>,
+    pub color_samples: Option<ash::vk::SampleCountFlags>,
+
+    /// The preferred extent to use if and only if the surface wants the caller to specify an extent to use.
+    pub preferred_extent: Option<ash::vk::Extent2D>,
 }
 
-struct FrameInFlightSync {
-    image_available: ash::vk::Semaphore,
-    image_rendered: ash::vk::Semaphore,
+/// Synchronization objects for a frame in flight.
+pub struct FrameInFlightSync {
+    pub image_available: ash::vk::Semaphore,
+    pub image_rendered: ash::vk::Semaphore,
+    pub present_complete: ash::vk::Fence,
 }
 
+/// A multi-sample anti-aliasing configuration, including the sample count and managed image resources.
+struct MultiSampleAntiAliasing {
+    pub samples: ash::vk::SampleCountFlags,
+    pub images: Vec<(ash::vk::Image, gpu_allocator::vulkan::Allocation)>,
+    pub image_views: Vec<ash::vk::ImageView>,
+}
+
+/// A Vulkan swapchain with synchronization objects for each frame in flight.
 pub struct Swapchain {
     swapchain_device: ash::khr::swapchain::Device,
-    swapchain: ash::vk::SwapchainKHR,
-    images: Vec<ash::vk::Image>,
+    handle: ash::vk::SwapchainKHR,
     image_views: Vec<ash::vk::ImageView>,
     format: ash::vk::Format,
     color_space: ash::vk::ColorSpaceKHR,
@@ -553,6 +619,7 @@ pub struct Swapchain {
     frame_syncs: SmallVec<[FrameInFlightSync; EXPECTED_MAX_FRAMES_IN_FLIGHT]>,
     current_frame: usize,
     acquired_index: Option<u32>,
+    multisample: Option<MultiSampleAntiAliasing>,
 }
 
 /// The result of acquiring the next image from the swapchain and advancing to the next frame in flight.
@@ -570,6 +637,7 @@ impl Swapchain {
         physical_device: ash::vk::PhysicalDevice,
         logical_device: &ash::Device,
         surface: ash::vk::SurfaceKHR,
+        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
         preferences: SwapchainPreferences,
         old_swapchain: Option<ash::vk::SwapchainKHR>,
     ) -> Self {
@@ -689,24 +757,41 @@ impl Swapchain {
 
         // In practice, window managers may set the surface to a zero extent when minimized.
         if surface_capabilities.max_image_extent.width == 0
-            && surface_capabilities.max_image_extent.height == 0
+            || surface_capabilities.max_image_extent.height == 0
         {
             panic!(
                 "Surface capabilities have not been initialized or window has launched minimized"
             );
         }
 
-        // Massage the current extent to ensure it is within the bounds of the surface.
+        const SPECIAL_EXTENT: ash::vk::Extent2D = ash::vk::Extent2D {
+            width: u32::MAX,
+            height: u32::MAX,
+        };
+        let preferred_extent = if surface_capabilities.current_extent == SPECIAL_EXTENT {
+            // The current extent is the special value indicating that the caller must set a desired extent.
+            // Use the preferred extent if it is set, otherwise use the minimum extent. The maximum image size is sometimes larger than the memory available.
+            preferences
+                .preferred_extent
+                .unwrap_or(surface_capabilities.min_image_extent)
+        } else {
+            surface_capabilities.current_extent
+        };
+
+        // Clamp the extent to ensure it is within the bounds of the surface.
         let extent = ash::vk::Extent2D {
-            width: surface_capabilities.current_extent.width.clamp(
+            width: preferred_extent.width.clamp(
                 surface_capabilities.min_image_extent.width,
                 surface_capabilities.max_image_extent.width,
             ),
-            height: surface_capabilities.current_extent.height.clamp(
+            height: preferred_extent.height.clamp(
                 surface_capabilities.min_image_extent.height,
                 surface_capabilities.max_image_extent.height,
             ),
         };
+
+        #[cfg(debug_assertions)]
+        println!("Swapchain extent: {extent:?}\n");
 
         // Create the swapchain with the specified parameters.
         let swapchain_info = ash::vk::SwapchainCreateInfoKHR {
@@ -715,7 +800,7 @@ impl Swapchain {
             image_format,
             image_color_space,
             image_extent: extent,
-            image_array_layers: 1, // Always 1 unless stereoscopic 3D (VR/AR) is used.
+            image_array_layers: 1, // Always 1 unless stereoscopic-3D / XR is used.
             image_usage: ash::vk::ImageUsageFlags::COLOR_ATTACHMENT,
             image_sharing_mode: ash::vk::SharingMode::EXCLUSIVE, // Only one queue family will access the images.
             pre_transform: surface_capabilities.current_transform, // Do not apply additional transformation to the surface.
@@ -742,6 +827,59 @@ impl Swapchain {
                 .get_swapchain_images(swapchain)
                 .expect("Unable to get swapchain images")
         };
+
+        // Determine if the caller is trying to use multiple color samples, and if it is supported.
+        let multisample = if let Some(multisample_image_create) = query_multisample_support(
+            vulkan,
+            physical_device,
+            preferences
+                .color_samples
+                .unwrap_or(ash::vk::SampleCountFlags::TYPE_1),
+            image_format,
+            extent,
+            1,
+            swapchain_info.image_usage,
+        ) {
+            let mut multisample_images = Vec::with_capacity(images.len());
+            for _ in &images {
+                unsafe {
+                    let image = logical_device
+                        .create_image(&multisample_image_create, None)
+                        .expect("Unable to create multisample image");
+
+                    let requirements = logical_device.get_image_memory_requirements(image);
+                    let allocation = memory_allocator
+                        .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
+                            name: "Multisample image",
+                            requirements,
+                            location: gpu_allocator::MemoryLocation::GpuOnly,
+                            linear: false,
+                            allocation_scheme:
+                                gpu_allocator::vulkan::AllocationScheme::DedicatedImage(image),
+                        })
+                        .expect("Unable to allocate memory for multisample image");
+                    logical_device
+                        .bind_image_memory(image, allocation.memory(), allocation.offset())
+                        .expect("Unable to bind memory to multisample image");
+
+                    multisample_images.push((image, allocation));
+                }
+            }
+            let image_views = multisample_images
+                .iter()
+                .map(|(i, _)| create_image_view(logical_device, *i, image_format, 1))
+                .collect();
+
+            Some(MultiSampleAntiAliasing {
+                samples: multisample_image_create.samples,
+                images: multisample_images,
+                image_views,
+            })
+        } else {
+            None
+        };
+
+        // Create image views for each image in the swapchain.
         let image_views = images
             .iter()
             .map(|&i| create_image_view(logical_device, i, image_format, 1))
@@ -761,9 +899,21 @@ impl Swapchain {
                     .create_semaphore(&ash::vk::SemaphoreCreateInfo::default(), None)
                     .expect("Unable to create render finished semaphore")
             };
+            let present_complete = unsafe {
+                logical_device
+                    .create_fence(
+                        &ash::vk::FenceCreateInfo {
+                            flags: ash::vk::FenceCreateFlags::SIGNALED,
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .expect("Unable to create present complete fence")
+            };
             FrameInFlightSync {
                 image_available,
                 image_rendered,
+                present_complete,
             }
         })
         .take(frames_in_flight)
@@ -774,8 +924,7 @@ impl Swapchain {
 
         Self {
             swapchain_device,
-            swapchain,
-            images,
+            handle: swapchain,
             image_views,
             format: image_format,
             color_space: image_color_space,
@@ -784,6 +933,7 @@ impl Swapchain {
             frame_syncs,
             current_frame: 0,
             acquired_index: None,
+            multisample,
         }
     }
 
@@ -793,6 +943,7 @@ impl Swapchain {
     pub fn destroy(
         self,
         logical_device: &ash::Device,
+        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
         framebuffers: &mut Vec<ash::vk::Framebuffer>,
     ) {
         // Destroy resources in the reverse order they were created.
@@ -801,18 +952,28 @@ impl Swapchain {
             for sync in self.frame_syncs {
                 logical_device.destroy_semaphore(sync.image_available, None);
                 logical_device.destroy_semaphore(sync.image_rendered, None);
+                logical_device.destroy_fence(sync.present_complete, None);
             }
 
-            // Destroy the framebuffers, image views, and finally the images.
+            // Destroy the framebuffers, image views, and finally the images (some of which are managed by the swapchain itself).
             for framebuffer in framebuffers.drain(..) {
                 logical_device.destroy_framebuffer(framebuffer, None);
             }
             for image_view in self.image_views {
                 logical_device.destroy_image_view(image_view, None);
             }
-
-            self.swapchain_device
-                .destroy_swapchain(self.swapchain, None);
+            if let Some(multisample) = self.multisample {
+                for image_view in multisample.image_views {
+                    logical_device.destroy_image_view(image_view, None);
+                }
+                for (image, allocation) in multisample.images {
+                    memory_allocator
+                        .free(allocation)
+                        .expect("Unable to free multisample image allocation");
+                    logical_device.destroy_image(image, None);
+                }
+            }
+            self.swapchain_device.destroy_swapchain(self.handle, None);
         }
     }
 
@@ -820,13 +981,14 @@ impl Swapchain {
     /// This is useful when the window is resized, or the window is moved to a different monitor.
     /// # Notes
     /// * This function will wait for the logical device to finish its operations on the swapchain before recreating it.
-    /// * This will
+    /// * The framebuffers will be destroyed and must be recreated by the caller.
     pub fn recreate_swapchain(
         &mut self,
         vulkan: &VulkanCore,
         physical_device: ash::vk::PhysicalDevice,
         logical_device: &ash::Device,
         surface: ash::vk::SurfaceKHR,
+        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
         framebuffers: &mut Vec<ash::vk::Framebuffer>,
         preferences: SwapchainPreferences,
     ) {
@@ -835,22 +997,24 @@ impl Swapchain {
             physical_device,
             logical_device,
             surface,
+            memory_allocator,
             preferences,
-            Some(self.swapchain),
+            Some(self.handle),
         );
 
+        // Swap the original swapchain (`self`) with the new one.
+        std::mem::swap(self, &mut stack_var_swapchain);
+
         // Wait for the logical device to finish its operations on the swapchain.
+        // TODO: If `VK_EXT_swapchain_maintenance1` is enabled, wait for the old swapchain to complete its presentation fences.
         unsafe {
             logical_device
                 .device_wait_idle()
                 .expect("Unable to wait for the logical device to finish its operations");
         }
 
-        // Swap the original swapchain (`self`) with the new one.
-        std::mem::swap(self, &mut stack_var_swapchain);
-
         // Destroy the old swapchain and its associated resources.
-        stack_var_swapchain.destroy(logical_device, framebuffers);
+        stack_var_swapchain.destroy(logical_device, memory_allocator, framebuffers);
     }
 
     /// Acquire the next image in the swapchain. Maintain the index of the acquired image.
@@ -858,7 +1022,7 @@ impl Swapchain {
         // Acquire the next image in the swapchain, using the same fence to signal completion.
         let (acquired_index, suboptimal) = unsafe {
             self.swapchain_device.acquire_next_image(
-                self.swapchain,
+                self.handle,
                 FIVE_SECONDS_IN_NANOSECONDS,
                 self.image_available(),
                 ash::vk::Fence::null(),
@@ -877,20 +1041,39 @@ impl Swapchain {
     }
 
     /// Present the next image in the swapchain. Return whether the swapchain is suboptimal for the surface on success.
-    pub fn present(&mut self, present_queue: ash::vk::Queue) -> ash::prelude::VkResult<bool> {
+    pub fn present(
+        &mut self,
+        present_queue: ash::vk::Queue,
+        use_present_fence: bool,
+    ) -> ash::prelude::VkResult<bool> {
         let acquired_index = self
             .acquired_index
             .take()
             .expect("No image has been acquired by the swapchain before presenting");
 
+        // Optionally, use a present fence to signal completion of the presentation operation.
+        // This is only present with device extension `VK_EXT_swapchain_maintenance1`.
+        let fence_info = if use_present_fence {
+            Some(ash::vk::SwapchainPresentFenceInfoEXT {
+                swapchain_count: 1,
+                p_fences: &self.frame_syncs[self.current_frame].present_complete,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+
         let result = unsafe {
             self.swapchain_device.queue_present(
                 present_queue,
                 &ash::vk::PresentInfoKHR {
+                    p_next: fence_info
+                        .as_ref()
+                        .map_or(std::ptr::null(), |f| std::ptr::from_ref(f).cast()),
                     wait_semaphore_count: 1,
                     p_wait_semaphores: &self.image_rendered(),
                     swapchain_count: 1,
-                    p_swapchains: &self.swapchain,
+                    p_swapchains: &self.handle,
                     p_image_indices: &acquired_index, // Needs to have the same number of entries as `swapchain_count`, i.e. 1.
                     ..Default::default()
                 },
@@ -913,6 +1096,9 @@ impl Swapchain {
     pub fn frames_in_flight(&self) -> usize {
         self.frame_syncs.len()
     }
+    pub fn frame_syncs(&self) -> &[FrameInFlightSync] {
+        &self.frame_syncs
+    }
     pub fn image_available(&self) -> ash::vk::Semaphore {
         self.frame_syncs[self.current_frame].image_available
     }
@@ -925,7 +1111,102 @@ impl Swapchain {
     pub fn image_views(&self) -> &[ash::vk::ImageView] {
         &self.image_views
     }
+    pub fn multisample_count(&self) -> Option<ash::vk::SampleCountFlags> {
+        self.multisample.as_ref().map(|m| m.samples)
+    }
+    pub fn multisample_views(&self) -> Option<&[ash::vk::ImageView]> {
+        self.multisample.as_ref().map(|m| m.image_views.as_slice())
+    }
+    pub fn present_complete(&self) -> ash::vk::Fence {
+        self.frame_syncs[self.current_frame].present_complete
+    }
     pub fn present_mode(&self) -> ash::vk::PresentModeKHR {
         self.present_mode
+    }
+}
+
+/// Query the physical device for the supported sample count for color images.
+/// Returns `Some(n)` with the `ImageCreateInfo` for the single highest supported multi-sample count (i.e., `n > 1`) if found, else `None`.
+pub fn query_multisample_support(
+    vulkan: &VulkanCore,
+    physical_device: ash::vk::PhysicalDevice,
+    samples: ash::vk::SampleCountFlags,
+    format: ash::vk::Format,
+    extent: ash::vk::Extent2D,
+    mip_levels: u32,
+    usage: ash::vk::ImageUsageFlags,
+) -> Option<ash::vk::ImageCreateInfo> {
+    // If only checking for the single-sampling, return early.
+    if samples.is_empty() || samples == ash::vk::SampleCountFlags::TYPE_1 {
+        return None;
+    }
+
+    // Check if the physical device supports the requested sample count.
+    let mut image_create = ash::vk::ImageCreateInfo {
+        image_type: ash::vk::ImageType::TYPE_2D,
+        format,
+        extent: ash::vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
+            depth: 1,
+        },
+        mip_levels,
+        array_layers: 1,
+        samples,
+        tiling: ash::vk::ImageTiling::OPTIMAL,
+        usage,
+        ..Default::default()
+    };
+    let limits = unsafe {
+        vulkan
+            .instance
+            .get_physical_device_image_format_properties(
+                physical_device,
+                format,
+                image_create.image_type,
+                image_create.tiling,
+                image_create.usage,
+                image_create.flags,
+            )
+            .expect("Unable to get image format properties")
+    };
+
+    // Ensure that the physical device supports at least one color sample per pixel.
+    #[cfg(debug_assertions)]
+    {
+        assert!(
+            !limits.sample_counts.is_empty(),
+            "Physical device does not support any color sample count"
+        );
+        println!("Supported sample counts: {:?}\n", limits.sample_counts);
+    }
+
+    if limits.sample_counts.intersects(samples) {
+        // Get the highest requested sample count.
+        let mut specific_sample_count =
+            ash::vk::SampleCountFlags::from_raw(1 << samples.as_raw().ilog2());
+
+        // Find the highest supported sample count that is also requested.
+        while !(specific_sample_count.is_empty()
+            || limits.sample_counts.contains(specific_sample_count)
+                && samples.contains(specific_sample_count))
+        {
+            specific_sample_count =
+                ash::vk::SampleCountFlags::from_raw(specific_sample_count.as_raw() >> 1);
+        }
+
+        #[cfg(debug_assertions)]
+        assert!(!specific_sample_count.is_empty(), "Physical device does not support any of the requested color sample count(s) {samples:?} after claiming it did");
+
+        // Update the image create info with the supported sample count.
+        image_create.samples = specific_sample_count;
+        Some(image_create)
+    } else {
+        #[cfg(debug_assertions)]
+        println!(
+            "WARN: Physical device does not support any of the requested color sample count(s) {samples:?}\n"
+        );
+
+        None
     }
 }

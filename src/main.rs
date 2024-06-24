@@ -1,16 +1,23 @@
 use std::ffi::CStr;
 
+use smallvec::SmallVec;
 use winit::{
     event_loop::EventLoop,
     raw_window_handle::{HasDisplayHandle as _, HasWindowHandle as _},
 };
 
+/// The title of the main window.
 const WINDOW_TITLE: &str = "Pompeii";
+
+/// The default size of the main window.
 const DEFAULT_WINDOWS_SIZE: winit::dpi::LogicalSize<f32> = winit::dpi::LogicalSize::new(800., 600.);
+
+/// The number of ticks to sample before printing a message.
+const TICK_SAMPLING_LENGTH: u64 = 6_000;
 
 mod cli;
 mod engine;
-use engine::utils;
+use engine::utils::{self, SwapchainPreferences};
 
 fn main() {
     // Parse the command-line arguments.
@@ -59,14 +66,16 @@ struct PompeiiApp {
     vulkan: utils::VulkanCore,
     graphics: Option<PompeiiGraphics>,
     tick_count: u64,
+    start_time: std::time::Instant,
+    user_toggle: bool,
 }
 
 impl PompeiiApp {
     /// Create a new Pompeii application with the given Vulkan API and instance.
     /// Creation of the swapchain and other objects are deferred until the application is resumed, when a window will be available.
     fn new(args: cli::Args, event_loop: &EventLoop<PompeiiEvent>) -> Self {
-        // Get Vulkan extensions required by the windowing system, including `VK_KHR_surface` and platform-specific ones.
-        let mut extension_names = ash_window::enumerate_required_extensions(
+        // Get Vulkan instance extensions required by the windowing system, including `VK_KHR_surface` and platform-specific ones.
+        let extension_names = ash_window::enumerate_required_extensions(
             event_loop
                 .display_handle()
                 .expect("Failed to get a display handle")
@@ -75,17 +84,37 @@ impl PompeiiApp {
         .expect("Unable to enumerate required extensions for the window")
         .iter()
         .map(|&e| unsafe { CStr::from_ptr(e) })
-        .collect::<Vec<_>>();
+        .collect::<SmallVec<[_; utils::EXPECTED_MAX_ENABLED_INSTANCE_EXTENSIONS]>>();
 
-        // Add the ability to check and specify additional device features. This is required for ray-tracing through the `vkGetPhysicalDeviceFeatures2KHR` call.
-        extension_names.push(ash::khr::get_physical_device_properties2::NAME);
+        // Attempt to initialize the core Vulkan objects. In case of failure, safely close after the user has seen the error.
+        let vulkan = match utils::VulkanCore::new(&extension_names, ash::vk::API_VERSION_1_2) {
+            Ok(v) => v,
+            Err(e) => {
+                use std::io::Write as _; // For `flush` method.
+
+                // Print the error and prompt the user to accept the failure message.
+                match e {
+                    utils::VulkanCoreError::Loading(e) => eprintln!("Error initializing Vulkan: {e}"),
+                    utils::VulkanCoreError::MissingExtension(e) => eprintln!("Error initializing Vulkan: Can't use this Vulkan instance because it doesn't support extension {e}"),
+                    utils::VulkanCoreError::MissingLayer(l) => eprintln!("Error initializing Vulkan: Can't use this Vulkan instance because it doesn't support layer {l}"),
+                }
+                print!("Press enter to exit... ");
+                std::io::stdout().flush().unwrap();
+
+                // Wait for the user to press enter before exiting.
+                std::io::stdin().read_line(&mut String::new()).unwrap();
+                std::process::exit(-1);
+            }
+        };
 
         // Create a Vulkan instance for our application initialized with the `Empty` state.
         PompeiiApp {
             args,
-            vulkan: utils::VulkanCore::new(&extension_names),
+            vulkan,
             graphics: None,
             tick_count: 0,
+            start_time: std::time::Instant::now(),
+            user_toggle: false,
         }
     }
 
@@ -102,7 +131,7 @@ impl PompeiiApp {
         window.request_redraw();
 
         // Increment the tick count for the application.
-        if self.tick_count % 6_000 == 0 {
+        if self.tick_count % TICK_SAMPLING_LENGTH == 0 {
             println!(
                 "{:?} Tick count: {}",
                 std::time::Instant::now(),
@@ -130,14 +159,29 @@ impl PompeiiApp {
                         "Swapchain is out of date at window-size check, needs to be recreated."
                     );
 
-                    renderer.recreate_swapchain(&self.vulkan);
+                    renderer.recreate_swapchain(
+                        &self.vulkan,
+                        SwapchainPreferences {
+                            preferred_extent: Some(ash::vk::Extent2D {
+                                width: window_size.width,
+                                height: window_size.height,
+                            }),
+                            ..renderer.swapchain_preferences
+                        },
+                    );
                 }
                 return;
             }
         }
 
+        // Get updated state for drawing.
+        // TODO: Update the game state outside of the render loop.
+        let push_constants = engine::PushConstants {
+            time: self.start_time.elapsed().as_secs_f32(),
+        };
+
         // Attempt to render the frame, or bail and recreate the swapchain if there is a recoverable error.
-        renderer.render_frame(&self.vulkan);
+        renderer.render_frame(&self.vulkan, push_constants);
     }
 
     /// Handle keyboard input events.
@@ -154,12 +198,15 @@ impl PompeiiApp {
         } = key_event;
         if state == winit::event::ElementState::Pressed {
             match key.as_ref() {
+                // Handle the escape key to exit fullscreen mode.
                 winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) => {
                     if window.fullscreen().is_some() {
                         // Exit fullscreen mode.
                         window.set_fullscreen(None);
                     }
                 }
+
+                // Handle the `F` key and `F11` to toggle fullscreen mode.
                 winit::keyboard::Key::Character("f")
                 | winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11) => {
                     if window.fullscreen().is_some() {
@@ -168,6 +215,19 @@ impl PompeiiApp {
                     } else {
                         // Enter fullscreen mode in borderless mode, defaulting to the active monitor.
                         window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                    }
+                }
+
+                // Handle the `T` key to toggle the user toggle.
+                winit::keyboard::Key::Character("t") => {
+                    self.user_toggle = !self.user_toggle;
+                    println!("User toggle is now {}", self.user_toggle);
+
+                    // Update the specialization constants for the renderer.
+                    if let Some(PompeiiGraphics { renderer, .. }) = &mut self.graphics {
+                        renderer.update_specialization_constants(engine::SpecializationConstants {
+                            toggle: u32::from(self.user_toggle),
+                        });
                     }
                 }
                 _ => (),
@@ -209,26 +269,47 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
             .expect("Unable to create Vulkan surface")
         };
 
+        let current_extent = window.inner_size();
+        #[cfg(debug_assertions)]
+        println!("Window size at creation: {current_extent:?}");
+
         // Create a renderer specific to this application's needs.
+        // NOTE: Some platforms require us to specify the preferred extent for the swapchain.
+        let preferred_extent = Some(ash::vk::Extent2D {
+            width: current_extent.width,
+            height: current_extent.height,
+        });
         // TODO: Allow the CLI to specify the image format and color-space preferences.
         let swapchain_preferences = if self.args.hdr && self.vulkan.enabled_colorspace_ext {
             utils::SwapchainPreferences {
                 format: Some(ash::vk::Format::A2B10G10R10_UNORM_PACK32),
                 color_space: Some(ash::vk::ColorSpaceKHR::HDR10_ST2084_EXT),
                 present_mode: Some(self.args.present_mode.into()),
+                color_samples: Some(self.args.msaa.into()),
+                preferred_extent,
             }
         } else {
             utils::SwapchainPreferences {
                 present_mode: Some(self.args.present_mode.into()),
+                preferred_extent,
+                color_samples: Some(self.args.msaa.into()),
                 ..Default::default()
             }
         };
-        let renderer = engine::Renderer::new(&self.vulkan, surface, swapchain_preferences);
+        let renderer = engine::Renderer::new(
+            &self.vulkan,
+            surface,
+            swapchain_preferences,
+            engine::SpecializationConstants {
+                toggle: u32::from(self.user_toggle),
+            },
+        );
 
         // Complete the state transition to windowed mode.
         self.graphics = Some(PompeiiGraphics { window, renderer });
 
-        println!("Application started");
+        self.start_time = std::time::Instant::now();
+        println!("Application started at {:?}", self.start_time);
     }
 
     /// Handle OS events to the windowing system.
