@@ -147,7 +147,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52bca67b61cb81e5553babde81b8211f713cb6db79766f80168f3e5f40ea6c82"
 dependencies = [
  "ash",
- "ash",
  "raw-window-handle",
  "raw-window-metal",
 ]
@@ -674,9 +673,7 @@ checksum = "78b3ae25bc7c8c38cec158d1f2757ee79e9b3740fbc7ccf0e59e4b08d793fa89"
 [[package]]
 name = "log"
 version = "0.4.22"
-version = "0.4.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7a70ba024b9dc04c27ea2f0c0548feb474ec5c54bba33a7f72f873a39d07b24"
 checksum = "a7a70ba024b9dc04c27ea2f0c0548feb474ec5c54bba33a7f72f873a39d07b24"
 
 [[package]]
@@ -1086,7 +1083,6 @@ dependencies = [
 name = "pompeii"
 version = "0.1.0"
 dependencies = [
- "ash",
  "ash",
  "ash-window",
  "clap",
