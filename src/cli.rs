@@ -2,19 +2,19 @@
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
 pub enum PresentMode {
     Immediate,
-    TripleBuffer,
+    Mailbox,
     #[default]
-    DoubleBuffer,
-    DoubleBufferRelaxed,
+    Fifo,
+    FifoRelaxed,
 }
 impl From<PresentMode> for ash::vk::PresentModeKHR {
     /// Convert the CLI present mode to the Vulkan equivalent.
     fn from(present_mode: PresentMode) -> Self {
         match present_mode {
             PresentMode::Immediate => ash::vk::PresentModeKHR::IMMEDIATE,
-            PresentMode::TripleBuffer => ash::vk::PresentModeKHR::MAILBOX,
-            PresentMode::DoubleBuffer => ash::vk::PresentModeKHR::FIFO,
-            PresentMode::DoubleBufferRelaxed => ash::vk::PresentModeKHR::FIFO_RELAXED,
+            PresentMode::Mailbox => ash::vk::PresentModeKHR::MAILBOX,
+            PresentMode::Fifo => ash::vk::PresentModeKHR::FIFO,
+            PresentMode::FifoRelaxed => ash::vk::PresentModeKHR::FIFO_RELAXED,
         }
     }
 }
@@ -49,13 +49,19 @@ impl From<MultiSamplingMode> for ash::vk::SampleCountFlags {
 /// The command-line interface for Pompeii.
 #[derive(clap::Parser)]
 pub struct Args {
-    /// The preferred present mode to use. Immediate and double-buffer relaxed may show screen tearing.
+    /// The preferred present mode to use.
+    /// Immediate and FIFO-relaxed may show screen tearing.
+    /// FIFO is the most efficient, and mailbox is the most responsive.
     #[arg(short, long, default_value_t, value_enum)]
     pub present_mode: PresentMode,
 
-    /// The type of multisampling to perform, if any.
+    /// The type of multisampling to prefer using, if any. If the desired multi-sample count is not supported, single sampling will be used instead.
     #[arg(long, default_value_t, value_enum)]
     pub msaa: MultiSamplingMode,
+
+    /// Start with FXAA (a fast screen-space anti-aliasing algorithm) enabled.
+    #[arg(long, default_value_t)]
+    pub fxaa: bool,
 
     /// Prefer presenting to an HDR colorspace if available.
     #[arg(long, default_value_t)]

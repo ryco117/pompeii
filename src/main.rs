@@ -87,7 +87,7 @@ impl PompeiiApp {
         .collect::<SmallVec<[_; utils::EXPECTED_MAX_ENABLED_INSTANCE_EXTENSIONS]>>();
 
         // Attempt to initialize the core Vulkan objects. In case of failure, safely close after the user has seen the error.
-        let vulkan = match utils::VulkanCore::new(&extension_names, ash::vk::API_VERSION_1_2) {
+        let vulkan = match utils::VulkanCore::new(&extension_names) {
             Ok(v) => v,
             Err(e) => {
                 use std::io::Write as _; // For `flush` method.
@@ -303,6 +303,7 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
             engine::SpecializationConstants {
                 toggle: u32::from(self.user_toggle),
             },
+            self.args.fxaa,
         );
 
         // Complete the state transition to windowed mode.

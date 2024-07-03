@@ -3,19 +3,22 @@ use std::{ffi::CStr, num::NonZeroU32};
 use smallvec::SmallVec;
 use strum::EnumCount as _;
 
+/// Target Vulkan API version 1.3 for compatibility with the latest Vulkan features and reduced extension fragmentation.
+const VULKAN_API_VERSION: u32 = ash::vk::API_VERSION_1_3;
+
 /// Set a sane value for the maximum expected number of queue families.
 /// A heap allocation is required if the number of queue families exceeds this value.
 pub const EXPECTED_MAX_QUEUE_FAMILIES: usize = 8;
 
 /// Set a sane value for the maximum expected number of instance extensions.
 /// A heap allocation is required if the number of instance extensions exceeds this value.
-pub const EXPECTED_MAX_ENABLED_INSTANCE_EXTENSIONS: usize = 16;
+pub const EXPECTED_MAX_ENABLED_INSTANCE_EXTENSIONS: usize = 8;
 
 /// Set a sane value for the maximum expected number of physical devices.
 /// A heap allocation is required if the number of physical devices exceeds this value.
 pub const EXPECTED_MAX_VULKAN_PHYSICAL_DEVICES: usize = 4;
 
-/// Sane maximum number of frames in flight before certain heap allocations are required.
+/// Sane maximum number of frames-in-flight before certain heap allocations are required.
 pub const EXPECTED_MAX_FRAMES_IN_FLIGHT: usize = 4;
 
 /// The number of nanoseconds in five seconds. Used for sane timeouts on synchronization objects.
@@ -50,7 +53,8 @@ pub struct VulkanCore {
 
 impl VulkanCore {
     /// Create a new `VulkanCore` with the specified instance extensions.
-    pub fn new(extension_names: &[&CStr], api_version: u32) -> Result<Self, VulkanCoreError> {
+    //  TODO: Allow for optional instance extensions and a way to report which ones were enabled.
+    pub fn new(required_extensions: &[&CStr]) -> Result<Self, VulkanCoreError> {
         // Attempt to dynamically load the Vulkan API from platform-specific shared libraries.
         let vulkan_api = unsafe { ash::Entry::load().map_err(VulkanCoreError::Loading)? };
 
@@ -68,7 +72,10 @@ impl VulkanCore {
         let available_contains = |ext: &CStr| extensions_list_contains(&available_extensions, ext);
 
         // Check that the required extensions are available.
-        if let Some(missing) = extension_names.iter().find(|ext| !available_contains(ext)) {
+        if let Some(missing) = required_extensions
+            .iter()
+            .find(|ext| !available_contains(ext))
+        {
             return Err(VulkanCoreError::MissingExtension(
                 missing.to_string_lossy().into_owned(),
             ));
@@ -76,10 +83,10 @@ impl VulkanCore {
 
         let mut extension_name_pointers: SmallVec<
             [*const i8; EXPECTED_MAX_ENABLED_INSTANCE_EXTENSIONS],
-        > = extension_names.iter().map(|&e| e.as_ptr()).collect();
+        > = required_extensions.iter().map(|&e| e.as_ptr()).collect();
 
         // Optionally, enable `VK_EXT_swapchain_colorspace` if is is available and the dependent `VK_KHR_surface` is requested.
-        let supports_colorspace_ext = extension_names.contains(&ash::khr::surface::NAME)
+        let supports_colorspace_ext = required_extensions.contains(&ash::khr::surface::NAME)
             && available_contains(ash::ext::swapchain_colorspace::NAME);
         if supports_colorspace_ext {
             #[cfg(debug_assertions)]
@@ -88,7 +95,7 @@ impl VulkanCore {
         }
 
         // Optionally, enable `VK_KHR_get_surface_capabilities2` and `VK_EXT_surface_maintenance1` if they are available and the dependent `VK_KHR_surface` is requested.
-        let supports_surface_maintenance = extension_names.contains(&ash::khr::surface::NAME)
+        let supports_surface_maintenance = required_extensions.contains(&ash::khr::surface::NAME)
             && available_contains(ash::khr::get_surface_capabilities2::NAME)
             && available_contains(ash::ext::surface_maintenance1::NAME);
         if supports_surface_maintenance {
@@ -152,7 +159,7 @@ impl VulkanCore {
                 application_version: ash::vk::make_api_version(0, 0, 1, 0),
                 p_engine_name: c"Pompeii".as_ptr().cast(),
                 engine_version: ash::vk::make_api_version(0, 0, 1, 0),
-                api_version,
+                api_version: VULKAN_API_VERSION,
                 ..Default::default()
             };
             let instance_info = {
@@ -174,7 +181,7 @@ impl VulkanCore {
 
         let khr = ash::khr::surface::Instance::new(&vulkan_api, &vulkan_instance);
         Ok(Self {
-            version: api_version,
+            version: VULKAN_API_VERSION,
             api: vulkan_api,
             instance: vulkan_instance,
             khr,
@@ -186,6 +193,7 @@ impl VulkanCore {
 
 /// Query the extended properties of a physical device to determine if it supports ray tracing.
 //  TODO: Consider refactoring to allow chaining of device features before performing the final query.
+#[allow(dead_code)]
 pub fn physical_supports_rtx(
     instance: &ash::Instance,
     physical_device: ash::vk::PhysicalDevice,
@@ -415,6 +423,13 @@ pub fn get_queue_families(
     }
 }
 
+/// A Vulkan command pool with its creation parameters.
+pub struct CommandPool {
+    pub handle: ash::vk::CommandPool,
+    pub flags: ash::vk::CommandPoolCreateFlags,
+    pub queue_family_index: u32,
+}
+
 /// Create a Vulkan logical device capable of graphics, compute, and presentation queues.
 /// Returns the device and the queue family indices that were requested for use.
 pub fn new_device(
@@ -542,6 +557,32 @@ pub fn is_stencil_format(format: ash::vk::Format) -> bool {
     )
 }
 
+/// Helper for creating a new image allocated by a `gpu_allocator::vulkan::Allocator`.
+pub fn create_image(
+    device: &ash::Device,
+    memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+    image_create_info: &ash::vk::ImageCreateInfo,
+    image_name: &str,
+) -> (ash::vk::Image, gpu_allocator::vulkan::Allocation) {
+    let image = unsafe { device.create_image(image_create_info, None) }
+        .expect("Unable to create new image handle");
+
+    let requirements = unsafe { device.get_image_memory_requirements(image) };
+    let allocation = memory_allocator
+        .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
+            name: image_name,
+            requirements,
+            location: gpu_allocator::MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: gpu_allocator::vulkan::AllocationScheme::DedicatedImage(image),
+        })
+        .expect("Unable to allocate memory for new image");
+    unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset()) }
+        .expect("Unable to bind memory to new image");
+
+    (image, allocation)
+}
+
 /// Create a new image view for an existing Vulkan image with a specified format and MIP level.
 pub fn create_image_view(
     device: &ash::Device,
@@ -612,6 +653,7 @@ pub struct Swapchain {
     swapchain_device: ash::khr::swapchain::Device,
     handle: ash::vk::SwapchainKHR,
     image_views: Vec<ash::vk::ImageView>,
+    images: Vec<ash::vk::Image>,
     format: ash::vk::Format,
     color_space: ash::vk::ColorSpaceKHR,
     present_mode: ash::vk::PresentModeKHR,
@@ -620,6 +662,7 @@ pub struct Swapchain {
     current_frame: usize,
     acquired_index: Option<u32>,
     multisample: Option<MultiSampleAntiAliasing>,
+    enabled_swapchain_maintenance1: bool,
 }
 
 /// The result of acquiring the next image from the swapchain and advancing to the next frame in flight.
@@ -639,8 +682,15 @@ impl Swapchain {
         surface: ash::vk::SurfaceKHR,
         memory_allocator: &mut gpu_allocator::vulkan::Allocator,
         preferences: SwapchainPreferences,
+        enabled_swapchain_maintenance1: bool,
         old_swapchain: Option<ash::vk::SwapchainKHR>,
     ) -> Self {
+        // Vulkan uses a special extent value to indicate that the application must set a desired extent without a `current_extent` available.
+        const SPECIAL_SURFACE_EXTENT: ash::vk::Extent2D = ash::vk::Extent2D {
+            width: u32::MAX,
+            height: u32::MAX,
+        };
+
         let surface_capabilities = unsafe {
             vulkan
                 .khr
@@ -651,8 +701,14 @@ impl Swapchain {
         #[cfg(debug_assertions)]
         println!("Surface capabilities: {surface_capabilities:?}\n");
 
+        // TODO: Refactor present mode selection to another function.
         let min_images = surface_capabilities.min_image_count;
         let max_images = NonZeroU32::new(surface_capabilities.max_image_count);
+        let target_image_count = if let Some(max) = max_images {
+            max.get().min(3)
+        } else {
+            3
+        };
 
         // Determine which present modes are available.
         let supported_present_modes = unsafe {
@@ -682,32 +738,26 @@ impl Swapchain {
 
                 match preferred_present_mode {
                     // Immediate mode should use the minimum number of images supported.
-                    // The caller has indicated they are not concerned with screen tearing, only resource usage.
+                    // This mode is used when there is not a concern with screen tearing, only resource usage.
                     ash::vk::PresentModeKHR::IMMEDIATE => Some((mode, min_images)),
 
-                    // Mailbox mode requires at least 3 images for proper mailbox synchronization.
-                    ash::vk::PresentModeKHR::MAILBOX => {
-                        if max_images.unwrap_or(NonZeroU32::MAX)
-                            >= unsafe { NonZeroU32::new_unchecked(3) }
-                        {
-                            // Ensure we are still using at least the minimum number of images.
-                            Some((mode, min_images.max(3)))
-                        } else {
-                            None
-                        }
-                    }
-
-                    // FIFO and FIFO_RELAXED modes require at least two images for proper vertical synchronization.
-                    ash::vk::PresentModeKHR::FIFO | ash::vk::PresentModeKHR::FIFO_RELAXED => {
+                    // Use `MAILBOX` to reduce latency and avoid tearing. Generally preferred.
+                    // `FIFO` and `FIFO_RELAXED` modes require at least two images for proper vertical synchronization.
+                    ash::vk::PresentModeKHR::MAILBOX
+                    | ash::vk::PresentModeKHR::FIFO
+                    | ash::vk::PresentModeKHR::FIFO_RELAXED => {
                         // Ensure we are still using at least the minimum number of images.
-                        Some((mode, min_images.max(2)))
+                        Some((mode, min_images.max(target_image_count)))
                     }
 
-                    // No other named present modes currently exist, unknown how to handle them.
+                    // No other named present modes currently exist so we default to FIFO.
                     _ => None,
                 }
             })
-            .unwrap_or((ash::vk::PresentModeKHR::FIFO, min_images.max(2)));
+            .unwrap_or((
+                ash::vk::PresentModeKHR::FIFO,
+                min_images.max(target_image_count),
+            ));
 
         // Determine the image format that is supported and compare it to what is preferred.
         let supported_formats = unsafe {
@@ -764,11 +814,7 @@ impl Swapchain {
             );
         }
 
-        const SPECIAL_EXTENT: ash::vk::Extent2D = ash::vk::Extent2D {
-            width: u32::MAX,
-            height: u32::MAX,
-        };
-        let preferred_extent = if surface_capabilities.current_extent == SPECIAL_EXTENT {
+        let preferred_extent = if surface_capabilities.current_extent == SPECIAL_SURFACE_EXTENT {
             // The current extent is the special value indicating that the caller must set a desired extent.
             // Use the preferred extent if it is set, otherwise use the minimum extent. The maximum image size is sometimes larger than the memory available.
             preferences
@@ -793,8 +839,19 @@ impl Swapchain {
         #[cfg(debug_assertions)]
         println!("Swapchain extent: {extent:?}\n");
 
+        // Optionally provide additional present modes if the
+        let mut present_modes_ext = if enabled_swapchain_maintenance1 {
+            Some(ash::vk::SwapchainPresentModesCreateInfoEXT {
+                present_mode_count: 1,
+                p_present_modes: &present_mode,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+
         // Create the swapchain with the specified parameters.
-        let swapchain_info = ash::vk::SwapchainCreateInfoKHR {
+        let mut swapchain_info = ash::vk::SwapchainCreateInfoKHR {
             surface,
             min_image_count: image_count,
             image_format,
@@ -810,6 +867,9 @@ impl Swapchain {
             old_swapchain: old_swapchain.unwrap_or_default(),
             ..Default::default()
         };
+        if let Some(present_modes_ext) = &mut present_modes_ext {
+            swapchain_info = swapchain_info.push_next(present_modes_ext);
+        }
 
         // Get swapchain-specific function pointers for this logical device.
         let swapchain_device = ash::khr::swapchain::Device::new(&vulkan.instance, logical_device);
@@ -822,7 +882,7 @@ impl Swapchain {
         };
 
         // Determine the actual number of images in the swapchain and create image views for each.
-        let images = unsafe {
+        let swapchain_images = unsafe {
             swapchain_device
                 .get_swapchain_images(swapchain)
                 .expect("Unable to get swapchain images")
@@ -838,33 +898,20 @@ impl Swapchain {
             image_format,
             extent,
             1,
-            swapchain_info.image_usage,
+            ash::vk::ImageUsageFlags::TRANSIENT_ATTACHMENT
+                | ash::vk::ImageUsageFlags::COLOR_ATTACHMENT, // Ensure the multisampled image is optimized to be transient.
         ) {
-            let mut multisample_images = Vec::with_capacity(images.len());
-            for _ in &images {
-                unsafe {
-                    let image = logical_device
-                        .create_image(&multisample_image_create, None)
-                        .expect("Unable to create multisample image");
-
-                    let requirements = logical_device.get_image_memory_requirements(image);
-                    let allocation = memory_allocator
-                        .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
-                            name: "Multisample image",
-                            requirements,
-                            location: gpu_allocator::MemoryLocation::GpuOnly,
-                            linear: false,
-                            allocation_scheme:
-                                gpu_allocator::vulkan::AllocationScheme::DedicatedImage(image),
-                        })
-                        .expect("Unable to allocate memory for multisample image");
-                    logical_device
-                        .bind_image_memory(image, allocation.memory(), allocation.offset())
-                        .expect("Unable to bind memory to multisample image");
-
-                    multisample_images.push((image, allocation));
-                }
-            }
+            let multisample_images: Vec<_> = swapchain_images
+                .iter()
+                .map(|_| {
+                    create_image(
+                        logical_device,
+                        memory_allocator,
+                        &multisample_image_create,
+                        "Multisample Image",
+                    )
+                })
+                .collect();
             let image_views = multisample_images
                 .iter()
                 .map(|(i, _)| create_image_view(logical_device, *i, image_format, 1))
@@ -880,7 +927,7 @@ impl Swapchain {
         };
 
         // Create image views for each image in the swapchain.
-        let image_views = images
+        let swapchain_views = swapchain_images
             .iter()
             .map(|&i| create_image_view(logical_device, i, image_format, 1))
             .collect();
@@ -925,7 +972,8 @@ impl Swapchain {
         Self {
             swapchain_device,
             handle: swapchain,
-            image_views,
+            image_views: swapchain_views,
+            images: swapchain_images,
             format: image_format,
             color_space: image_color_space,
             present_mode,
@@ -934,6 +982,7 @@ impl Swapchain {
             current_frame: 0,
             acquired_index: None,
             multisample,
+            enabled_swapchain_maintenance1,
         }
     }
 
@@ -967,10 +1016,10 @@ impl Swapchain {
                     logical_device.destroy_image_view(image_view, None);
                 }
                 for (image, allocation) in multisample.images {
+                    logical_device.destroy_image(image, None);
                     memory_allocator
                         .free(allocation)
                         .expect("Unable to free multisample image allocation");
-                    logical_device.destroy_image(image, None);
                 }
             }
             self.swapchain_device.destroy_swapchain(self.handle, None);
@@ -999,6 +1048,7 @@ impl Swapchain {
             surface,
             memory_allocator,
             preferences,
+            self.enabled_swapchain_maintenance1,
             Some(self.handle),
         );
 
@@ -1008,9 +1058,25 @@ impl Swapchain {
         // Wait for the logical device to finish its operations on the swapchain.
         // TODO: If `VK_EXT_swapchain_maintenance1` is enabled, wait for the old swapchain to complete its presentation fences.
         unsafe {
-            logical_device
-                .device_wait_idle()
-                .expect("Unable to wait for the logical device to finish its operations");
+            if self.enabled_swapchain_maintenance1 {
+                let presentation_fences: SmallVec<[ash::vk::Fence; EXPECTED_MAX_FRAMES_IN_FLIGHT]> =
+                    stack_var_swapchain
+                        .frame_syncs
+                        .iter()
+                        .map(|s| s.present_complete)
+                        .collect();
+                logical_device
+                    .wait_for_fences(
+                        presentation_fences.as_slice(),
+                        true,
+                        FIVE_SECONDS_IN_NANOSECONDS,
+                    )
+                    .expect("Unable to wait for the logical device to finish its operations");
+            } else {
+                logical_device
+                    .device_wait_idle()
+                    .expect("Unable to wait for the logical device to finish its operations");
+            }
         }
 
         // Destroy the old swapchain and its associated resources.
@@ -1111,6 +1177,9 @@ impl Swapchain {
     pub fn image_views(&self) -> &[ash::vk::ImageView] {
         &self.image_views
     }
+    pub fn images(&self) -> &[ash::vk::Image] {
+        &self.images
+    }
     pub fn multisample_count(&self) -> Option<ash::vk::SampleCountFlags> {
         self.multisample.as_ref().map(|m| m.samples)
     }
@@ -1209,4 +1278,113 @@ pub fn query_multisample_support(
 
         None
     }
+}
+
+/// Create a new device-local buffer with the given data using a staging buffer.
+pub fn new_device_buffer(
+    device: &ash::Device,
+    allocator: &mut gpu_allocator::vulkan::Allocator,
+    command_pool: ash::vk::CommandPool,
+    queue: ash::vk::Queue,
+    data: &[u8],
+) -> Result<(ash::vk::Buffer, ash::vk::Fence), ash::vk::Result> {
+    // Create a staging buffer to copy the data to the device-local buffer.
+    let staging_buffer = unsafe {
+        device.create_buffer(
+            &ash::vk::BufferCreateInfo {
+                size: data.len() as u64,
+                usage: ash::vk::BufferUsageFlags::TRANSFER_SRC,
+                ..Default::default()
+            },
+            None,
+        )?
+    };
+
+    // Allocate memory for the staging buffer.
+    // TODO: Consider allowing for reuse of the staging buffer for multiple transfers.
+    let staging_requirements = unsafe { device.get_buffer_memory_requirements(staging_buffer) };
+    let mut staging_allocation = allocator
+        .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
+            name: "Staging buffer",
+            requirements: staging_requirements,
+            location: gpu_allocator::MemoryLocation::CpuToGpu,
+            linear: true, // "Buffers are always linear" as per README.
+            allocation_scheme: gpu_allocator::vulkan::AllocationScheme::DedicatedBuffer(
+                staging_buffer,
+            ),
+        })
+        .expect("Unable to allocate memory for staging buffer");
+
+    // Bind the staging buffer to the allocated memory.
+    unsafe {
+        device.bind_buffer_memory(
+            staging_buffer,
+            staging_allocation.memory(),
+            staging_allocation.offset(),
+        )?;
+    }
+    staging_allocation
+        .mapped_slice_mut()
+        .expect("Staging buffer did not allocate a mapping")
+        .copy_from_slice(data);
+
+    // Create the device-local buffer.
+    let device_buffer = unsafe {
+        device.create_buffer(
+            &ash::vk::BufferCreateInfo {
+                size: data.len() as u64,
+                usage: ash::vk::BufferUsageFlags::TRANSFER_DST
+                    | ash::vk::BufferUsageFlags::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            None,
+        )?
+    };
+
+    // Allocate memory for the device-local buffer.
+    let device_requirements = unsafe { device.get_buffer_memory_requirements(device_buffer) };
+    let device_allocation = allocator
+        .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
+            name: "Device buffer",
+            requirements: device_requirements,
+            location: gpu_allocator::MemoryLocation::GpuOnly,
+            linear: true, // "Buffers are always linear" as per README.
+            allocation_scheme: gpu_allocator::vulkan::AllocationScheme::DedicatedBuffer(
+                device_buffer,
+            ),
+        })
+        .expect("Unable to allocate memory for device buffer");
+
+    // Bind the device-local buffer to the allocated memory.
+    unsafe {
+        device.bind_buffer_memory(
+            device_buffer,
+            device_allocation.memory(),
+            device_allocation.offset(),
+        )?;
+    }
+
+    // Copy the data from the staging buffer to the device-local buffer.
+    let command_buffer = unsafe {
+        device.allocate_command_buffers(&ash::vk::CommandBufferAllocateInfo {
+            command_pool,
+            level: ash::vk::CommandBufferLevel::PRIMARY,
+            command_buffer_count: 1,
+            ..Default::default()
+        })?
+    }[0];
+    unsafe {
+        device.cmd_copy_buffer(
+            command_buffer,
+            staging_buffer,
+            device_buffer,
+            &[ash::vk::BufferCopy {
+                src_offset: 0, // TODO: Should these be zero, or the offset returned by the buffer allocation.
+                dst_offset: 0,
+                size: data.len() as u64,
+            }],
+        );
+    }
+
+    todo!()
 }

@@ -1,6 +1,8 @@
+use fxaa_pass::FxaaPass;
 use smallvec::SmallVec;
 use utils::{EXPECTED_MAX_FRAMES_IN_FLIGHT, FIVE_SECONDS_IN_NANOSECONDS};
 
+pub mod fxaa_pass;
 pub mod utils;
 
 /// Store the SPIR-V representation of the shaders in the binary.
@@ -9,12 +11,16 @@ mod shaders {
     pub const ENTRY_POINT_MAIN: &std::ffi::CStr = c"main";
 
     /// Standard triangle-example vertex shader.
-    pub const VERTEX: &[u32] =
+    pub const BB_TRIANGLE_VERTEX: &[u32] =
         inline_spirv::include_spirv!("src/shaders/bb_triangle_vert.glsl", vert, glsl);
 
     /// Standard triangle-example fragment shader.
-    pub const FRAGMENT: &[u32] =
+    pub const BB_TRIANGLE_FRAGMENT: &[u32] =
         inline_spirv::include_spirv!("src/shaders/bb_triangle_frag.glsl", frag, glsl);
+
+    /// Shader for texture-mapping the entire screen. Useful for post-processing and fullscreen effects.
+    pub const FULLSCREEN_VERTEX: &[u32] =
+        inline_spirv::include_spirv!("src/shaders/fullscreen_vert.glsl", vert, glsl);
 }
 
 /// A sane maximum number of color attachments that can be used before requiring a heap allocation.
@@ -28,7 +34,7 @@ pub struct SpecializationConstants {
     pub toggle: u32,
 }
 
-/// Define the push constants that can be used with the shaders of this application.
+/// Define the push constants that can be used with the shaders of this application (i.e., `BB_TRIANGLE_FRAGMENT`).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct PushConstants {
@@ -42,6 +48,9 @@ pub fn create_render_pass(
     image_format: ash::vk::Format,
     multisample: Option<ash::vk::SampleCountFlags>,
 ) -> ash::vk::RenderPass {
+    // Ensure that the multisample count is valid and not single-sampled.
+    let multisample = multisample.filter(|&s| s != ash::vk::SampleCountFlags::TYPE_1);
+
     let mut color_attachment_references =
         SmallVec::<[ash::vk::AttachmentReference; EXPECTED_MAX_COLOR_ATTACHMENTS]>::new();
     let mut resolve_attachment_reference = None;
@@ -55,7 +64,12 @@ pub fn create_render_pass(
         format: image_format,
         samples: multisample.unwrap_or(ash::vk::SampleCountFlags::TYPE_1), // Default to single-sampled. Depth/stencil attachments must have the same sample count as the color attachments.
         load_op: ash::vk::AttachmentLoadOp::CLEAR, // Clear the framebuffer before rendering.
-        store_op: ash::vk::AttachmentStoreOp::STORE, // Store the framebuffer after rendering.
+        store_op: if multisample.is_some() {
+            // The multisample resolve attachment will store the final image, this image is transient.
+            ash::vk::AttachmentStoreOp::DONT_CARE
+        } else {
+            ash::vk::AttachmentStoreOp::STORE // Store the framebuffer after rendering.
+        },
         stencil_load_op: if is_stencil {
             ash::vk::AttachmentLoadOp::CLEAR // Match the `load_op` above when the format is stencil.
         } else {
@@ -92,7 +106,7 @@ pub fn create_render_pass(
         attachment_descriptors.push(ash::vk::AttachmentDescription {
             format: image_format,
             samples: ash::vk::SampleCountFlags::TYPE_1, // The resolve attachment must be single-sampled.
-            load_op: ash::vk::AttachmentLoadOp::DONT_CARE, // TODO: Check if this should be `CLEAR` instead.
+            load_op: ash::vk::AttachmentLoadOp::DONT_CARE,
             store_op: ash::vk::AttachmentStoreOp::STORE,
             stencil_load_op: ash::vk::AttachmentLoadOp::DONT_CARE,
             stencil_store_op: ash::vk::AttachmentStoreOp::DONT_CARE,
@@ -126,42 +140,21 @@ pub fn create_render_pass(
     };
 
     // TODO: Be more judicious about the flags we set for any particular application's needs.
-    let subpass_dependencies = [
-        ash::vk::SubpassDependency {
-            src_subpass: ash::vk::SUBPASS_EXTERNAL,
-            dst_subpass: 0,
-            src_stage_mask: ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            dst_stage_mask: ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                | ash::vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                | ash::vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
-                | ash::vk::PipelineStageFlags::FRAGMENT_SHADER,
-            src_access_mask: ash::vk::AccessFlags::MEMORY_READ,
-            dst_access_mask: ash::vk::AccessFlags::COLOR_ATTACHMENT_READ
-                | ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                | ash::vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
-                | ash::vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
-                | ash::vk::AccessFlags::SHADER_READ,
-            ..Default::default()
+    let subpass_dependencies = [ash::vk::SubpassDependency {
+        src_subpass: ash::vk::SUBPASS_EXTERNAL,
+        dst_subpass: 0,
+        src_stage_mask: ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        dst_stage_mask: ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        src_access_mask: if multisample.is_some() {
+            // The resolve attachment will be written to at the end of a previous subpass.
+            // Ensure that we wait for the attachment to be ready.
+            ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+        } else {
+            ash::vk::AccessFlags::NONE
         },
-        ash::vk::SubpassDependency {
-            src_subpass: 0,
-            dst_subpass: ash::vk::SUBPASS_EXTERNAL,
-            src_stage_mask: ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                | ash::vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                | ash::vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
-            dst_stage_mask: ash::vk::PipelineStageFlags::ALL_COMMANDS,
-            src_access_mask: ash::vk::AccessFlags::COLOR_ATTACHMENT_READ
-                | ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                | ash::vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
-                | ash::vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            dst_access_mask: ash::vk::AccessFlags::COLOR_ATTACHMENT_READ
-                | ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                | ash::vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
-                | ash::vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
-                | ash::vk::AccessFlags::SHADER_READ,
-            ..Default::default()
-        },
-    ];
+        dst_access_mask: ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        ..Default::default()
+    }];
 
     unsafe {
         device.create_render_pass(
@@ -286,8 +279,8 @@ impl Pipeline {
             ..Default::default()
         };
 
-        // TODO: Enable blending for the color attachment.
         let color_blend_attachment = ash::vk::PipelineColorBlendAttachmentState {
+            blend_enable: ash::vk::FALSE, // TODO: Enable blending for the color attachment.
             color_write_mask: ash::vk::ColorComponentFlags::R
                 | ash::vk::ColorComponentFlags::G
                 | ash::vk::ColorComponentFlags::B
@@ -295,7 +288,6 @@ impl Pipeline {
             ..Default::default()
         };
         let color_blending = ash::vk::PipelineColorBlendStateCreateInfo {
-            logic_op_enable: ash::vk::FALSE,
             attachment_count: 1,
             p_attachments: &color_blend_attachment,
             ..Default::default()
@@ -330,13 +322,6 @@ impl Pipeline {
             max_depth_bounds: 1.,
             ..Default::default()
         };
-
-        // Only used with dynamic rendering with field `p_next`. TODO: Add remaining fields when allowing dynamic rendering.
-        // let pipeline_rendering_create_info = ash::vk::PipelineRenderingCreateInfo {
-        //     color_attachment_count: 1,
-        //     p_color_attachment_formats: &swapchain.image_format(),
-        //     ..Default::default()
-        // };
 
         // Assert that the viewport and scissor will be assigned dynamically by the command buffers at render time.
         let dynamic_states = [
@@ -425,6 +410,7 @@ pub struct Renderer {
     pub framebuffers: Vec<ash::vk::Framebuffer>,
     pub frame_fences: Vec<ash::vk::Fence>,
 
+    pub fxaa_pass: Option<FxaaPass>,
     pub swapchain_preferences: utils::SwapchainPreferences,
 }
 
@@ -435,6 +421,7 @@ impl Renderer {
         surface: ash::vk::SurfaceKHR,
         swapchain_preferences: utils::SwapchainPreferences,
         toggle_data: SpecializationConstants,
+        enable_fxaa: bool,
     ) -> Self {
         // Required device extensions for the swapchain.
         const DEVICE_EXTENSIONS: [*const i8; 1] = [ash::khr::swapchain::NAME.as_ptr()];
@@ -525,9 +512,11 @@ impl Renderer {
             surface,
             &mut memory_allocator,
             swapchain_preferences,
+            enabled_swapchain_maintenance,
             None,
         );
         let frames_in_flight = swapchain.frames_in_flight();
+        let extent = swapchain.extent();
 
         // Create the render pass that will orchestrate usage of the attachments in a framebuffer's render.
         let render_pass = create_render_pass(
@@ -537,8 +526,10 @@ impl Renderer {
         );
 
         // Process the shaders that will be used in the graphics pipeline.
-        let vertex_module = utils::create_shader_module(&logical_device, shaders::VERTEX);
-        let fragment_module = utils::create_shader_module(&logical_device, shaders::FRAGMENT);
+        let vertex_module =
+            utils::create_shader_module(&logical_device, shaders::BB_TRIANGLE_VERTEX);
+        let fragment_module =
+            utils::create_shader_module(&logical_device, shaders::BB_TRIANGLE_FRAGMENT);
 
         // Create the graphics pipeline that will be used to render the application.
         let graphics_pipeline = Pipeline::new_graphics(
@@ -553,11 +544,13 @@ impl Renderer {
         // Create a pool for allocating new commands.
         // NOTE: https://developer.nvidia.com/blog/vulkan-dos-donts/ Recommends `image_count * recording_thread_count` many command pools for optimal command buffer allocation.
         //       However, we currently only reuse existing command buffers and do not need to allocate new ones.
+        // NOTE: The `RESET_COMMAND_BUFFER` flag allows for resetting individual buffers. If many command buffers are used per frame, setting an entire pool may be more efficient.
         let command_pool = unsafe {
             logical_device
                 .create_command_pool(
                     &ash::vk::CommandPoolCreateInfo {
-                        flags: ash::vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+                        flags: ash::vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER
+                            | ash::vk::CommandPoolCreateFlags::TRANSIENT,
                         queue_family_index: graphics_index,
                         ..Default::default()
                     },
@@ -601,33 +594,23 @@ impl Renderer {
             f
         };
 
-        // Create the framebuffers for this application.
-        // TODO: Create framebuffers in the same function as the render pass because the render pass defines the framebuffer topology.
-        let extent = swapchain.extent();
-        let framebuffers = if let Some(multisample_views) = swapchain.multisample_views() {
-            // Note that the order of the image views must be the same as specified during the render pass creation.
-            swapchain
-                .image_views()
-                .iter()
-                .zip(multisample_views.iter())
-                .map(|(image_view, multisample_view)| {
-                    create_framebuffer(
-                        &logical_device,
-                        render_pass,
-                        &[*multisample_view, *image_view],
-                        extent,
-                    )
-                })
-                .collect()
+        // Create the FXAA post-processing pass if desired.
+        let fxaa_pass = if enable_fxaa {
+            Some(FxaaPass::new(
+                &logical_device,
+                &mut memory_allocator,
+                extent,
+                swapchain.image_format(),
+                swapchain.image_views(),
+                ash::vk::ImageLayout::PRESENT_SRC_KHR, // The FXAA pass will render directly to the swapchain image for presentation.
+            ))
         } else {
-            swapchain
-                .image_views()
-                .iter()
-                .map(|image_view| {
-                    create_framebuffer(&logical_device, render_pass, &[*image_view], extent)
-                })
-                .collect()
+            None
         };
+
+        // Create the framebuffers for this application.
+        let framebuffers =
+            Self::create_framebuffers(&logical_device, &swapchain, render_pass, fxaa_pass.as_ref());
 
         Self {
             physical_device,
@@ -650,6 +633,8 @@ impl Renderer {
             command_buffers,
             framebuffers,
             frame_fences,
+
+            fxaa_pass,
             swapchain_preferences,
         }
     }
@@ -673,15 +658,19 @@ impl Renderer {
             // Destroy the graphics pipeline and its dependent resources.
             self.graphics_pipeline.destroy(&self.logical_device);
 
+            if let Some(mut fxaa_pass) = self.fxaa_pass.take() {
+                fxaa_pass.destroy(&self.logical_device, &mut self.memory_allocator);
+            }
+
+            // Destroy the render pass.
+            self.logical_device
+                .destroy_render_pass(self.render_pass, None);
+
             // Destroy all currently open shader modules.
             self.logical_device
                 .destroy_shader_module(self.shaders.vertex_module, None);
             self.logical_device
                 .destroy_shader_module(self.shaders.fragment_module, None);
-
-            // Destroy the render pass.
-            self.logical_device
-                .destroy_render_pass(self.render_pass, None);
 
             // Destroy the swapchain and its dependent resources, including framebuffers.
             self.swapchain.destroy(
@@ -698,6 +687,51 @@ impl Renderer {
         }
     }
 
+    /// Helper for creating framebuffers for the given render topology.
+    fn create_framebuffers(
+        device: &ash::Device,
+        swapchain: &utils::Swapchain,
+        render_pass: ash::vk::RenderPass,
+        fxaa_pass: Option<&FxaaPass>,
+    ) -> Vec<ash::vk::Framebuffer> {
+        let extent = swapchain.extent();
+
+        // Render to a temporary image if FXAA is enabled, otherwise render to the swapchain's images.
+        let destination_image_views = if let Some(fxaa_pass) = &fxaa_pass {
+            fxaa_pass
+                .framebuffer_data()
+                .iter()
+                .map(|(_, img, _, _)| *img)
+                .collect()
+        } else {
+            swapchain.image_views().to_vec()
+        };
+
+        // Render to a multisampled image if MSAA is enabled, otherwise render directly to the destination image.
+        if let Some(multisample_views) = swapchain.multisample_views() {
+            // Note that the order of the image views must be the same as specified during the render pass creation.
+            destination_image_views
+                .iter()
+                .zip(multisample_views.iter())
+                .map(|(destination_view, multisample_view)| {
+                    create_framebuffer(
+                        device,
+                        render_pass,
+                        &[*multisample_view, *destination_view],
+                        extent,
+                    )
+                })
+                .collect()
+        } else {
+            destination_image_views
+                .iter()
+                .map(|destination_view| {
+                    create_framebuffer(device, render_pass, &[*destination_view], extent)
+                })
+                .collect()
+        }
+    }
+
     /// Recreate the swapchain, including the framebuffers and image views for the frames owned by the swapchain.
     /// The `self.swapchain_preferences` are used to recreate the swapchain and do not need to match those used with the initial swapchain creation.
     pub fn recreate_swapchain(
@@ -708,7 +742,7 @@ impl Renderer {
         let old_format = self.swapchain.image_format();
 
         // Recreate the swapchain using the new preferences.
-        // Note the framebuffers are emptied and will need to be recreated separately.
+        // NOTE: The framebuffers are emptied and will need to be recreated separately.
         self.swapchain.recreate_swapchain(
             vulkan,
             self.physical_device,
@@ -720,10 +754,11 @@ impl Renderer {
         );
 
         // Check if the image format has changed and recreate the render pass and graphics pipeline if necessary.
-        if self.swapchain.image_format() != old_format {
+        let new_swapchain_format = self.swapchain.image_format();
+        if new_swapchain_format != old_format {
             let new_render_pass = create_render_pass(
                 &self.logical_device,
-                self.swapchain.image_format(),
+                new_swapchain_format,
                 self.swapchain.multisample_count(),
             );
             let mut stack_pipeline = Pipeline::new_graphics(
@@ -752,35 +787,40 @@ impl Renderer {
 
         // Recreate the framebuffers using the new swapchain's image views.
         let extent = self.swapchain.extent();
-        self.framebuffers = if let Some(multisample_views) = self.swapchain.multisample_views() {
-            // Note that the order of the image views must be the same as specified during the render pass creation.
-            self.swapchain
-                .image_views()
-                .iter()
-                .zip(multisample_views.iter())
-                .map(|(image_view, multisample_view)| {
-                    create_framebuffer(
-                        &self.logical_device,
-                        self.render_pass,
-                        &[*multisample_view, *image_view],
-                        extent,
-                    )
-                })
-                .collect()
-        } else {
-            self.swapchain
-                .image_views()
-                .iter()
-                .map(|image_view| {
-                    create_framebuffer(
-                        &self.logical_device,
-                        self.render_pass,
-                        &[*image_view],
-                        extent,
-                    )
-                })
-                .collect()
-        };
+
+        // Recreate the FXAA pass if it was enabled.
+        if let Some(fxaa_pass) = &mut self.fxaa_pass {
+            if self.swapchain.image_format() != old_format {
+                let new_fxaa_pass = FxaaPass::new(
+                    &self.logical_device,
+                    &mut self.memory_allocator,
+                    extent,
+                    new_swapchain_format,
+                    self.swapchain.image_views(),
+                    ash::vk::ImageLayout::PRESENT_SRC_KHR,
+                );
+
+                // Destroy the old FXAA pass and replace it with the new one.
+                fxaa_pass.destroy(&self.logical_device, &mut self.memory_allocator);
+                
+                *fxaa_pass = new_fxaa_pass;
+            } else {
+                fxaa_pass.recreate_framebuffers(
+                    &self.logical_device,
+                    &mut self.memory_allocator,
+                    extent,
+                    new_swapchain_format,
+                    self.swapchain.image_views(),
+                );
+            }
+        }
+
+        self.framebuffers = Self::create_framebuffers(
+            &self.logical_device,
+            &self.swapchain,
+            self.render_pass,
+            self.fxaa_pass.as_ref(),
+        );
     }
 
     /// Attempt to render the next frame of the application. If there is a recoverable error, then the swapchain is recreated and the function bails early without rendering.
@@ -848,16 +888,6 @@ impl Renderer {
                 .expect("Unable to begin command buffer");
         }
 
-        unsafe {
-            self.logical_device.cmd_push_constants(
-                command_buffer,
-                self.graphics_pipeline.layout,
-                ash::vk::ShaderStageFlags::FRAGMENT,
-                0,
-                &push_constants.time.to_ne_bytes(),
-            );
-        }
-
         let extent = self.swapchain.extent();
 
         // Begin the render pass for the current frame.
@@ -879,18 +909,28 @@ impl Renderer {
             );
         }
 
+        unsafe {
+            self.logical_device.cmd_push_constants(
+                command_buffer,
+                self.graphics_pipeline.layout,
+                ash::vk::ShaderStageFlags::FRAGMENT,
+                0,
+                &push_constants.time.to_ne_bytes(),
+            );
+        }
+
         // Set the viewport and scissor in the command buffer because we specified they would be set dynamically in the pipeline.
         unsafe {
             self.logical_device.cmd_set_viewport(
                 command_buffer,
                 0,
                 &[ash::vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
+                    x: 0.,
+                    y: 0.,
                     width: extent.width as f32,
                     height: extent.height as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
+                    min_depth: 0.,
+                    max_depth: 1.,
                 }],
             );
             self.logical_device.cmd_set_scissor(
@@ -922,6 +962,22 @@ impl Renderer {
         // End the render pass for the current frame.
         unsafe {
             self.logical_device.cmd_end_render_pass(command_buffer);
+        }
+
+        // Add the optional FXAA render pass to the command buffer, if enabled.
+        if let Some(fxaa_pass) = &self.fxaa_pass {
+            fxaa_pass.render_frame(
+                &self.logical_device,
+                command_buffer,
+                extent,
+                image_index as usize,
+                ash::vk::ImageLayout::PRESENT_SRC_KHR,
+                self.swapchain.images()[image_index as usize],
+            );
+        }
+
+        // Complete the command buffer.
+        unsafe {
             self.logical_device
                 .end_command_buffer(command_buffer)
                 .expect("Unable to end the graphics command buffer");
