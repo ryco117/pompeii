@@ -1,4 +1,4 @@
-use std::ffi::CStr;
+use std::{ffi::CStr, ops::Neg};
 
 use smallvec::SmallVec;
 use winit::{
@@ -67,6 +67,9 @@ struct PompeiiApp {
     graphics: Option<PompeiiGraphics>,
     tick_count: u64,
     start_time: std::time::Instant,
+    last_frame_time: Option<std::time::Instant>,
+    last_mouse_position: Option<(winit::dpi::PhysicalPosition<f64>, std::time::Instant)>,
+    mouse_velocity: [f32; 2],
     user_toggle: bool,
 }
 
@@ -86,8 +89,11 @@ impl PompeiiApp {
         .map(|&e| unsafe { CStr::from_ptr(e) })
         .collect::<SmallVec<[_; utils::EXPECTED_MAX_ENABLED_INSTANCE_EXTENSIONS]>>();
 
+        #[cfg(debug_assertions)]
+        println!("Enabling `ash_window` required extensions: {extension_names:?}");
+
         // Attempt to initialize the core Vulkan objects. In case of failure, safely close after the user has seen the error.
-        let vulkan = match utils::VulkanCore::new(&extension_names) {
+        let vulkan = match utils::VulkanCore::new(&extension_names, &[]) {
             Ok(v) => v,
             Err(e) => {
                 use std::io::Write as _; // For `flush` method.
@@ -114,6 +120,9 @@ impl PompeiiApp {
             graphics: None,
             tick_count: 0,
             start_time: std::time::Instant::now(),
+            last_frame_time: None,
+            last_mouse_position: None,
+            mouse_velocity: [0., 0.],
             user_toggle: false,
         }
     }
@@ -139,16 +148,14 @@ impl PompeiiApp {
             );
         }
         self.tick_count += 1;
+        let extent = renderer.swapchain.extent();
 
         // Check that the current window size won't affect rendering.
         // TODO: Consider catching window resizes and minimizes as events, then checking for a flag here.
         //       This would reduce CPU overhead in the draw loop.
         {
             let window_size = window.inner_size();
-            let swapchain_size = renderer.swapchain.extent();
-            if window_size.width != swapchain_size.width
-                || window_size.height != swapchain_size.height
-            {
+            if window_size.width != extent.width || window_size.height != extent.height {
                 if window_size.width == 0 || window_size.height == 0 {
                     // Skip all operations if the window contains no pixels.
                     #[cfg(debug_assertions)]
@@ -176,12 +183,53 @@ impl PompeiiApp {
 
         // Get updated state for drawing.
         // TODO: Update the game state outside of the render loop.
-        let push_constants = engine::PushConstants {
-            time: self.start_time.elapsed().as_secs_f32(),
+        let now = std::time::Instant::now();
+        let time = now.duration_since(self.start_time).as_secs_f32();
+        let delta_time = self.last_frame_time.map_or(time, |last_frame| {
+            now.duration_since(last_frame).as_secs_f32()
+        });
+        self.last_frame_time = Some(now);
+
+        let push_constants = match &mut renderer.active_demo {
+            engine::DemoPipeline::Triangle(_) => {
+                engine::DemoPushConstants::Triangle(engine::example_triangle::PushConstants {
+                    time,
+                })
+            }
+
+            engine::DemoPipeline::Fluid(fluid) => {
+                let dye_cycle = 12. * time;
+                let push_constants = fluid.new_push_constants(
+                    extent,
+                    self.last_mouse_position.map_or([-1.; 2], |m| m.0.into()),
+                    self.mouse_velocity,
+                    [
+                        ((dye_cycle - 0.86).sin() + 0.5).max(0.) * (2. / 3.),
+                        (-dye_cycle.sin()).max(0.),
+                        dye_cycle.cos().max(0.),
+                        ((self.mouse_velocity[0] * self.mouse_velocity[0]
+                            + self.mouse_velocity[1] * self.mouse_velocity[1])
+                            .sqrt()
+                            + 1.)
+                            .ln()
+                            .neg()
+                            .exp(),
+                    ],
+                    delta_time,
+                );
+                engine::DemoPushConstants::Fluid(push_constants, self.user_toggle.into())
+            }
         };
 
+        {
+            // Decay constants.
+            let decay = (-2. * delta_time).exp();
+            self.mouse_velocity[0] *= decay;
+            self.mouse_velocity[1] *= decay;
+        }
+
         // Attempt to render the frame, or bail and recreate the swapchain if there is a recoverable error.
-        renderer.render_frame(&self.vulkan, push_constants);
+        renderer.render_frame(&self.vulkan, &push_constants);
     }
 
     /// Handle keyboard input events.
@@ -225,10 +273,36 @@ impl PompeiiApp {
 
                     // Update the specialization constants for the renderer.
                     if let Some(PompeiiGraphics { renderer, .. }) = &mut self.graphics {
-                        renderer.update_specialization_constants(engine::SpecializationConstants {
-                            toggle: u32::from(self.user_toggle),
-                        });
+                        match &renderer.active_demo {
+                            engine::DemoPipeline::Triangle(_) => {
+                                renderer.update_specialization_constants(
+                                    engine::DemoSpecializationConstants::Triangle(
+                                        engine::example_triangle::SpecializationConstants {
+                                            toggle: u32::from(self.user_toggle),
+                                        },
+                                    ),
+                                );
+                            }
+                            engine::DemoPipeline::Fluid(_) => {}
+                        }
                     }
+                }
+
+                winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab) => {
+                    // Update the specialization constants for the renderer.
+                    let Some(PompeiiGraphics { renderer, .. }) = &mut self.graphics else {
+                        return;
+                    };
+
+                    let new_demo = match renderer.active_demo {
+                        engine::DemoPipeline::Triangle(_) => engine::NewDemo::Fluid,
+                        engine::DemoPipeline::Fluid(_) => engine::NewDemo::Triangle(
+                            engine::example_triangle::SpecializationConstants {
+                                toggle: u32::from(self.user_toggle),
+                            },
+                        ),
+                    };
+                    renderer.switch_demo(new_demo);
                 }
                 _ => (),
             }
@@ -280,29 +354,21 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
             height: current_extent.height,
         });
         // TODO: Allow the CLI to specify the image format and color-space preferences.
-        let swapchain_preferences = if self.args.hdr && self.vulkan.enabled_colorspace_ext {
-            utils::SwapchainPreferences {
-                format: Some(ash::vk::Format::A2B10G10R10_UNORM_PACK32),
-                color_space: Some(ash::vk::ColorSpaceKHR::HDR10_ST2084_EXT),
-                present_mode: Some(self.args.present_mode.into()),
-                color_samples: Some(self.args.msaa.into()),
-                preferred_extent,
-            }
-        } else {
-            utils::SwapchainPreferences {
-                present_mode: Some(self.args.present_mode.into()),
-                preferred_extent,
-                color_samples: Some(self.args.msaa.into()),
-                ..Default::default()
-            }
+        let swapchain_preferences = utils::SwapchainPreferences {
+            present_mode: Some(self.args.present_mode.into()),
+            preferred_extent,
+            color_samples: Some(self.args.msaa.into()),
+            ..Default::default()
         };
         let renderer = engine::Renderer::new(
             &self.vulkan,
             surface,
             swapchain_preferences,
-            engine::SpecializationConstants {
-                toggle: u32::from(self.user_toggle),
-            },
+            engine::DemoSpecializationConstants::Triangle(
+                engine::example_triangle::SpecializationConstants {
+                    toggle: u32::from(self.user_toggle),
+                },
+            ),
             self.args.fxaa,
         );
 
@@ -333,6 +399,23 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
             // Handle keyboard input events.
             winit::event::WindowEvent::KeyboardInput { event, .. } => {
                 self.handle_keyboard_input(event);
+            }
+
+            winit::event::WindowEvent::CursorMoved { position, .. } => {
+                let now = std::time::Instant::now();
+                self.mouse_velocity = match self.last_mouse_position {
+                    Some((last_position, last_time)) => {
+                        let delta_time = now.duration_since(last_time).as_secs_f64();
+                        let delta = (
+                            (position.x - last_position.x) / delta_time,
+                            (position.y - last_position.y) / delta_time,
+                        );
+                        [delta.0 as f32, delta.1 as f32]
+                    }
+                    None => [0.; 2],
+                };
+
+                self.last_mouse_position = Some((position, now));
             }
 
             // Ignore other events.

@@ -1,0 +1,86 @@
+// Implementatin of a basic incompressible, homogeneous fluid simulation. See https://www.dgp.toronto.edu/public_user/stam/reality/Research/pdf/ns.pdf, https://developer.nvidia.com/gpugems/gpugems/part-vi-beyond-triangles/chapter-38-fast-fluid-dynamics-simulation-gpu, https://github.com/PavelDoGreat/WebGL-Fluid-Simulation/tree/master.
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer VelocityTexture {
+  vec2 v[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer CurlTexture {
+  float c[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) writeonly buffer DivergenceTexture {
+  float d[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) buffer PressureTexture {
+  float p[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer UnusedPressureTexture {
+  float p[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer DyeTexture {
+  vec4 c[];
+};
+
+layout(push_constant) uniform PushConstants {
+  // Store GPU pointers to each texture/buffer.
+  VelocityTexture input_velocity;
+  CurlTexture curl;
+  DivergenceTexture divergence;
+  PressureTexture alpha_pressure;
+  UnusedPressureTexture beta_pressure;
+  VelocityTexture output_velocity;
+  DyeTexture input_dye;
+  DyeTexture output_dye;
+
+  vec4 cursor_dye;
+  vec2 cursor_position;
+  vec2 cursor_velocity;
+  ivec2 screen_size;
+  float delta_time;
+  float velocity_diffusion_rate;
+  float dye_diffusion_rate;
+  float vorticity_strength; // Sane values are 0 to 50. Default is 30.
+} push_constants;
+
+int texture_index(ivec2 uv) {
+  uv = clamp(uv, ivec2(0), push_constants.screen_size - ivec2(1));
+  return uv.y * push_constants.screen_size.x + uv.x;
+}
+
+// Calculate the divergence of the velocity field and store it in the output texture.
+void main() {
+  const ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+  if(coords.x >= push_constants.screen_size.x || coords.y >= push_constants.screen_size.y) {
+    return;
+  }
+  const int index = texture_index(coords);
+
+  float velocity_left = push_constants.input_velocity.v[texture_index(coords - ivec2(1, 0))].x;
+  float velocity_right = push_constants.input_velocity.v[texture_index(coords + ivec2(1, 0))].x;
+  float velocity_top = push_constants.input_velocity.v[texture_index(coords + ivec2(0, 1))].y;
+  float velocity_bottom = push_constants.input_velocity.v[texture_index(coords - ivec2(0, 1))].y;
+
+  // Invert the sign of velocity components when the neighbor is a texture boundary.
+  const vec2 velocity_center = push_constants.input_velocity.v[index];
+  if(coords.x == 0) {
+    velocity_left = -velocity_center.x;
+  } else if(coords.x == push_constants.screen_size.x - 1) {
+    velocity_right = -velocity_center.x;
+  }
+
+  if(coords.y == 0) {
+    velocity_bottom = -velocity_center.y;
+  } else if(coords.y == push_constants.screen_size.y - 1) {
+    velocity_top = -velocity_center.y;
+  }
+
+  // Calculate the divergence of the velocity field.
+  push_constants.divergence.d[index] = 0.5 * (velocity_right - velocity_left + velocity_top - velocity_bottom);
+
+  // Reduce the pressure at this pixel.
+  const float pressure = push_constants.alpha_pressure.p[index];
+  push_constants.alpha_pressure.p[index] = 0.8*pressure;
+}

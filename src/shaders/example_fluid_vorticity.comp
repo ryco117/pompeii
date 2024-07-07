@@ -1,0 +1,71 @@
+// Implementatin of a basic incompressible, homogeneous fluid simulation. See https://www.dgp.toronto.edu/public_user/stam/reality/Research/pdf/ns.pdf, https://developer.nvidia.com/gpugems/gpugems/part-vi-beyond-triangles/chapter-38-fast-fluid-dynamics-simulation-gpu, https://github.com/PavelDoGreat/WebGL-Fluid-Simulation/tree/master.
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer VelocityTexture {
+  vec2 v[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer CurlTexture {
+  float c[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer DivergenceTexture {
+  float d[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer PressureTexture {
+  float p[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer DyeTexture {
+  vec4 c[];
+};
+
+layout(push_constant) uniform PushConstants {
+  // Store GPU pointers to each texture/buffer.
+  VelocityTexture input_velocity;
+  CurlTexture curl;
+  DivergenceTexture divergence;
+  PressureTexture alpha_pressure;
+  PressureTexture beta_pressure;
+  VelocityTexture output_velocity;
+  DyeTexture input_dye;
+  DyeTexture output_dye;
+
+  vec4 cursor_dye;
+  vec2 cursor_position;
+  vec2 cursor_velocity;
+  ivec2 screen_size;
+  float delta_time;
+  float velocity_diffusion_rate;
+  float dye_diffusion_rate;
+  float vorticity_strength; // Sane values are 0 to 50. Default is 30.
+} push_constants;
+
+int texture_index(ivec2 uv) {
+  uv = clamp(uv, ivec2(0), push_constants.screen_size - ivec2(1));
+  return uv.y * push_constants.screen_size.x + uv.x;
+}
+
+// Use the `curl` field to update the velocity field. The goal is to increase the vorticity of the fluid.
+void main() {
+  const ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+  if(coords.x >= push_constants.screen_size.x || coords.y >= push_constants.screen_size.y) {
+    return;
+  }
+  const int index = texture_index(coords);
+  vec2 velocity = push_constants.input_velocity.v[index];
+
+  const float curl_left = push_constants.curl.c[texture_index(coords - ivec2(1, 0))];
+  const float curl_right = push_constants.curl.c[texture_index(coords + ivec2(1, 0))];
+  const float curl_top = push_constants.curl.c[texture_index(coords + ivec2(0, 1))];
+  const float curl_bottom = push_constants.curl.c[texture_index(coords - ivec2(0, 1))];
+  const float curl_center = push_constants.curl.c[index];
+
+  vec2 adjusting_force = vec2(abs(curl_top) - abs(curl_bottom), abs(curl_left) - abs(curl_right));
+  adjusting_force /= length(adjusting_force) + 0.0001;
+  adjusting_force *= push_constants.vorticity_strength * curl_center;
+
+  velocity += adjusting_force * push_constants.delta_time;
+  push_constants.input_velocity.v[index] = velocity;
+}

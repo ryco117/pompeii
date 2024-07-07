@@ -1,393 +1,25 @@
-use fxaa_pass::FxaaPass;
-use smallvec::SmallVec;
-use utils::{EXPECTED_MAX_FRAMES_IN_FLIGHT, FIVE_SECONDS_IN_NANOSECONDS};
+use smallvec::{smallvec, SmallVec};
+use utils::{fxaa_pass::FxaaPass, EXPECTED_MAX_FRAMES_IN_FLIGHT, FIVE_SECONDS_IN_NANOSECONDS};
 
-pub mod fxaa_pass;
+pub mod example_fluid;
+pub mod example_triangle;
 pub mod utils;
-
-/// Store the SPIR-V representation of the shaders in the binary.
-mod shaders {
-    /// The default entry point for shaders is the `main` function.
-    pub const ENTRY_POINT_MAIN: &std::ffi::CStr = c"main";
-
-    /// Standard triangle-example vertex shader.
-    pub const BB_TRIANGLE_VERTEX: &[u32] =
-        inline_spirv::include_spirv!("src/shaders/bb_triangle_vert.glsl", vert, glsl);
-
-    /// Standard triangle-example fragment shader.
-    pub const BB_TRIANGLE_FRAGMENT: &[u32] =
-        inline_spirv::include_spirv!("src/shaders/bb_triangle_frag.glsl", frag, glsl);
-
-    /// Shader for texture-mapping the entire screen. Useful for post-processing and fullscreen effects.
-    pub const FULLSCREEN_VERTEX: &[u32] =
-        inline_spirv::include_spirv!("src/shaders/fullscreen_vert.glsl", vert, glsl);
-}
-
-/// A sane maximum number of color attachments that can be used before requiring a heap allocation.
-const EXPECTED_MAX_COLOR_ATTACHMENTS: usize = 4;
-
-/// Define the specialization constants that can be used with the shaders of this application.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct SpecializationConstants {
-    /// Reflect the vertices of the triangle along their Y axis.
-    pub toggle: u32,
-}
-
-/// Define the push constants that can be used with the shaders of this application (i.e., `BB_TRIANGLE_FRAGMENT`).
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct PushConstants {
-    /// The time in seconds since the application started.
-    pub time: f32,
-}
-
-/// Create the render pass capable of orchestrating the rendering of framebuffers for this application.
-pub fn create_render_pass(
-    device: &ash::Device,
-    image_format: ash::vk::Format,
-    multisample: Option<ash::vk::SampleCountFlags>,
-) -> ash::vk::RenderPass {
-    // Ensure that the multisample count is valid and not single-sampled.
-    let multisample = multisample.filter(|&s| s != ash::vk::SampleCountFlags::TYPE_1);
-
-    let mut color_attachment_references =
-        SmallVec::<[ash::vk::AttachmentReference; EXPECTED_MAX_COLOR_ATTACHMENTS]>::new();
-    let mut resolve_attachment_reference = None;
-    let mut depth_stencil_attachment_reference = None;
-
-    // TODO: Allow for a list of attachment images with different formats, layouts, etc.
-    let is_stencil = utils::is_stencil_format(image_format);
-    let is_depth = utils::is_depth_format(image_format);
-
-    let mut attachment_descriptors = vec![ash::vk::AttachmentDescription {
-        format: image_format,
-        samples: multisample.unwrap_or(ash::vk::SampleCountFlags::TYPE_1), // Default to single-sampled. Depth/stencil attachments must have the same sample count as the color attachments.
-        load_op: ash::vk::AttachmentLoadOp::CLEAR, // Clear the framebuffer before rendering.
-        store_op: if multisample.is_some() {
-            // The multisample resolve attachment will store the final image, this image is transient.
-            ash::vk::AttachmentStoreOp::DONT_CARE
-        } else {
-            ash::vk::AttachmentStoreOp::STORE // Store the framebuffer after rendering.
-        },
-        stencil_load_op: if is_stencil {
-            ash::vk::AttachmentLoadOp::CLEAR // Match the `load_op` above when the format is stencil.
-        } else {
-            ash::vk::AttachmentLoadOp::DONT_CARE
-        },
-        stencil_store_op: if is_stencil {
-            ash::vk::AttachmentStoreOp::STORE // Match the `store_op` above when the format is stencil.
-        } else {
-            ash::vk::AttachmentStoreOp::DONT_CARE
-        },
-        initial_layout: ash::vk::ImageLayout::UNDEFINED,
-        final_layout: if multisample.is_some() {
-            ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-        } else {
-            ash::vk::ImageLayout::PRESENT_SRC_KHR
-        },
-        ..Default::default()
-    }];
-
-    if is_stencil || is_depth {
-        depth_stencil_attachment_reference = Some(ash::vk::AttachmentReference {
-            attachment: 0, // TODO: Use the index of depth attachment in framebuffer.
-            layout: ash::vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-        });
-    } else {
-        color_attachment_references.push(ash::vk::AttachmentReference {
-            attachment: 0, // TODO: Use the index of color attachment in framebuffer.
-            layout: ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        });
-    }
-
-    if multisample.is_some() {
-        let index = attachment_descriptors.len();
-        attachment_descriptors.push(ash::vk::AttachmentDescription {
-            format: image_format,
-            samples: ash::vk::SampleCountFlags::TYPE_1, // The resolve attachment must be single-sampled.
-            load_op: ash::vk::AttachmentLoadOp::DONT_CARE,
-            store_op: ash::vk::AttachmentStoreOp::STORE,
-            stencil_load_op: ash::vk::AttachmentLoadOp::DONT_CARE,
-            stencil_store_op: ash::vk::AttachmentStoreOp::DONT_CARE,
-            initial_layout: ash::vk::ImageLayout::UNDEFINED,
-            final_layout: ash::vk::ImageLayout::PRESENT_SRC_KHR,
-            ..Default::default()
-        });
-
-        resolve_attachment_reference = Some(ash::vk::AttachmentReference {
-            attachment: index as u32,
-            layout: ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        });
-    }
-
-    // Ensure that when multisampling is enabled, there is a resolve attachment for every color attachment.
-    #[cfg(debug_assertions)]
-    assert!(resolve_attachment_reference.is_none() || color_attachment_references.len() == 1);
-
-    // Define the single subpass that will be used in the render pass.
-    let subpass_description = ash::vk::SubpassDescription {
-        pipeline_bind_point: ash::vk::PipelineBindPoint::GRAPHICS,
-        color_attachment_count: color_attachment_references.len() as u32,
-        p_color_attachments: color_attachment_references.as_ptr(),
-        p_resolve_attachments: resolve_attachment_reference
-            .as_ref()
-            .map_or(std::ptr::null(), std::ptr::from_ref),
-        p_depth_stencil_attachment: depth_stencil_attachment_reference
-            .as_ref()
-            .map_or(std::ptr::null(), std::ptr::from_ref),
-        ..Default::default()
-    };
-
-    // TODO: Be more judicious about the flags we set for any particular application's needs.
-    let subpass_dependencies = [ash::vk::SubpassDependency {
-        src_subpass: ash::vk::SUBPASS_EXTERNAL,
-        dst_subpass: 0,
-        src_stage_mask: ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-        dst_stage_mask: ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-        src_access_mask: if multisample.is_some() {
-            // The resolve attachment will be written to at the end of a previous subpass.
-            // Ensure that we wait for the attachment to be ready.
-            ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-        } else {
-            ash::vk::AccessFlags::NONE
-        },
-        dst_access_mask: ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-        ..Default::default()
-    }];
-
-    unsafe {
-        device.create_render_pass(
-            &ash::vk::RenderPassCreateInfo {
-                attachment_count: attachment_descriptors.len() as u32,
-                p_attachments: attachment_descriptors.as_ptr(),
-                subpass_count: 1,
-                p_subpasses: &subpass_description,
-                dependency_count: subpass_dependencies.len() as u32,
-                p_dependencies: subpass_dependencies.as_ptr(),
-                ..Default::default()
-            },
-            None,
-        )
-    }
-    .expect("Unable to create the application render pass")
-}
-
-/// Create a framebuffer that can be used with this render pass.
-pub fn create_framebuffer(
-    device: &ash::Device,
-    render_pass: ash::vk::RenderPass,
-    image_views: &[ash::vk::ImageView],
-    extent: ash::vk::Extent2D,
-) -> ash::vk::Framebuffer {
-    let ash::vk::Extent2D { width, height } = extent;
-    unsafe {
-        device.create_framebuffer(
-            &ash::vk::FramebufferCreateInfo {
-                render_pass,
-                attachment_count: image_views.len() as u32,
-                p_attachments: image_views.as_ptr(),
-                width,
-                height,
-                layers: 1,
-                ..Default::default()
-            },
-            None,
-        )
-    }
-    .expect("Unable to create framebuffer")
-}
-
-/// Manage the graphics pipeline and dependent resources.
-pub struct Pipeline {
-    pub handle: ash::vk::Pipeline,
-    pub layout: ash::vk::PipelineLayout,
-    pub specialization_constants: SpecializationConstants,
-}
-
-impl Pipeline {
-    /// Create the graphics pipeline capable of rendering this application's scene.
-    pub fn new_graphics(
-        device: &ash::Device,
-        vertex_module: ash::vk::ShaderModule,
-        fragment_module: ash::vk::ShaderModule,
-        render_pass: ash::vk::RenderPass,
-        multisample_count: Option<ash::vk::SampleCountFlags>,
-        specialization_constants: SpecializationConstants,
-    ) -> Self {
-        // Define the specialization constants used for this pipeline creation.
-        let specialization_map_toggle = ash::vk::SpecializationMapEntry {
-            constant_id: 0,
-            offset: 0,
-            size: std::mem::size_of::<u32>(),
-        };
-        let vertex_specialization_constants = ash::vk::SpecializationInfo {
-            map_entry_count: 1,
-            p_map_entries: &specialization_map_toggle,
-            data_size: std::mem::size_of_val::<u32>(&specialization_constants.toggle),
-            p_data: std::ptr::from_ref(&specialization_constants.toggle).cast(),
-            ..Default::default()
-        };
-
-        // Define the shader stages that will be used in this pipeline.
-        let shader_stages = [
-            // Define the vertex shader stage.
-            ash::vk::PipelineShaderStageCreateInfo {
-                stage: ash::vk::ShaderStageFlags::VERTEX,
-                module: vertex_module,
-                p_name: shaders::ENTRY_POINT_MAIN.as_ptr(),
-                p_specialization_info: &vertex_specialization_constants,
-                ..Default::default()
-            },
-            // Define the fragment shader stage.
-            ash::vk::PipelineShaderStageCreateInfo {
-                stage: ash::vk::ShaderStageFlags::FRAGMENT,
-                module: fragment_module,
-                p_name: shaders::ENTRY_POINT_MAIN.as_ptr(),
-                ..Default::default()
-            },
-        ];
-
-        // Using the technique Programmable Vertex Pulling (PVP), specifying vertex input states is somewhat obsolete.
-        let vertex_input_create_info = ash::vk::PipelineVertexInputStateCreateInfo {
-            ..Default::default()
-        };
-
-        let input_assembly = ash::vk::PipelineInputAssemblyStateCreateInfo {
-            topology: ash::vk::PrimitiveTopology::TRIANGLE_LIST,
-            ..Default::default()
-        };
-
-        // Define a dynamic viewport and scissor will be used with this pipeline.
-        let viewport_state = ash::vk::PipelineViewportStateCreateInfo {
-            viewport_count: 1,
-            scissor_count: 1,
-            ..Default::default()
-        };
-
-        let rasterizer = ash::vk::PipelineRasterizationStateCreateInfo {
-            polygon_mode: ash::vk::PolygonMode::FILL, // TODO: Allow the caller to define the fill mode.
-            cull_mode: ash::vk::CullModeFlags::BACK,
-            front_face: ash::vk::FrontFace::COUNTER_CLOCKWISE, // This is the default, but making it explicit for clarity.
-            line_width: 1.,
-            ..Default::default()
-        };
-
-        let multisampling = ash::vk::PipelineMultisampleStateCreateInfo {
-            rasterization_samples: multisample_count.unwrap_or(ash::vk::SampleCountFlags::TYPE_1), // Must match the sample count of the color attachments of the render pass.
-            min_sample_shading: 1., // Only does something when `sample_shading_enable` is true.
-            ..Default::default()
-        };
-
-        let color_blend_attachment = ash::vk::PipelineColorBlendAttachmentState {
-            blend_enable: ash::vk::FALSE, // TODO: Enable blending for the color attachment.
-            color_write_mask: ash::vk::ColorComponentFlags::R
-                | ash::vk::ColorComponentFlags::G
-                | ash::vk::ColorComponentFlags::B
-                | ash::vk::ColorComponentFlags::A,
-            ..Default::default()
-        };
-        let color_blending = ash::vk::PipelineColorBlendStateCreateInfo {
-            attachment_count: 1,
-            p_attachments: &color_blend_attachment,
-            ..Default::default()
-        };
-
-        // TODO: Enable other common pipeline features including descriptor sets, etc.
-
-        // TODO: Store the push constant ranges with the pipeline so that each can be explicitly reused during the render.
-        let push_constant_ranges = [ash::vk::PushConstantRange {
-            stage_flags: ash::vk::ShaderStageFlags::FRAGMENT,
-            offset: 0,
-            size: std::mem::size_of::<f32>() as u32,
-        }];
-        let pipeline_layout = unsafe {
-            device
-                .create_pipeline_layout(
-                    &ash::vk::PipelineLayoutCreateInfo {
-                        push_constant_range_count: push_constant_ranges.len() as u32,
-                        p_push_constant_ranges: push_constant_ranges.as_ptr(),
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .expect("Unable to create the application graphics pipeline layout")
-        };
-
-        let depth_stencil_state = ash::vk::PipelineDepthStencilStateCreateInfo {
-            depth_test_enable: ash::vk::FALSE,
-            depth_write_enable: ash::vk::TRUE,
-            depth_compare_op: ash::vk::CompareOp::LESS,
-            min_depth_bounds: 0.,
-            max_depth_bounds: 1.,
-            ..Default::default()
-        };
-
-        // Assert that the viewport and scissor will be assigned dynamically by the command buffers at render time.
-        let dynamic_states = [
-            ash::vk::DynamicState::VIEWPORT,
-            ash::vk::DynamicState::SCISSOR,
-        ];
-
-        // Create the graphics pipeline using the parameters above.
-        let pipeline = *unsafe {
-            device.create_graphics_pipelines(
-                ash::vk::PipelineCache::null(),
-                &[ash::vk::GraphicsPipelineCreateInfo {
-                    stage_count: shader_stages.len() as u32,
-                    p_stages: shader_stages.as_ptr(),
-                    p_vertex_input_state: &vertex_input_create_info,
-                    p_input_assembly_state: &input_assembly,
-                    p_viewport_state: &viewport_state,
-                    p_rasterization_state: &rasterizer,
-                    p_multisample_state: &multisampling,
-                    p_depth_stencil_state: &depth_stencil_state,
-                    p_color_blend_state: &color_blending,
-                    p_dynamic_state: &ash::vk::PipelineDynamicStateCreateInfo {
-                        dynamic_state_count: dynamic_states.len() as u32,
-                        p_dynamic_states: dynamic_states.as_ptr(),
-                        ..Default::default()
-                    },
-                    layout: pipeline_layout,
-                    render_pass,
-                    subpass: 0, // Optional, but a good reminder that pipelines are associated with a subpass.
-                    base_pipeline_index: -1,
-                    ..Default::default()
-                }],
-                None,
-            )
-        }
-        .expect("Unable to create the application graphics pipeline")
-        .first()
-        .expect("vkCreateGraphicsPipelines returned an empty list of pipelines");
-
-        Self {
-            handle: pipeline,
-            layout: pipeline_layout,
-            specialization_constants,
-        }
-    }
-
-    /// Destroy the graphics pipeline and its dependent resources.
-    /// # Safety
-    /// This function **must** only be called when the owned resources are not currently being processed by the GPU.
-    pub fn destroy(self, device: &ash::Device) {
-        unsafe {
-            device.destroy_pipeline(self.handle, None);
-            device.destroy_pipeline_layout(self.layout, None);
-        }
-    }
-}
-
-/// Store the shader modules used by the renderer.
-pub struct Shaders {
-    vertex_module: ash::vk::ShaderModule,
-    fragment_module: ash::vk::ShaderModule,
-}
 
 /// Store the state of optional features that aren't required but we may want to leverage.
 pub struct DeviceFeatures {
     pub enabled_swapchain_maintenance: bool,
+}
+
+/// The demos the application is capable of rendering.
+pub enum DemoPipeline {
+    Triangle(example_triangle::Pipeline),
+    Fluid(example_fluid::FluidSimulation),
+}
+
+/// The push constants necessary to render the active demo.
+pub enum DemoPushConstants {
+    Triangle(example_triangle::PushConstants),
+    Fluid(example_fluid::PushConstants, u32),
 }
 
 /// Define which rendering objects are necessary for this application.
@@ -399,19 +31,35 @@ pub struct Renderer {
     pub surface: ash::vk::SurfaceKHR,
     pub memory_allocator: gpu_allocator::vulkan::Allocator,
     pub swapchain: utils::Swapchain,
-    pub render_pass: ash::vk::RenderPass,
-    pub shaders: Shaders,
-    pub graphics_pipeline: Pipeline,
 
-    pub graphics_queue: ash::vk::Queue,
-    pub presentation_queue: ash::vk::Queue,
+    // The specific object we are interested in rendering.
+    pub active_demo: DemoPipeline,
+
+    pub graphics_queue: utils::IndexedQueue,
+    pub compute_queue: utils::IndexedQueue,
+    pub presentation_queue: utils::IndexedQueue,
     pub command_pool: ash::vk::CommandPool,
+    pub compute_command_pool: Option<(ash::vk::CommandPool, ash::vk::Semaphore)>, // Optional compute command pool and compute semaphore if the graphics and compute queue families are separate.
+
     pub command_buffers: Vec<ash::vk::CommandBuffer>,
-    pub framebuffers: Vec<ash::vk::Framebuffer>,
     pub frame_fences: Vec<ash::vk::Fence>,
 
     pub fxaa_pass: Option<FxaaPass>,
     pub swapchain_preferences: utils::SwapchainPreferences,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DemoSpecializationConstants {
+    Triangle(example_triangle::SpecializationConstants),
+
+    #[allow(dead_code)]
+    Fluid,
+}
+
+/// The new demo to switch to, and any unique parameters necessary to initialize it.
+pub enum NewDemo {
+    Triangle(example_triangle::SpecializationConstants),
+    Fluid,
 }
 
 impl Renderer {
@@ -420,25 +68,45 @@ impl Renderer {
         vulkan: &utils::VulkanCore,
         surface: ash::vk::SurfaceKHR,
         swapchain_preferences: utils::SwapchainPreferences,
-        toggle_data: SpecializationConstants,
+        specialization_constants: DemoSpecializationConstants,
         enable_fxaa: bool,
     ) -> Self {
         // Required device extensions for the swapchain.
         const DEVICE_EXTENSIONS: [*const i8; 1] = [ash::khr::swapchain::NAME.as_ptr()];
-        let mut custom_extensions = Vec::new();
 
         // Use simple heuristics to find the best suitable physical device.
         let (physical_device, device_properties) = *utils::get_sorted_physical_devices(
             &vulkan.instance,
             vulkan.version,
             &DEVICE_EXTENSIONS,
+            utils::EnginePhysicalDeviceFeatures {
+                buffer_device_address: ash::vk::PhysicalDeviceBufferDeviceAddressFeatures::default(
+                )
+                .buffer_device_address(true),
+                dynamic_rendering: true,
+                descriptor_indexing: ash::vk::PhysicalDeviceDescriptorIndexingFeaturesEXT::default(
+                )
+                .descriptor_binding_update_unused_while_pending(true)
+                .descriptor_binding_partially_bound(true),
+                synchronization2: true,
+                ..Default::default()
+            },
         )
         .first()
         .expect("Unable to find a suitable physical device");
 
+        #[cfg(debug_assertions)]
+        println!(
+            "Selected physical device: {:?}",
+            device_properties
+                .device_name_as_c_str()
+                .expect("Unable to get device name")
+        );
+
         // Check the physical device for optional features we can enable for this application.
+        let mut custom_extensions = Vec::new();
         let (device_extensions, enabled_swapchain_maintenance) = if vulkan
-            .enabled_surface_maintenance
+            .enabled_instance_extension(ash::ext::surface_maintenance1::NAME)
         {
             let extensions = unsafe {
                 vulkan
@@ -449,6 +117,9 @@ impl Renderer {
 
             if utils::extensions_list_contains(&extensions, ash::ext::swapchain_maintenance1::NAME)
             {
+                #[cfg(debug_assertions)]
+                println!("Enabling VK_EXT_swapchain_maintenance1 device extension");
+
                 // Enable all of the default device extensions.
                 custom_extensions.extend_from_slice(&DEVICE_EXTENSIONS);
 
@@ -463,35 +134,81 @@ impl Renderer {
             (&DEVICE_EXTENSIONS[..], false)
         };
 
-        #[cfg(debug_assertions)]
-        println!(
-            "Selected physical device: {:?}",
-            device_properties
-                .device_name_as_c_str()
-                .expect("Unable to get device name")
-        );
+        // We required these features in physical device selection.
+        // Now we can request the features be enabled over the logical device we create.
+        let mut descriptor_indexing_feature =
+            ash::vk::PhysicalDeviceDescriptorIndexingFeaturesEXT::default()
+                .descriptor_binding_update_unused_while_pending(true)
+                .descriptor_binding_partially_bound(true);
+        let mut dynamic_rendering_feature =
+            ash::vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+        let mut synchronization2_feature =
+            ash::vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+        let mut buffer_device_address_feature =
+            ash::vk::PhysicalDeviceBufferDeviceAddressFeatures::default()
+                .buffer_device_address(true);
+
+        // Ignore the features we are not interested in, and enable the ones we are.
+        let mut features = ash::vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut descriptor_indexing_feature)
+            .push_next(&mut dynamic_rendering_feature)
+            .push_next(&mut synchronization2_feature)
+            .push_next(&mut buffer_device_address_feature);
 
         // Create a logical device capable of rendering to the surface and performing compute operations.
-        let (logical_device, queue_families) =
-            utils::new_device(vulkan, physical_device, surface, device_extensions);
-        let (graphics_index, present_index) = {
-            let graphics = *queue_families
-                .graphics
-                .first()
-                .expect("Unable to find a graphics queue family");
-            let present = *queue_families
-                .present
-                .first()
-                .expect("Unable to find a present queue family");
+        let (logical_device, queue_families) = utils::new_device(
+            vulkan,
+            physical_device,
+            surface,
+            device_extensions,
+            Some(&mut features),
+        );
+        let (graphics_index, compute_index, present_index) = {
+            // NOTE: Prefer that the graphics and compute queues are equivalent because the `example_fluid` module will benefit from shared resources.
+            let graphics = if let Some(gc) = queue_families.queue_families.iter().position(|f| {
+                f.queue_flags
+                    .contains(ash::vk::QueueFlags::COMPUTE | ash::vk::QueueFlags::GRAPHICS)
+            }) {
+                gc as u32
+            } else {
+                *queue_families
+                    .graphics
+                    .first()
+                    .expect("Unable to find a graphics queue family")
+            };
 
-            (graphics, present)
+            // Prefer using the graphics queue for presentation if possible.
+            let present = if queue_families.present.contains(&graphics) {
+                graphics
+            } else {
+                // Choose the first queue family that supports presentation.
+                *queue_families
+                    .present
+                    .first()
+                    .expect("Unable to find a present queue family")
+            };
+
+            // NOTE: Prefer that the graphics and compute queues are equivalent because the `example_fluid` module will benefit from shared resources.
+            let compute = if queue_families.compute.contains(&graphics) {
+                graphics
+            } else {
+                *queue_families
+                    .compute
+                    .first()
+                    .expect("Unable to find a compute queue family")
+            };
+
+            (graphics, compute, present)
         };
 
-        // Create a queue capable of performing graphics commands.
-        let graphics_queue = unsafe { logical_device.get_device_queue(graphics_index, 0) };
+        // Get a handle to a queue capable of performing graphics commands.
+        let graphics_queue = utils::IndexedQueue::get(&logical_device, graphics_index, 0);
 
-        // Create a presentation queue for use with the swapchain.
-        let presentation_queue = unsafe { logical_device.get_device_queue(present_index, 0) };
+        // Get a handle to a queue capable of performing compute commands.
+        let compute_queue = utils::IndexedQueue::get(&logical_device, compute_index, 0);
+
+        // Get a handle to a presentation queue for use with swapchain presentation.
+        let presentation_queue = utils::IndexedQueue::get(&logical_device, present_index, 0);
 
         let mut memory_allocator =
             gpu_allocator::vulkan::Allocator::new(&gpu_allocator::vulkan::AllocatorCreateDesc {
@@ -499,7 +216,7 @@ impl Renderer {
                 device: logical_device.clone(),
                 physical_device,
                 debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
-                buffer_device_address: false, // TODO: One can check if this feature is enabled first.
+                buffer_device_address: true,
                 allocation_sizes: gpu_allocator::AllocationSizes::default(),
             })
             .expect("Unable to create memory allocator (GPU Allocator)");
@@ -517,29 +234,7 @@ impl Renderer {
         );
         let frames_in_flight = swapchain.frames_in_flight();
         let extent = swapchain.extent();
-
-        // Create the render pass that will orchestrate usage of the attachments in a framebuffer's render.
-        let render_pass = create_render_pass(
-            &logical_device,
-            swapchain.image_format(),
-            swapchain.multisample_count(),
-        );
-
-        // Process the shaders that will be used in the graphics pipeline.
-        let vertex_module =
-            utils::create_shader_module(&logical_device, shaders::BB_TRIANGLE_VERTEX);
-        let fragment_module =
-            utils::create_shader_module(&logical_device, shaders::BB_TRIANGLE_FRAGMENT);
-
-        // Create the graphics pipeline that will be used to render the application.
-        let graphics_pipeline = Pipeline::new_graphics(
-            &logical_device,
-            vertex_module,
-            fragment_module,
-            render_pass,
-            swapchain.multisample_count(),
-            toggle_data,
-        );
+        let image_format = swapchain.image_format();
 
         // Create a pool for allocating new commands.
         // NOTE: https://developer.nvidia.com/blog/vulkan-dos-donts/ Recommends `image_count * recording_thread_count` many command pools for optimal command buffer allocation.
@@ -557,6 +252,82 @@ impl Renderer {
                     None,
                 )
                 .expect("Unable to create command pool")
+        };
+
+        let compute_command_pool = if graphics_index == compute_index {
+            None
+        } else {
+            let pool = unsafe {
+                logical_device.create_command_pool(
+                    &ash::vk::CommandPoolCreateInfo {
+                        flags: ash::vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER
+                            | ash::vk::CommandPoolCreateFlags::TRANSIENT,
+                        queue_family_index: compute_index,
+                        ..Default::default()
+                    },
+                    None,
+                )
+            }
+            .expect("Unable to create command pool");
+
+            let semaphore = unsafe {
+                logical_device
+                    .create_semaphore(&ash::vk::SemaphoreCreateInfo::default(), None)
+                    .expect("Unable to create semaphore")
+            };
+
+            Some((pool, semaphore))
+        };
+
+        // Create the FXAA post-processing pass if it is desired.
+        // Creating post processing passes first is helpful for chaining passes together.
+        let fxaa_pass = if enable_fxaa {
+            Some(FxaaPass::new(
+                &logical_device,
+                &mut memory_allocator,
+                extent,
+                image_format,
+                swapchain.image_views(),
+                ash::vk::ImageLayout::PRESENT_SRC_KHR, // The FXAA pass will render directly to the swapchain image for presentation.
+            ))
+        } else {
+            None
+        };
+
+        let active_demo = match specialization_constants {
+            DemoSpecializationConstants::Triangle(constants) => {
+                // Create the graphics pipeline that will be used to render the application.
+                let demo = example_triangle::Pipeline::new(
+                    &logical_device,
+                    None,
+                    None,
+                    example_triangle::CreateReuseRenderPass::Create {
+                        image_format,
+                        destination_layout: if enable_fxaa {
+                            // NOTE: If we have at least one post-processing pass, we should render to a color attachment.
+                            ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                        } else {
+                            ash::vk::ImageLayout::PRESENT_SRC_KHR
+                        },
+                    },
+                    &swapchain,
+                    constants,
+                    fxaa_pass.as_ref(),
+                );
+                DemoPipeline::Triangle(demo)
+            }
+            DemoSpecializationConstants::Fluid => {
+                let demo = example_fluid::FluidSimulation::new(
+                    &logical_device,
+                    &mut memory_allocator,
+                    extent,
+                    image_format,
+                    ash::vk::ImageLayout::PRESENT_SRC_KHR,
+                    swapchain.image_views(),
+                    compute_command_pool.map_or(command_pool, |(pool, _)| pool),
+                );
+                DemoPipeline::Fluid(demo)
+            }
         };
 
         // Allocate a command buffer for each frame in flight.
@@ -594,24 +365,6 @@ impl Renderer {
             f
         };
 
-        // Create the FXAA post-processing pass if desired.
-        let fxaa_pass = if enable_fxaa {
-            Some(FxaaPass::new(
-                &logical_device,
-                &mut memory_allocator,
-                extent,
-                swapchain.image_format(),
-                swapchain.image_views(),
-                ash::vk::ImageLayout::PRESENT_SRC_KHR, // The FXAA pass will render directly to the swapchain image for presentation.
-            ))
-        } else {
-            None
-        };
-
-        // Create the framebuffers for this application.
-        let framebuffers =
-            Self::create_framebuffers(&logical_device, &swapchain, render_pass, fxaa_pass.as_ref());
-
         Self {
             physical_device,
             device_features: DeviceFeatures {
@@ -620,18 +373,16 @@ impl Renderer {
             logical_device,
             surface,
             memory_allocator,
+
             swapchain,
-            render_pass,
-            shaders: Shaders {
-                vertex_module,
-                fragment_module,
-            },
-            graphics_pipeline,
+            active_demo,
             graphics_queue,
+            compute_queue,
             presentation_queue,
             command_pool,
+            compute_command_pool,
+
             command_buffers,
-            framebuffers,
             frame_fences,
 
             fxaa_pass,
@@ -656,28 +407,22 @@ impl Renderer {
                 .destroy_command_pool(self.command_pool, None);
 
             // Destroy the graphics pipeline and its dependent resources.
-            self.graphics_pipeline.destroy(&self.logical_device);
+            match self.active_demo {
+                DemoPipeline::Triangle(pipeline) => {
+                    pipeline.destroy(&self.logical_device, true, true)
+                }
+                DemoPipeline::Fluid(mut simulation) => {
+                    simulation.destroy(&self.logical_device, &mut self.memory_allocator)
+                }
+            }
 
             if let Some(mut fxaa_pass) = self.fxaa_pass.take() {
                 fxaa_pass.destroy(&self.logical_device, &mut self.memory_allocator);
             }
 
-            // Destroy the render pass.
-            self.logical_device
-                .destroy_render_pass(self.render_pass, None);
-
-            // Destroy all currently open shader modules.
-            self.logical_device
-                .destroy_shader_module(self.shaders.vertex_module, None);
-            self.logical_device
-                .destroy_shader_module(self.shaders.fragment_module, None);
-
-            // Destroy the swapchain and its dependent resources, including framebuffers.
-            self.swapchain.destroy(
-                &self.logical_device,
-                &mut self.memory_allocator,
-                &mut self.framebuffers,
-            );
+            // Destroy the swapchain and its dependent resources.
+            self.swapchain
+                .destroy(&self.logical_device, &mut self.memory_allocator);
 
             // Destroy the logical device itself.
             self.logical_device.destroy_device(None);
@@ -688,49 +433,6 @@ impl Renderer {
     }
 
     /// Helper for creating framebuffers for the given render topology.
-    fn create_framebuffers(
-        device: &ash::Device,
-        swapchain: &utils::Swapchain,
-        render_pass: ash::vk::RenderPass,
-        fxaa_pass: Option<&FxaaPass>,
-    ) -> Vec<ash::vk::Framebuffer> {
-        let extent = swapchain.extent();
-
-        // Render to a temporary image if FXAA is enabled, otherwise render to the swapchain's images.
-        let destination_image_views = if let Some(fxaa_pass) = &fxaa_pass {
-            fxaa_pass
-                .framebuffer_data()
-                .iter()
-                .map(|(_, img, _, _)| *img)
-                .collect()
-        } else {
-            swapchain.image_views().to_vec()
-        };
-
-        // Render to a multisampled image if MSAA is enabled, otherwise render directly to the destination image.
-        if let Some(multisample_views) = swapchain.multisample_views() {
-            // Note that the order of the image views must be the same as specified during the render pass creation.
-            destination_image_views
-                .iter()
-                .zip(multisample_views.iter())
-                .map(|(destination_view, multisample_view)| {
-                    create_framebuffer(
-                        device,
-                        render_pass,
-                        &[*multisample_view, *destination_view],
-                        extent,
-                    )
-                })
-                .collect()
-        } else {
-            destination_image_views
-                .iter()
-                .map(|destination_view| {
-                    create_framebuffer(device, render_pass, &[*destination_view], extent)
-                })
-                .collect()
-        }
-    }
 
     /// Recreate the swapchain, including the framebuffers and image views for the frames owned by the swapchain.
     /// The `self.swapchain_preferences` are used to recreate the swapchain and do not need to match those used with the initial swapchain creation.
@@ -742,55 +444,30 @@ impl Renderer {
         let old_format = self.swapchain.image_format();
 
         // Recreate the swapchain using the new preferences.
-        // NOTE: The framebuffers are emptied and will need to be recreated separately.
         self.swapchain.recreate_swapchain(
             vulkan,
             self.physical_device,
             &self.logical_device,
             self.surface,
             &mut self.memory_allocator,
-            &mut self.framebuffers,
             swapchain_preferences,
         );
 
         // Check if the image format has changed and recreate the render pass and graphics pipeline if necessary.
         let new_swapchain_format = self.swapchain.image_format();
-        if new_swapchain_format != old_format {
-            let new_render_pass = create_render_pass(
-                &self.logical_device,
-                new_swapchain_format,
-                self.swapchain.multisample_count(),
-            );
-            let mut stack_pipeline = Pipeline::new_graphics(
-                &self.logical_device,
-                self.shaders.vertex_module,
-                self.shaders.fragment_module,
-                new_render_pass,
-                self.swapchain.multisample_count(),
-                self.graphics_pipeline.specialization_constants,
-            );
-
-            // Swap the new graphics pipeline with the old one.
-            std::mem::swap(&mut self.graphics_pipeline, &mut stack_pipeline);
-
-            self.wait_for_tasks();
-
-            // Destroy the old graphics pipeline and render pass.
-            stack_pipeline.destroy(&self.logical_device);
-            unsafe {
-                self.logical_device
-                    .destroy_render_pass(self.render_pass, None);
-            }
-
-            self.render_pass = new_render_pass;
-        }
-
-        // Recreate the framebuffers using the new swapchain's image views.
         let extent = self.swapchain.extent();
 
         // Recreate the FXAA pass if it was enabled.
         if let Some(fxaa_pass) = &mut self.fxaa_pass {
-            if self.swapchain.image_format() != old_format {
+            if new_swapchain_format == old_format {
+                fxaa_pass.recreate_framebuffers(
+                    &self.logical_device,
+                    &mut self.memory_allocator,
+                    extent,
+                    new_swapchain_format,
+                    self.swapchain.image_views(),
+                );
+            } else {
                 let new_fxaa_pass = FxaaPass::new(
                     &self.logical_device,
                     &mut self.memory_allocator,
@@ -802,29 +479,72 @@ impl Renderer {
 
                 // Destroy the old FXAA pass and replace it with the new one.
                 fxaa_pass.destroy(&self.logical_device, &mut self.memory_allocator);
-                
+
                 *fxaa_pass = new_fxaa_pass;
-            } else {
-                fxaa_pass.recreate_framebuffers(
-                    &self.logical_device,
-                    &mut self.memory_allocator,
-                    extent,
-                    new_swapchain_format,
-                    self.swapchain.image_views(),
-                );
             }
         }
 
-        self.framebuffers = Self::create_framebuffers(
-            &self.logical_device,
-            &self.swapchain,
-            self.render_pass,
-            self.fxaa_pass.as_ref(),
-        );
+        if new_swapchain_format == old_format {
+            // Recreate the framebuffers to account for the new size. Other details are unchanged.
+            match &mut self.active_demo {
+                DemoPipeline::Triangle(triangle_pipeline) => {
+                    triangle_pipeline.recreate_framebuffers(
+                        &self.logical_device,
+                        &self.swapchain,
+                        self.fxaa_pass.as_ref(),
+                    );
+                }
+                DemoPipeline::Fluid(simulation) => {
+                    simulation.recreate_framebuffers(
+                        &self.logical_device,
+                        &mut self.memory_allocator,
+                        extent,
+                        self.swapchain.image_views(),
+                    );
+                }
+            }
+        } else {
+            // Wait for the resources to be available for destruction.
+            self.wait_for_tasks();
+
+            // Destroy the old pipeline and recreate the necessary resources.
+            match &mut self.active_demo {
+                DemoPipeline::Triangle(triangle_pipeline) => {
+                    triangle_pipeline.recreate(
+                        &self.logical_device,
+                        example_triangle::CreateReuseRenderPass::Create {
+                            image_format: new_swapchain_format,
+                            destination_layout: if self.fxaa_pass.is_some() {
+                                ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                            } else {
+                                ash::vk::ImageLayout::PRESENT_SRC_KHR
+                            },
+                        },
+                        &self.swapchain,
+                        triangle_pipeline.specialization_constants(),
+                        self.fxaa_pass.as_ref(),
+                    );
+                }
+                DemoPipeline::Fluid(simulation) => {
+                    let new_sim = example_fluid::FluidSimulation::new(
+                        &self.logical_device,
+                        &mut self.memory_allocator,
+                        extent,
+                        new_swapchain_format,
+                        ash::vk::ImageLayout::PRESENT_SRC_KHR,
+                        self.swapchain.image_views(),
+                        self.compute_command_pool
+                            .map_or(self.command_pool, |(pool, _)| pool),
+                    );
+                    simulation.destroy(&self.logical_device, &mut self.memory_allocator);
+                    *simulation = new_sim;
+                }
+            }
+        }
     }
 
     /// Attempt to render the next frame of the application. If there is a recoverable error, then the swapchain is recreated and the function bails early without rendering.
-    pub fn render_frame(&mut self, vulkan: &utils::VulkanCore, push_constants: PushConstants) {
+    pub fn render_frame(&mut self, vulkan: &utils::VulkanCore, push_constants: &DemoPushConstants) {
         // Synchronize the CPU with the GPU for the resources previously used for this frame in flight.
         // Specifically, the command buffer cannot be reused until the fence is signaled.
         let resource_fence = self.frame_fences[self.swapchain.current_frame()];
@@ -871,12 +591,7 @@ impl Renderer {
 
         let command_buffer = self.command_buffers[current_frame];
         unsafe {
-            self.logical_device
-                .reset_command_buffer(
-                    command_buffer,
-                    ash::vk::CommandBufferResetFlags::RELEASE_RESOURCES,
-                )
-                .expect("Unable to reset command buffer");
+            // NOTE: We do not need to reset the command buffer here because `ONE_TIME_SUBMIT` command buffers are implicitly reset.
             self.logical_device
                 .begin_command_buffer(
                     command_buffer,
@@ -890,93 +605,57 @@ impl Renderer {
 
         let extent = self.swapchain.extent();
 
-        // Begin the render pass for the current frame.
-        unsafe {
-            self.logical_device.cmd_begin_render_pass(
-                command_buffer,
-                &ash::vk::RenderPassBeginInfo {
-                    render_pass: self.render_pass,
-                    framebuffer: self.framebuffers[image_index as usize],
-                    render_area: ash::vk::Rect2D {
-                        offset: ash::vk::Offset2D::default(),
-                        extent,
-                    },
-                    clear_value_count: 1,
-                    p_clear_values: &ash::vk::ClearValue::default(),
-                    ..Default::default()
-                },
-                ash::vk::SubpassContents::INLINE,
-            );
-        }
-
-        unsafe {
-            self.logical_device.cmd_push_constants(
-                command_buffer,
-                self.graphics_pipeline.layout,
-                ash::vk::ShaderStageFlags::FRAGMENT,
-                0,
-                &push_constants.time.to_ne_bytes(),
-            );
-        }
-
-        // Set the viewport and scissor in the command buffer because we specified they would be set dynamically in the pipeline.
-        unsafe {
-            self.logical_device.cmd_set_viewport(
-                command_buffer,
-                0,
-                &[ash::vk::Viewport {
-                    x: 0.,
-                    y: 0.,
-                    width: extent.width as f32,
-                    height: extent.height as f32,
-                    min_depth: 0.,
-                    max_depth: 1.,
-                }],
-            );
-            self.logical_device.cmd_set_scissor(
-                command_buffer,
-                0,
-                &[ash::vk::Rect2D {
-                    offset: ash::vk::Offset2D::default(),
+        // Draw the active demo pipeline.
+        match &mut self.active_demo {
+            DemoPipeline::Triangle(pipeline) => {
+                let DemoPushConstants::Triangle(push_constants) = push_constants else {
+                    panic!("Push constants do not match the active demo");
+                };
+                pipeline.render_frame(
+                    &self.logical_device,
+                    command_buffer,
                     extent,
-                }],
-            );
+                    image_index as usize,
+                    push_constants,
+                );
+
+                // Add the optional FXAA render pass to the command buffer, if enabled.
+                if let Some(fxaa_pass) = &self.fxaa_pass {
+                    fxaa_pass.render_frame(
+                        &self.logical_device,
+                        command_buffer,
+                        extent,
+                        image_index as usize,
+                    );
+                }
+            }
+            DemoPipeline::Fluid(simulation) => {
+                let DemoPushConstants::Fluid(push_constants, display_texture) = push_constants
+                else {
+                    panic!("Push constants do not match the active demo");
+                };
+                simulation.render_frame(
+                    &self.logical_device,
+                    self.compute_command_pool
+                        .map(
+                            |(command_pool, compute_semaphore)| example_fluid::ComputeInfo {
+                                command_pool,
+                                compute_semaphore,
+                                compute_family_index: self.compute_queue.family_index,
+                                graphics_family_index: self.graphics_queue.family_index,
+                            },
+                        ),
+                    self.compute_queue.queue,
+                    command_buffer,
+                    extent,
+                    image_index as usize,
+                    push_constants,
+                    *display_texture,
+                );
+            }
         }
 
-        // Bind the graphics pipeline to the command buffer.
-        unsafe {
-            self.logical_device.cmd_bind_pipeline(
-                command_buffer,
-                ash::vk::PipelineBindPoint::GRAPHICS,
-                self.graphics_pipeline.handle,
-            );
-        }
-
-        // TODO: Update descriptor sets here when we have them.
-
-        // Draw the example triangle.
-        unsafe {
-            self.logical_device.cmd_draw(command_buffer, 3, 1, 0, 0);
-        }
-
-        // End the render pass for the current frame.
-        unsafe {
-            self.logical_device.cmd_end_render_pass(command_buffer);
-        }
-
-        // Add the optional FXAA render pass to the command buffer, if enabled.
-        if let Some(fxaa_pass) = &self.fxaa_pass {
-            fxaa_pass.render_frame(
-                &self.logical_device,
-                command_buffer,
-                extent,
-                image_index as usize,
-                ash::vk::ImageLayout::PRESENT_SRC_KHR,
-                self.swapchain.images()[image_index as usize],
-            );
-        }
-
-        // Complete the command buffer.
+        // Complete the graphics command buffer.
         unsafe {
             self.logical_device
                 .end_command_buffer(command_buffer)
@@ -984,9 +663,13 @@ impl Renderer {
         }
 
         // Submit the draw command buffer to the GPU.
+        let mut semaphores: SmallVec<[_; 2]> = smallvec![self.swapchain.image_available()];
+        if let Some((_, compute_semaphore)) = &self.compute_command_pool {
+            semaphores.push(*compute_semaphore);
+        }
         let submit_info = ash::vk::SubmitInfo {
-            wait_semaphore_count: 1,
-            p_wait_semaphores: &self.swapchain.image_available(),
+            wait_semaphore_count: semaphores.len() as u32,
+            p_wait_semaphores: semaphores.as_ptr(),
             p_wait_dst_stage_mask: &ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             command_buffer_count: 1,
             p_command_buffers: &command_buffer,
@@ -1005,13 +688,13 @@ impl Renderer {
                 .reset_fences(&[resource_fence, presentation_fence])
                 .expect("Unable to reset fence for this frame's resources");
             self.logical_device
-                .queue_submit(self.graphics_queue, &[submit_info], resource_fence)
+                .queue_submit(self.graphics_queue.queue, &[submit_info], resource_fence)
                 .expect("Unable to submit command buffer");
         }
 
         // Queue the presentation of the swapchain image.
         match self.swapchain.present(
-            self.presentation_queue,
+            self.presentation_queue.queue,
             self.device_features.enabled_swapchain_maintenance,
         ) {
             Ok(_) => (),
@@ -1043,26 +726,31 @@ impl Renderer {
     }
 
     /// Recreate the graphics pipeline with the new specialization constants.
+    /// # Safety
+    /// The specialization constants enum type must match the active demo.
     pub fn update_specialization_constants(
         &mut self,
-        specialization_constants: SpecializationConstants,
+        specialization_constants: DemoSpecializationConstants,
     ) {
-        let mut stack_pipeline = Pipeline::new_graphics(
-            &self.logical_device,
-            self.shaders.vertex_module,
-            self.shaders.fragment_module,
-            self.render_pass,
-            self.swapchain.multisample_count(),
-            specialization_constants,
-        );
-
-        // Swap the new graphics pipeline with the old one.
-        std::mem::swap(&mut self.graphics_pipeline, &mut stack_pipeline);
-
+        // Wait for the GPU to finish processing all tasks submitted by this renderer.
         self.wait_for_tasks();
 
-        // Destroy the old graphics pipeline and render pass.
-        stack_pipeline.destroy(&self.logical_device);
+        match specialization_constants {
+            DemoSpecializationConstants::Triangle(specialization_constants) => {
+                let DemoPipeline::Triangle(triangle_pipeline) = &mut self.active_demo else {
+                    panic!("Specialization constants do not match the active demo");
+                };
+
+                triangle_pipeline.recreate(
+                    &self.logical_device,
+                    example_triangle::CreateReuseRenderPass::Reuse(triangle_pipeline.render_pass()),
+                    &self.swapchain,
+                    specialization_constants,
+                    self.fxaa_pass.as_ref(),
+                );
+            }
+            DemoSpecializationConstants::Fluid => {}
+        }
     }
 
     /// Wait for the GPU to finish processing all tasks submitted by this renderer.
@@ -1083,6 +771,76 @@ impl Renderer {
                 self.logical_device
                     .device_wait_idle()
                     .expect("Unable to wait for device to become idle");
+            }
+        }
+    }
+
+    /// Toggle which demo is currently active.
+    pub fn switch_demo(&mut self, new_demo: NewDemo) {
+        match new_demo {
+            NewDemo::Triangle(constants) => {
+                if let DemoPipeline::Triangle(_) = &self.active_demo {
+                    return;
+                }
+
+                let mut new_triangle = DemoPipeline::Triangle(example_triangle::Pipeline::new(
+                    &self.logical_device,
+                    None,
+                    None,
+                    example_triangle::CreateReuseRenderPass::Create {
+                        image_format: self.swapchain.image_format(),
+                        destination_layout: if self.fxaa_pass.is_some() {
+                            ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                        } else {
+                            ash::vk::ImageLayout::PRESENT_SRC_KHR
+                        },
+                    },
+                    &self.swapchain,
+                    constants,
+                    self.fxaa_pass.as_ref(),
+                ));
+
+                self.wait_for_tasks();
+                std::mem::swap(&mut self.active_demo, &mut new_triangle);
+                let old_demo = new_triangle; // Rename for clarity.
+
+                match old_demo {
+                    DemoPipeline::Fluid(mut simulation) => {
+                        simulation.destroy(&self.logical_device, &mut self.memory_allocator);
+                    }
+                    DemoPipeline::Triangle(_) => {
+                        panic!("switch_demo: Wait, I thought we were not using the `Triangle` pipeline at the top of this function...");
+                    }
+                }
+            }
+            NewDemo::Fluid => {
+                if let DemoPipeline::Fluid(_) = &self.active_demo {
+                    return;
+                }
+
+                let mut new_fluid = DemoPipeline::Fluid(example_fluid::FluidSimulation::new(
+                    &self.logical_device,
+                    &mut self.memory_allocator,
+                    self.swapchain.extent(),
+                    self.swapchain.image_format(),
+                    ash::vk::ImageLayout::PRESENT_SRC_KHR,
+                    self.swapchain.image_views(),
+                    self.compute_command_pool
+                        .map_or(self.command_pool, |(pool, _)| pool),
+                ));
+
+                self.wait_for_tasks();
+                std::mem::swap(&mut self.active_demo, &mut new_fluid);
+                let old_demo = new_fluid; // Rename for clarity.
+
+                match old_demo {
+                    DemoPipeline::Triangle(triangle) => {
+                        triangle.destroy(&self.logical_device, true, true);
+                    }
+                    DemoPipeline::Fluid(_) => {
+                        panic!("switch_demo: Wait, I thought we were not using the `Fluid` pipeline at the top of this function...");
+                    }
+                }
             }
         }
     }

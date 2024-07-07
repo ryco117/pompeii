@@ -1,0 +1,84 @@
+// Implementatin of a basic incompressible, homogeneous fluid simulation. See https://www.dgp.toronto.edu/public_user/stam/reality/Research/pdf/ns.pdf, https://developer.nvidia.com/gpugems/gpugems/part-vi-beyond-triangles/chapter-38-fast-fluid-dynamics-simulation-gpu, https://github.com/PavelDoGreat/WebGL-Fluid-Simulation/tree/master.
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Use a toggle to invert which buffer is read from and which is written to.
+layout(constant_id = 0) const bool read_from_alpha = false;
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer VelocityTexture {
+  vec2 v[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer CurlTexture {
+  float c[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer DivergenceTexture {
+  float d[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) buffer PressureTexture {
+  float p[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer DyeTexture {
+  vec4 c[];
+};
+
+layout(push_constant) uniform PushConstants {
+  // Store GPU pointers to each texture/buffer.
+  VelocityTexture input_velocity;
+  CurlTexture curl;
+  DivergenceTexture divergence;
+  PressureTexture alpha_pressure;
+  PressureTexture beta_pressure;
+  VelocityTexture output_velocity;
+  DyeTexture input_dye;
+  DyeTexture output_dye;
+
+  vec4 cursor_dye;
+  vec2 cursor_position;
+  vec2 cursor_velocity;
+  ivec2 screen_size;
+  float delta_time;
+  float velocity_diffusion_rate;
+  float dye_diffusion_rate;
+  float vorticity_strength; // Sane values are 0 to 50. Default is 30.
+} push_constants;
+
+int texture_index(ivec2 uv) {
+  uv = clamp(uv, ivec2(0), push_constants.screen_size - ivec2(1));
+  return uv.y * push_constants.screen_size.x + uv.x;
+}
+
+// Use the most recent pressure data and the divergence field to update the pressure field.
+void main() {
+  const ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+  if(coords.x >= push_constants.screen_size.x || coords.y >= push_constants.screen_size.y) {
+    return;
+  }
+  const int index = texture_index(coords);
+
+  const float divergence = push_constants.divergence.d[index];
+
+  // Use a compile-time specialization constant to determine which buffer to read from and which to write to.
+  // The remaining logic is the same for both cases.
+  if(read_from_alpha) {
+    const float pressure_left = push_constants.alpha_pressure.p[texture_index(coords - ivec2(1, 0))];
+    const float pressure_right = push_constants.alpha_pressure.p[texture_index(coords + ivec2(1, 0))];
+    const float pressure_top = push_constants.alpha_pressure.p[texture_index(coords + ivec2(0, 1))];
+    const float pressure_bottom = push_constants.alpha_pressure.p[texture_index(coords - ivec2(0, 1))];
+    const float pressure_center = push_constants.alpha_pressure.p[index];
+
+    const float new_pressure = (pressure_left + pressure_right + pressure_top + pressure_bottom - divergence) * 0.25;
+    push_constants.beta_pressure.p[index] = new_pressure;
+  } else {
+    const float pressure_left = push_constants.beta_pressure.p[texture_index(coords - ivec2(1, 0))];
+    const float pressure_right = push_constants.beta_pressure.p[texture_index(coords + ivec2(1, 0))];
+    const float pressure_top = push_constants.beta_pressure.p[texture_index(coords + ivec2(0, 1))];
+    const float pressure_bottom = push_constants.beta_pressure.p[texture_index(coords - ivec2(0, 1))];
+    const float pressure_center = push_constants.beta_pressure.p[index];
+
+    const float new_pressure = (pressure_left + pressure_right + pressure_top + pressure_bottom - divergence) * 0.25;
+    push_constants.alpha_pressure.p[index] = new_pressure;
+  }
+}

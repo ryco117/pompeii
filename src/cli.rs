@@ -62,8 +62,4 @@ pub struct Args {
     /// Start with FXAA (a fast screen-space anti-aliasing algorithm) enabled.
     #[arg(long, default_value_t)]
     pub fxaa: bool,
-
-    /// Prefer presenting to an HDR colorspace if available.
-    #[arg(long, default_value_t)]
-    pub hdr: bool,
 }

@@ -1,0 +1,105 @@
+// Implementatin of a basic incompressible, homogeneous fluid simulation. See https://www.dgp.toronto.edu/public_user/stam/reality/Research/pdf/ns.pdf, https://developer.nvidia.com/gpugems/gpugems/part-vi-beyond-triangles/chapter-38-fast-fluid-dynamics-simulation-gpu, https://github.com/PavelDoGreat/WebGL-Fluid-Simulation/tree/master.
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer InputVelocityTexture {
+  vec2 v[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) writeonly buffer OutputVelocityTexture {
+  vec2 v[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer CurlTexture {
+  float c[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer DivergenceTexture {
+  float d[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer PressureTexture {
+  float p[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer InputDyeTexture {
+  vec4 c[];
+};
+layout(scalar, buffer_reference, buffer_reference_align = 16) writeonly buffer OutputDyeTexture {
+  vec4 c[];
+};
+
+layout(push_constant) uniform PushConstants {
+  // Store GPU pointers to each texture/buffer.
+  InputVelocityTexture input_velocity;
+  CurlTexture curl;
+  DivergenceTexture divergence;
+  PressureTexture alpha_pressure;
+  PressureTexture beta_pressure;
+  OutputVelocityTexture output_velocity;
+  InputDyeTexture input_dye;
+  OutputDyeTexture output_dye;
+
+  vec4 cursor_dye;
+  vec2 cursor_position;
+  vec2 cursor_velocity;
+  ivec2 screen_size;
+  float delta_time;
+  float velocity_diffusion_rate;
+  float dye_diffusion_rate;
+  float vorticity_strength; // Sane values are 0 to 50. Default is 30.
+} push_constants;
+
+int texture_index(ivec2 uv) {
+  uv = clamp(uv, ivec2(0), push_constants.screen_size - ivec2(1));
+  return uv.y * push_constants.screen_size.x + uv.x;
+}
+
+vec2 bilerp_velocity(ivec2 uv) {
+  vec2 a = push_constants.input_velocity.v[texture_index(uv + ivec2(-1, -1))];
+  vec2 b = push_constants.input_velocity.v[texture_index(uv + ivec2(1, -1))];
+  vec2 c = push_constants.input_velocity.v[texture_index(uv + ivec2(-1, 1))];
+  vec2 d = push_constants.input_velocity.v[texture_index(uv + ivec2(1, 1))];
+  vec2 e = push_constants.input_velocity.v[texture_index(uv)];
+
+  return 0.125 * (a + b + c + d) + 0.5 * e;
+}
+
+vec4 bilerp_dye(ivec2 uv) {
+  vec4 a = push_constants.input_dye.c[texture_index(uv + ivec2(-1, -1))];
+  vec4 b = push_constants.input_dye.c[texture_index(uv + ivec2(1, -1))];
+  vec4 c = push_constants.input_dye.c[texture_index(uv + ivec2(-1, 1))];
+  vec4 d = push_constants.input_dye.c[texture_index(uv + ivec2(1, 1))];
+  vec4 e = push_constants.input_dye.c[texture_index(uv)];
+
+  return 0.125 * (a + b + c + d) + 0.5 * e;
+}
+
+// Perform the main advection step of the fluid simulation along the velocity and dye fields.
+void main() {
+  const ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+  if(coords.x >= push_constants.screen_size.x || coords.y >= push_constants.screen_size.y) {
+    return;
+  }
+  const int index = texture_index(coords);
+
+  // const vec2 velocity = push_constants.input_velocity.v[index];
+  const vec2 velocity = bilerp_velocity(coords);
+
+  // Move the field texture coordinates backwards along the velocity vector to get a reference coordinate for advection.
+  const ivec2 reference_coord = ivec2(gl_GlobalInvocationID.xy - push_constants.delta_time * velocity);
+  const int reference_index = texture_index(reference_coord);
+
+  const float velocity_diffusion = exp(-push_constants.velocity_diffusion_rate * push_constants.delta_time);
+  vec2 new_velocity = velocity_diffusion * bilerp_velocity(reference_coord);
+
+  const float dye_diffusion = exp(-push_constants.dye_diffusion_rate * push_constants.delta_time);
+  vec3 new_dye = dye_diffusion * bilerp_dye(reference_coord).rgb;
+
+  // Apply additional velocity and fluid from the cursor. Use ~1/70th of the screen size as a distance threshold.
+  const vec2 cursor_distance = 70.0 * (push_constants.cursor_position - gl_GlobalInvocationID.xy) / min(push_constants.screen_size.x, push_constants.screen_size.y);
+  const float cursor_effect = exp(-dot(cursor_distance, cursor_distance));
+  new_velocity = mix(new_velocity, push_constants.cursor_velocity, cursor_effect);
+  new_dye = mix(new_dye, push_constants.cursor_dye.rgb, cursor_effect);
+
+  push_constants.output_velocity.v[index] = new_velocity;
+  push_constants.output_dye.c[index] = vec4(new_dye, 1.0);
+}

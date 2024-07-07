@@ -1,9 +1,22 @@
-use std::{ffi::CStr, num::NonZeroU32};
+use std::{collections::HashSet, ffi::CStr, num::NonZeroU32};
 
+use ash::ext::{buffer_device_address, descriptor_indexing};
 use smallvec::SmallVec;
 use strum::EnumCount as _;
 
-/// Target Vulkan API version 1.3 for compatibility with the latest Vulkan features and reduced extension fragmentation.
+pub mod fxaa_pass;
+
+/// Store the SPIR-V representation of the shaders in the binary.
+pub mod shaders {
+    /// The default entry point for shaders is the `main` function.
+    pub const ENTRY_POINT_MAIN: &std::ffi::CStr = c"main";
+
+    /// Shader for texture-mapping the entire screen. Useful for post-processing and fullscreen effects.
+    pub const FULLSCREEN_VERTEX: &[u32] =
+        inline_spirv::include_spirv!("src/shaders/fullscreen_vert.glsl", vert, glsl);
+}
+
+/// Target Vulkan API version 1.3 for compatibility with the latest Vulkan features and **reduced fragmentation of extension support**.
 const VULKAN_API_VERSION: u32 = ash::vk::API_VERSION_1_3;
 
 /// Set a sane value for the maximum expected number of queue families.
@@ -33,6 +46,11 @@ pub fn extensions_list_contains(list: &[ash::vk::ExtensionProperties], ext: &CSt
     })
 }
 
+/// A minimal helper for converting a Rust reference `&T` to a byte slice over the same memory.
+pub fn data_byte_slice<T>(data: &T) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(std::ptr::from_ref(data).cast(), std::mem::size_of::<T>()) }
+}
+
 /// The possible errors that may occur when creating a `VulkanCore`.
 #[derive(Debug)]
 pub enum VulkanCoreError {
@@ -47,14 +65,15 @@ pub struct VulkanCore {
     pub api: ash::Entry,
     pub instance: ash::Instance,
     pub khr: ash::khr::surface::Instance,
-    pub enabled_colorspace_ext: bool,
-    pub enabled_surface_maintenance: bool,
+    enabled_instance_extensions: HashSet<&'static CStr>,
 }
 
 impl VulkanCore {
     /// Create a new `VulkanCore` with the specified instance extensions.
-    //  TODO: Allow for optional instance extensions and a way to report which ones were enabled.
-    pub fn new(required_extensions: &[&CStr]) -> Result<Self, VulkanCoreError> {
+    pub fn new(
+        required_extensions: &[&'static CStr],
+        optional_extensions: &[&'static CStr],
+    ) -> Result<Self, VulkanCoreError> {
         // Attempt to dynamically load the Vulkan API from platform-specific shared libraries.
         let vulkan_api = unsafe { ash::Entry::load().map_err(VulkanCoreError::Loading)? };
 
@@ -71,7 +90,7 @@ impl VulkanCore {
         // Helper lambda for checking if an extension is available.
         let available_contains = |ext: &CStr| extensions_list_contains(&available_extensions, ext);
 
-        // Check that the required extensions are available.
+        // Check that all of the required extensions are available.
         if let Some(missing) = required_extensions
             .iter()
             .find(|ext| !available_contains(ext))
@@ -81,9 +100,31 @@ impl VulkanCore {
             ));
         }
 
+        // Track which extensions are being enabled and convert those extensions to a list of pointers.
+        let mut enabled_instance_extensions = std::collections::HashSet::new();
         let mut extension_name_pointers: SmallVec<
             [*const i8; EXPECTED_MAX_ENABLED_INSTANCE_EXTENSIONS],
-        > = required_extensions.iter().map(|&e| e.as_ptr()).collect();
+        > = required_extensions
+            .iter()
+            .map(|&e| {
+                // Add the required extensions to the enabled set.
+                enabled_instance_extensions.insert(e);
+
+                // Map the extension to a pointer representation.
+                e.as_ptr()
+            })
+            .collect();
+
+        // Add all of the optional extensions to our creation set if they are available.
+        for feature in optional_extensions {
+            if available_contains(feature) {
+                #[cfg(debug_assertions)]
+                println!("Enabling optional extension '{feature:?}'");
+
+                enabled_instance_extensions.insert(feature);
+                extension_name_pointers.push(feature.as_ptr());
+            }
+        }
 
         // Optionally, enable `VK_EXT_swapchain_colorspace` if is is available and the dependent `VK_KHR_surface` is requested.
         let supports_colorspace_ext = required_extensions.contains(&ash::khr::surface::NAME)
@@ -91,6 +132,8 @@ impl VulkanCore {
         if supports_colorspace_ext {
             #[cfg(debug_assertions)]
             println!("Enabling VK_EXT_swapchain_colorspace extension");
+
+            enabled_instance_extensions.insert(ash::ext::swapchain_colorspace::NAME);
             extension_name_pointers.push(ash::ext::swapchain_colorspace::NAME.as_ptr());
         }
 
@@ -101,7 +144,11 @@ impl VulkanCore {
         if supports_surface_maintenance {
             #[cfg(debug_assertions)]
             println!("Enabling VK_KHR_get_surface_capabilities2 and VK_EXT_surface_maintenance1 extensions");
+
+            enabled_instance_extensions.insert(ash::khr::get_surface_capabilities2::NAME);
             extension_name_pointers.push(ash::khr::get_surface_capabilities2::NAME.as_ptr());
+
+            enabled_instance_extensions.insert(ash::ext::surface_maintenance1::NAME);
             extension_name_pointers.push(ash::ext::surface_maintenance1::NAME.as_ptr());
         }
 
@@ -109,6 +156,8 @@ impl VulkanCore {
         #[cfg(debug_assertions)]
         if available_contains(ash::ext::debug_utils::NAME) {
             println!("Enabling VK_EXT_debug_utils extension");
+
+            enabled_instance_extensions.insert(ash::ext::debug_utils::NAME);
             extension_name_pointers.push(ash::ext::debug_utils::NAME.as_ptr());
         }
 
@@ -152,6 +201,15 @@ impl VulkanCore {
         #[cfg(not(debug_assertions))]
         let layer_names = [];
 
+        #[cfg(debug_assertions)]
+        if extension_name_pointers.spilled() {
+            println!(
+                "INFO: Extension name pointers list has spilled over to the heap. Extension count {} greater than inline size {}",
+                extension_name_pointers.len(),
+                extension_name_pointers.inline_size(),
+            );
+        }
+
         // Create a Vulkan instance with the given extensions and layers.
         let vulkan_instance = {
             let application_info = ash::vk::ApplicationInfo {
@@ -185,37 +243,105 @@ impl VulkanCore {
             api: vulkan_api,
             instance: vulkan_instance,
             khr,
-            enabled_colorspace_ext: supports_colorspace_ext,
-            enabled_surface_maintenance: supports_surface_maintenance,
+            enabled_instance_extensions,
         })
+    }
+
+    /// Check if the Vulkan instance was created with a specific extension enabled.
+    pub fn enabled_instance_extension(&self, ext: &CStr) -> bool {
+        self.enabled_instance_extensions.contains(ext)
     }
 }
 
+/// Query a physical device for support of a given set of features.
+/// Will only check for features which the caller has set to `true` and will set those features which are not supported to `false`.
+/// # Note
+/// The `p_next` pointers will be ignored by this function and set to `null` before returning.
+pub fn query_physical_feature_support(
+    instance: &ash::Instance,
+    physical_device: ash::vk::PhysicalDevice,
+    requested_features: &mut EnginePhysicalDeviceFeatures,
+) -> ash::vk::PhysicalDeviceFeatures {
+    // Build the feature chain from the provided features.
+    let mut feature_chain = ash::vk::PhysicalDeviceFeatures2::default();
+
+    // Ensure there are no circular references in the feature chain.
+    requested_features.clear_pointer();
+
+    let mut dynamic_rendering = ash::vk::PhysicalDeviceDynamicRenderingFeatures::default();
+    let mut synchronization2 = ash::vk::PhysicalDeviceSynchronization2Features::default();
+    let mut ray_query = ash::vk::PhysicalDeviceRayQueryFeaturesKHR::default();
+
+    if requested_features
+        .acceleration_structure
+        .acceleration_structure
+        == ash::vk::TRUE
+    {
+        feature_chain = feature_chain.push_next(&mut requested_features.acceleration_structure);
+    }
+    if requested_features
+        .buffer_device_address
+        .buffer_device_address
+        == ash::vk::TRUE
+    {
+        feature_chain = feature_chain.push_next(&mut requested_features.buffer_device_address);
+    }
+
+    // Unconditionally apply `descriptor_indexing` features.
+    feature_chain = feature_chain.push_next(&mut requested_features.descriptor_indexing);
+
+    if requested_features.dynamic_rendering {
+        feature_chain = feature_chain.push_next(&mut dynamic_rendering);
+    }
+    if requested_features.synchronization2 {
+        feature_chain = feature_chain.push_next(&mut synchronization2);
+    }
+    if requested_features.ray_query {
+        feature_chain = feature_chain.push_next(&mut ray_query);
+    }
+    if requested_features.ray_tracing.ray_tracing_pipeline == ash::vk::TRUE {
+        feature_chain = feature_chain.push_next(&mut requested_features.ray_tracing);
+    }
+
+    let features = {
+        // Query the physical device for the selected features.
+        unsafe { instance.get_physical_device_features2(physical_device, &mut feature_chain) };
+        feature_chain.features
+    };
+
+    // Update the caller's feature struct with the results.
+    requested_features.dynamic_rendering = dynamic_rendering.dynamic_rendering > 0;
+    requested_features.synchronization2 = synchronization2.synchronization2 > 0;
+    requested_features.ray_query = ray_query.ray_query > 0;
+
+    // Don't confuse the caller with pointers to features.
+    requested_features.clear_pointer();
+
+    // Return the features described in the default structure.
+    features
+}
+
 /// Query the extended properties of a physical device to determine if it supports ray tracing.
-//  TODO: Consider refactoring to allow chaining of device features before performing the final query.
 #[allow(dead_code)]
 pub fn physical_supports_rtx(
     instance: &ash::Instance,
     physical_device: ash::vk::PhysicalDevice,
 ) -> Option<ash::vk::PhysicalDeviceRayTracingPipelinePropertiesKHR> {
     // Query the physical device for ray tracing support features.
-    let mut ray_query = ash::vk::PhysicalDeviceRayQueryFeaturesKHR::default();
-    let mut ray_tracing = ash::vk::PhysicalDeviceRayTracingPipelineFeaturesKHR {
-        p_next: std::ptr::from_mut(&mut ray_query).cast(),
+    let mut features = EnginePhysicalDeviceFeatures {
+        acceleration_structure: ash::vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
+            .acceleration_structure(true),
+        ray_query: true,
+        ray_tracing: ash::vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default()
+            .ray_tracing_pipeline(true),
         ..Default::default()
     };
-    let mut acceleration_structure = ash::vk::PhysicalDeviceAccelerationStructureFeaturesKHR {
-        p_next: std::ptr::from_mut(&mut ray_tracing).cast(),
-        ..Default::default()
-    };
-    let mut features =
-        ash::vk::PhysicalDeviceFeatures2::default().push_next(&mut acceleration_structure);
-    unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
+    let _ = query_physical_feature_support(instance, physical_device, &mut features);
 
     // If the physical device supports ray tracing, return the ray tracing pipeline properties.
-    if acceleration_structure.acceleration_structure > 0
-        && ray_tracing.ray_tracing_pipeline > 0
-        && ray_query.ray_query > 0
+    if features.acceleration_structure.acceleration_structure == ash::vk::TRUE
+        && features.ray_tracing.ray_tracing_pipeline == ash::vk::TRUE
+        && features.ray_query
     {
         let mut ray_tracing_pipeline =
             ash::vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
@@ -228,11 +354,60 @@ pub fn physical_supports_rtx(
     }
 }
 
+/// The Vulkan physical device features which this engine may utilize. This struct is used to query and report enabled features.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EnginePhysicalDeviceFeatures {
+    /// Corresponds to `VkPhysicalDeviceAccelerationStructureFeaturesKHR`.
+    pub acceleration_structure: ash::vk::PhysicalDeviceAccelerationStructureFeaturesKHR<'static>,
+
+    /// Corresponds to `VkPhysicalDeviceBufferDeviceAddressFeatures`.
+    pub buffer_device_address: ash::vk::PhysicalDeviceBufferDeviceAddressFeatures<'static>,
+
+    /// Corresponds to `VkPhysicalDeviceDescriptorIndexingFeatures`.
+    pub descriptor_indexing: ash::vk::PhysicalDeviceDescriptorIndexingFeatures<'static>,
+
+    /// Corresponds to `VkPhysicalDeviceDynamicRenderingFeatures`.
+    pub dynamic_rendering: bool,
+
+    /// Corresponds to `VkPhysicalDeviceRayQueryFeaturesKHR`.
+    pub ray_query: bool,
+
+    /// Corresponds to `VkPhysicalDeviceRayTracingPipelineFeaturesKHR`.
+    pub ray_tracing: ash::vk::PhysicalDeviceRayTracingPipelineFeaturesKHR<'static>,
+
+    /// Corresponds to `VkPhysicalDeviceSynchronization2Features`.
+    pub synchronization2: bool,
+}
+impl EnginePhysicalDeviceFeatures {
+    /// A helper to verify that this feature-set contains every enabled (i.e., `true`) feature in the provided mask.
+    /// # Note
+    /// This doesn't contain checking for sub-properties of a feature. For example, `descriptor_indexing` is not checked because it is only sub-properties.
+    pub fn contains_mask(self, mask: &EnginePhysicalDeviceFeatures) -> bool {
+        (mask.acceleration_structure.acceleration_structure != ash::vk::TRUE
+            || self.acceleration_structure.acceleration_structure == ash::vk::TRUE)
+            && (mask.buffer_device_address.buffer_device_address == ash::vk::TRUE
+                || self.buffer_device_address.buffer_device_address == ash::vk::TRUE)
+            && (!mask.dynamic_rendering || self.dynamic_rendering)
+            && (!mask.synchronization2 || self.synchronization2)
+            && (!mask.ray_query || self.ray_query)
+            && (mask.ray_tracing.ray_tracing_pipeline != ash::vk::TRUE
+                || self.ray_tracing.ray_tracing_pipeline == ash::vk::TRUE)
+    }
+
+    /// Clear all feature pointers to `NULL` or `0` to indicate that no features are enabled.
+    fn clear_pointer(&mut self) {
+        self.acceleration_structure.p_next = std::ptr::null_mut::<std::ffi::c_void>();
+        self.buffer_device_address.p_next = std::ptr::null_mut::<std::ffi::c_void>();
+        self.ray_tracing.p_next = std::ptr::null_mut::<std::ffi::c_void>();
+    }
+}
+
 /// Get all physical devices that support the minimum Vulkan API and the required extensions. Sort them by their likelihood of being the desired device.
 pub fn get_sorted_physical_devices(
     instance: &ash::Instance,
     minimum_version: u32,
     required_extensions: &[*const i8],
+    required_features: EnginePhysicalDeviceFeatures,
 ) -> SmallVec<
     [(ash::vk::PhysicalDevice, ash::vk::PhysicalDeviceProperties);
         EXPECTED_MAX_VULKAN_PHYSICAL_DEVICES],
@@ -263,7 +438,6 @@ pub fn get_sorted_physical_devices(
             let properties = unsafe { instance.get_physical_device_properties(device) };
 
             // Query for the basic extensions available to this physical device.
-            // Note that instance extension `VK_KHR_get_physical_device_properties2` enables use of function `vkGetPhysicalDeviceFeatures2KHR` for additional features, but is not called here.
             let extensions = unsafe {
                 instance
                     .enumerate_device_extension_properties(device)
@@ -278,6 +452,15 @@ pub fn get_sorted_physical_devices(
             if properties.api_version < minimum_version {
                 #[cfg(debug_assertions)]
                 println!("Physical device {device:?} does not support a sufficiently high Vulkan version");
+                return None;
+            }
+
+            // Ensure the device supports all required features.
+            let mut copy_features = required_features;
+            let _ = query_physical_feature_support(instance, device, &mut copy_features);
+            if !copy_features.contains_mask(&required_features) {
+                #[cfg(debug_assertions)]
+                println!("Physical device {device:?}: does not support all the required features {required_features:?}: Actual features {copy_features:?}");
                 return None;
             }
 
@@ -423,20 +606,16 @@ pub fn get_queue_families(
     }
 }
 
-/// A Vulkan command pool with its creation parameters.
-pub struct CommandPool {
-    pub handle: ash::vk::CommandPool,
-    pub flags: ash::vk::CommandPoolCreateFlags,
-    pub queue_family_index: u32,
-}
-
 /// Create a Vulkan logical device capable of graphics, compute, and presentation queues.
 /// Returns the device and the queue family indices that were requested for use.
+/// # Safety
+/// The behavior is undefined if the device does not support all the requested device extensions or features.
 pub fn new_device(
     vulkan: &VulkanCore,
     physical_device: ash::vk::PhysicalDevice,
     surface: ash::vk::SurfaceKHR,
     device_extensions: &[*const i8],
+    feature_chain: Option<&mut dyn ash::vk::ExtendsDeviceCreateInfo>,
 ) -> (ash::Device, QueueFamilies) {
     // Get the necessary queue family indices for the logical device.
     let queue_families = get_queue_families(vulkan, physical_device, surface);
@@ -500,13 +679,19 @@ pub fn new_device(
 
     // Create the logical device with the desired queue families and extensions.
     let device = unsafe {
-        let device_info = ash::vk::DeviceCreateInfo {
+        let mut device_info = ash::vk::DeviceCreateInfo {
             queue_create_info_count: queue_info.len() as u32,
             p_queue_create_infos: queue_info.as_ptr(),
             enabled_extension_count: device_extensions.len() as u32,
             pp_enabled_extension_names: device_extensions.as_ptr(),
             ..Default::default()
         };
+
+        // Optionally, add additional features to the device creation info.
+        if let Some(feature_chain) = feature_chain {
+            device_info = device_info.push_next(feature_chain);
+        }
+
         vulkan
             .instance
             .create_device(physical_device, &device_info, None)
@@ -514,6 +699,24 @@ pub fn new_device(
     };
 
     (device, queue_families)
+}
+
+/// A helper type for understanding the context of a queue in Vulkan.
+pub struct IndexedQueue {
+    pub queue: ash::vk::Queue,
+    pub family_index: u32,
+    pub index: u32,
+}
+impl IndexedQueue {
+    /// Get a queue from a logical device by its family and index.
+    pub fn get(device: &ash::Device, family_index: u32, index: u32) -> Self {
+        let queue = unsafe { device.get_device_queue(family_index, index) };
+        Self {
+            queue,
+            family_index,
+            index,
+        }
+    }
 }
 
 /// A helper for creating shader modules on a logical device.
@@ -611,7 +814,7 @@ pub fn create_image_view(
             base_mip_level: 0,
             level_count: mip_levels,
             base_array_layer: 0,
-            layer_count: 1, // In case of 3D images, `VK_REMAINING_ARRAY_LAYERS` can be used.
+            layer_count: ash::vk::REMAINING_ARRAY_LAYERS, // In case of 3D images, `VK_REMAINING_ARRAY_LAYERS` will consider all remaining layers.
         },
         ..Default::default()
     };
@@ -701,63 +904,15 @@ impl Swapchain {
         #[cfg(debug_assertions)]
         println!("Surface capabilities: {surface_capabilities:?}\n");
 
-        // TODO: Refactor present mode selection to another function.
-        let min_images = surface_capabilities.min_image_count;
-        let max_images = NonZeroU32::new(surface_capabilities.max_image_count);
-        let target_image_count = if let Some(max) = max_images {
-            max.get().min(3)
-        } else {
-            3
-        };
-
-        // Determine which present modes are available.
-        let supported_present_modes = unsafe {
-            vulkan
-                .khr
-                .get_physical_device_surface_present_modes(physical_device, surface)
-                .expect("Unable to get supported present modes")
-        };
-
-        #[cfg(debug_assertions)]
-        println!("Supported present modes: {supported_present_modes:?}\n");
-
-        // Default to what is guaranteed to be available.
-        let preferred_present_mode = preferences
-            .present_mode
-            .unwrap_or(ash::vk::PresentModeKHR::FIFO);
-
-        // Attempt to use the preferred present mode, or fallback to a default mode.
-        // Choose the number of images based on the present mode and the minimum images required.
-        let (present_mode, image_count) = supported_present_modes
-            .iter()
-            .find_map(|&mode| {
-                // Don't choose anything other than the preferred present mode in this first pass.
-                if mode != preferred_present_mode {
-                    return None;
-                }
-
-                match preferred_present_mode {
-                    // Immediate mode should use the minimum number of images supported.
-                    // This mode is used when there is not a concern with screen tearing, only resource usage.
-                    ash::vk::PresentModeKHR::IMMEDIATE => Some((mode, min_images)),
-
-                    // Use `MAILBOX` to reduce latency and avoid tearing. Generally preferred.
-                    // `FIFO` and `FIFO_RELAXED` modes require at least two images for proper vertical synchronization.
-                    ash::vk::PresentModeKHR::MAILBOX
-                    | ash::vk::PresentModeKHR::FIFO
-                    | ash::vk::PresentModeKHR::FIFO_RELAXED => {
-                        // Ensure we are still using at least the minimum number of images.
-                        Some((mode, min_images.max(target_image_count)))
-                    }
-
-                    // No other named present modes currently exist so we default to FIFO.
-                    _ => None,
-                }
-            })
-            .unwrap_or((
-                ash::vk::PresentModeKHR::FIFO,
-                min_images.max(target_image_count),
-            ));
+        // Try to choose the preferred present mode, but fall back to the default of FIFO. Uses the most reasonable and valid image count for each present mode.
+        let (present_mode, image_count) = Self::choose_present_mode_and_image_count(
+            vulkan,
+            physical_device,
+            surface,
+            &surface_capabilities,
+            preferences.present_mode,
+            enabled_swapchain_maintenance1,
+        );
 
         // Determine the image format that is supported and compare it to what is preferred.
         let supported_formats = unsafe {
@@ -993,7 +1148,6 @@ impl Swapchain {
         self,
         logical_device: &ash::Device,
         memory_allocator: &mut gpu_allocator::vulkan::Allocator,
-        framebuffers: &mut Vec<ash::vk::Framebuffer>,
     ) {
         // Destroy resources in the reverse order they were created.
         unsafe {
@@ -1004,10 +1158,8 @@ impl Swapchain {
                 logical_device.destroy_fence(sync.present_complete, None);
             }
 
-            // Destroy the framebuffers, image views, and finally the images (some of which are managed by the swapchain itself).
-            for framebuffer in framebuffers.drain(..) {
-                logical_device.destroy_framebuffer(framebuffer, None);
-            }
+            // Destroy the image views and images.
+            // NOTE: Do not directly destroy the images managed by the swapchain internally (i.e., the presentation images).
             for image_view in self.image_views {
                 logical_device.destroy_image_view(image_view, None);
             }
@@ -1026,6 +1178,98 @@ impl Swapchain {
         }
     }
 
+    /// Helper to attempt to usee the preferred present mode, but falls back to the default of `FIFO` which is always supported.
+    /// Also, tries to use the most reasonable and valid image count for whichever present mode is determined.
+    pub fn choose_present_mode_and_image_count(
+        vulkan: &VulkanCore,
+        physical_device: ash::vk::PhysicalDevice,
+        surface: ash::vk::SurfaceKHR,
+        surface_capabilities: &ash::vk::SurfaceCapabilitiesKHR,
+        preferred_present_mode: Option<ash::vk::PresentModeKHR>,
+        enabled_swapchain_maintenance1: bool,
+    ) -> (ash::vk::PresentModeKHR, u32) {
+        // NOTE: `SurfaceCapabilitiesKHR` specifies the minimum and maximum number of images that any present mode on this surface may have.
+        // However, each present mode may have a tighter bound on the min and max than this global value.
+        // See below where `SurfaceCapabilities2KHR` is used to get the actual min and max image count for the determined present mode.
+        let surface_min_images = surface_capabilities.min_image_count;
+        let surface_max_images = NonZeroU32::new(surface_capabilities.max_image_count);
+
+        // Determine which present modes are available.
+        let supported_present_modes = unsafe {
+            vulkan
+                .khr
+                .get_physical_device_surface_present_modes(physical_device, surface)
+                .expect("Unable to get supported present modes")
+        };
+
+        #[cfg(debug_assertions)]
+        println!("Supported present modes: {supported_present_modes:?}\n");
+
+        // Default to what is guaranteed to be available.
+        let preferred_present_mode =
+            preferred_present_mode.unwrap_or(ash::vk::PresentModeKHR::FIFO);
+
+        // Attempt to use the preferred present mode, or fallback to a default mode.
+        // Choose the number of images based on the present mode and the minimum images required.
+        let (present_mode, mut image_count) = supported_present_modes
+            .iter()
+            .find_map(|&mode| {
+                // Don't choose anything other than the preferred present mode in this first pass.
+                if mode != preferred_present_mode {
+                    return None;
+                }
+
+                match preferred_present_mode {
+                    // Immediate mode should use the minimum number of images supported.
+                    // This mode is used when there is not a concern with screen tearing, only resource usage.
+                    ash::vk::PresentModeKHR::IMMEDIATE => Some((mode, 1)),
+
+                    // Use `MAILBOX` to reduce latency and avoid tearing. Generally preferred.
+                    // `FIFO` and `FIFO_RELAXED` modes require at least two images for proper vertical synchronization.
+                    ash::vk::PresentModeKHR::MAILBOX
+                    | ash::vk::PresentModeKHR::FIFO
+                    | ash::vk::PresentModeKHR::FIFO_RELAXED => Some((mode, 3)),
+
+                    // No other named present modes currently exist so we default to FIFO.
+                    _ => None,
+                }
+            })
+            .unwrap_or((ash::vk::PresentModeKHR::FIFO, 3));
+
+        // TODO: Only require the instance extension https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_surface_maintenance1.html.
+        if enabled_swapchain_maintenance1 {
+            let mut present_mode_ext =
+                ash::vk::SurfacePresentModeEXT::default().present_mode(present_mode);
+            let surface_info = ash::vk::PhysicalDeviceSurfaceInfo2KHR::default()
+                .surface(surface)
+                .push_next(&mut present_mode_ext);
+            let mut surface_capabilities = ash::vk::SurfaceCapabilities2KHR::default();
+            unsafe {
+                ash::khr::get_surface_capabilities2::Instance::new(&vulkan.api, &vulkan.instance)
+                    .get_physical_device_surface_capabilities2(
+                        physical_device,
+                        &surface_info,
+                        &mut surface_capabilities,
+                    )
+            }
+            .expect("Unable to get extended surface capabilities(2)");
+
+            let present_max =
+                NonZeroU32::new(surface_capabilities.surface_capabilities.max_image_count);
+            image_count = image_count.clamp(
+                surface_capabilities.surface_capabilities.min_image_count,
+                present_max.map_or(u32::MAX, NonZeroU32::get),
+            );
+        } else {
+            image_count = image_count.clamp(
+                surface_min_images,
+                surface_max_images.map_or(u32::MAX, NonZeroU32::get),
+            );
+        }
+
+        (present_mode, image_count)
+    }
+
     /// Recreate the swapchain using the existing one.
     /// This is useful when the window is resized, or the window is moved to a different monitor.
     /// # Notes
@@ -1038,7 +1282,6 @@ impl Swapchain {
         logical_device: &ash::Device,
         surface: ash::vk::SurfaceKHR,
         memory_allocator: &mut gpu_allocator::vulkan::Allocator,
-        framebuffers: &mut Vec<ash::vk::Framebuffer>,
         preferences: SwapchainPreferences,
     ) {
         let mut stack_var_swapchain = Self::new(
@@ -1054,13 +1297,13 @@ impl Swapchain {
 
         // Swap the original swapchain (`self`) with the new one.
         std::mem::swap(self, &mut stack_var_swapchain);
+        let old_swapchain = stack_var_swapchain; // Variable rename for clarity.
 
-        // Wait for the logical device to finish its operations on the swapchain.
-        // TODO: If `VK_EXT_swapchain_maintenance1` is enabled, wait for the old swapchain to complete its presentation fences.
         unsafe {
             if self.enabled_swapchain_maintenance1 {
+                // Wait for the old swapchain to complete its presentation fences.
                 let presentation_fences: SmallVec<[ash::vk::Fence; EXPECTED_MAX_FRAMES_IN_FLIGHT]> =
-                    stack_var_swapchain
+                    old_swapchain
                         .frame_syncs
                         .iter()
                         .map(|s| s.present_complete)
@@ -1073,6 +1316,8 @@ impl Swapchain {
                     )
                     .expect("Unable to wait for the logical device to finish its operations");
             } else {
+                // Wait for the logical device to finish its operations on the swapchain.
+                // This is not particularly optimal.
                 logical_device
                     .device_wait_idle()
                     .expect("Unable to wait for the logical device to finish its operations");
@@ -1080,7 +1325,7 @@ impl Swapchain {
         }
 
         // Destroy the old swapchain and its associated resources.
-        stack_var_swapchain.destroy(logical_device, memory_allocator, framebuffers);
+        old_swapchain.destroy(logical_device, memory_allocator);
     }
 
     /// Acquire the next image in the swapchain. Maintain the index of the acquired image.

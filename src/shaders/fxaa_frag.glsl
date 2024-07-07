@@ -1,7 +1,7 @@
 #version 460
 
 layout(push_constant) uniform PushConstants {
-  vec2 screen_size;
+  vec2 inverse_screen_size;
 } push_constants;
 
 layout(set = 0, binding = 0) uniform sampler2D input_texture;
@@ -9,11 +9,11 @@ layout(set = 0, binding = 0) uniform sampler2D input_texture;
 layout(location = 0) out vec4 out_color;
 
 // Constants used for the FXAA algorithm.
-const float EDGE_THRESHOLD_MIN = 1.0 / 16.0;
-const float EDGE_THRESHOLD_MAX = 1.0 / 8.0;
-const float PIXEL_BLEND_LIMIT  = 0.75;
+const float EDGE_THRESHOLD_MIN = 1.0 / 20.0;
+const float EDGE_THRESHOLD_MAX = 1.0 / 12.0;
+const float PIXEL_BLEND_LIMIT  = 0.8;
 const float MIN_PIXEL_ALIASING = 1.0 / 8.0;
-const float NUM_LOOP_FOR_EDGE_DETECTION = 1;
+const float NUM_LOOP_FOR_EDGE_DETECTION = 2;
 
 // Constants to help indexing neighboring cells by name.
 const int CENTER = 0;
@@ -27,7 +27,7 @@ const int TOP_LEFT = 7;
 const int BOTTOM_LEFT = 8;
 
 // Neighbor offsets aligned to the name constants.
-const vec2 offsets[] = {
+const vec2 BLOCK_OFFSETS[] = {
   vec2(0), vec2(0, -1), vec2(0, 1), vec2(-1, 0), vec2(1, 0),
   vec2(1, -1), vec2(1, 1), vec2(-1, -1), vec2(-1, 1)
 };
@@ -38,7 +38,7 @@ float measure_luminance(vec3 color) {
 }
 
 // Traverses an edge in the image bi-directionally in search of the endpoints.
-// Returns 1 if anti-aliasing should be applied, 0 otherwise.
+// Returns 1.0 if anti-aliasing should be applied, 0.0 otherwise.
 float find_end_point_position(
   vec2 tex_coord,
   float luminance,
@@ -46,8 +46,8 @@ float find_end_point_position(
   float step_length,
   vec2 inverse_screen,
   bool is_horizontal,
-  out vec2 out_position)
-{
+  out vec2 out_position
+) {
   // Initialize the direction and position of the high-contrast pixel.
   vec2 texture_coord_of_high_contrast_pixel = tex_coord;
 
@@ -67,14 +67,18 @@ float find_end_point_position(
   float pixel_south;
   bool done_going_north = false;
   bool done_going_south = false;
-  vec2 position_contrast_north = texture_coord_of_high_contrast_pixel - edge_direction;
-  vec2 position_contrast_south = texture_coord_of_high_contrast_pixel + edge_direction;
-  vec2 position_pixel_north = tex_coord - edge_direction;
-  vec2 position_pixel_south = tex_coord + edge_direction;
+  vec2 position_contrast_north = texture_coord_of_high_contrast_pixel;
+  vec2 position_contrast_south = texture_coord_of_high_contrast_pixel;
+  vec2 position_pixel_north = tex_coord;
+  vec2 position_pixel_south = tex_coord;
 
   for(int i = 0; i < NUM_LOOP_FOR_EDGE_DETECTION; ++i) {
     // Process searching north.
     if(!done_going_north) {
+      // Update the positions of the "high-contrast" and "middle" reference pixels along the edge.
+      position_contrast_north -= edge_direction;
+      position_pixel_north -= edge_direction;
+
       high_contrast_pixel_north = measure_luminance(texture(input_texture, position_contrast_north).rgb);
       pixel_north = measure_luminance(texture(input_texture, position_pixel_north).rgb);
       done_going_north = abs(high_contrast_pixel_north - high_contrast_pixel) > abs(high_contrast_pixel_north - luminance)
@@ -83,6 +87,10 @@ float find_end_point_position(
 
     // Process searching south.
     if(!done_going_south) {
+      // Update the positions of the "high-contrast" and "middle" reference pixels along the edge.
+      position_contrast_south += edge_direction;
+      position_pixel_south += edge_direction;
+
       high_contrast_pixel_south = measure_luminance(texture(input_texture, position_contrast_south).rgb);
       pixel_south = measure_luminance(texture(input_texture, position_pixel_south).rgb);
       done_going_south = abs(high_contrast_pixel_south - high_contrast_pixel) > abs(high_contrast_pixel_south - luminance)
@@ -92,16 +100,6 @@ float find_end_point_position(
     // Check if the search is done.
     if(done_going_north && done_going_south) {
       break;
-    }
-
-    // Update the positions.
-    if(!done_going_north) {
-      position_contrast_north -= edge_direction;
-      position_pixel_north -= edge_direction;
-    }
-    if(!done_going_south) {
-      position_contrast_south += edge_direction;
-      position_pixel_south += edge_direction;
     }
   }
 
@@ -117,7 +115,7 @@ float find_end_point_position(
   }
 
   // Determine which endpoint is closer.
-  const bool is_north_closer = destination_north < destination_south; // TODO: Check this inequality with inclusivity to see if there are any visual differences.
+  const bool is_north_closer = destination_north < destination_south;
   float min_distance = min(destination_north, destination_south);
   float closer_luminance = is_north_closer ? pixel_north : pixel_south;
 
@@ -139,7 +137,7 @@ float find_end_point_position(
 
 // Apply the FXAA algorithm to the input texture which is usually the result of the render before post-processing.
 vec4 apply_fxaa(vec2 screen_coord) {
-  const vec2 inverse_screen = vec2(1) / push_constants.screen_size;
+  const vec2 inverse_screen = push_constants.inverse_screen_size;
   const vec2 tex_coord = screen_coord * inverse_screen;
 
   float min_luminance = 10000000;
@@ -148,7 +146,7 @@ vec4 apply_fxaa(vec2 screen_coord) {
   vec3 color_sum = vec3(0);
 
   for(int i = 0; i < 9; ++i) {
-    block_color_and_luminance[i].xyz = texture(input_texture, tex_coord + offsets[i] * inverse_screen).rgb;
+    block_color_and_luminance[i].xyz = texture(input_texture, tex_coord + BLOCK_OFFSETS[i] * inverse_screen).rgb;
     color_sum += block_color_and_luminance[i].xyz;
 
     block_color_and_luminance[i].w = measure_luminance(block_color_and_luminance[i].xyz);
@@ -180,7 +178,7 @@ vec4 apply_fxaa(vec2 screen_coord) {
   pixel_blend = min(PIXEL_BLEND_LIMIT, pixel_blend * (1.0 / (1.0 - MIN_PIXEL_ALIASING)));
 
   // Determine the direction of the edge.
-  const vec3 average_color = color_sum * (1.0 / 9.0); // Store 1/9 as a constant at compile and perform multiplication at runtime.
+  const vec3 average_color = color_sum * (1.0 / 9.0); // Store 1/9 as a constant at compile and perform multiplication at runtime. Same trick is used throughout.
   const float vertical_edge_row_1 = abs(-2.0 * block_color_and_luminance[TOP].w + luminance_top_corners);
   const float vertical_edge_row_2 = abs(-2.0 * block_color_and_luminance[CENTER].w + luminance_left_right);
   const float vertical_edge_row_3 = abs(-2.0 * block_color_and_luminance[BOTTOM].w + luminance_bottom_corners);
@@ -191,7 +189,7 @@ vec4 apply_fxaa(vec2 screen_coord) {
   const float horizontal_edge_col_3 = abs(-2.0 * block_color_and_luminance[RIGHT].w + luminance_right_corners);
   const float horizontal_edge = (horizontal_edge_col_1 + 2.0 * horizontal_edge_col_2 + horizontal_edge_col_3) * (1.0 / 12.0);
 
-  const bool is_horizontal = horizontal_edge >= vertical_edge; // TODO: Determine whether an inclusive or exclusive comparison is better visually. Likely doesn't matter.
+  const bool is_horizontal = horizontal_edge > vertical_edge;
 
   const float steep_luminance_1 = is_horizontal ? block_color_and_luminance[TOP].w : block_color_and_luminance[LEFT].w;
   const float steep_luminance_2 = is_horizontal ? block_color_and_luminance[BOTTOM].w : block_color_and_luminance[RIGHT].w;

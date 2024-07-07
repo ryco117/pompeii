@@ -1,4 +1,4 @@
-use super::{shaders::ENTRY_POINT_MAIN, utils};
+use super::shaders::ENTRY_POINT_MAIN;
 
 /// Shader for texture-mapping the entire screen. Useful for post-processing and fullscreen effects.
 const FXAA_FRAGMENT: &[u32] =
@@ -9,11 +9,11 @@ const FXAA_FRAGMENT: &[u32] =
 #[derive(Debug, Clone, Copy)]
 pub struct PushConstants {
     /// The width and height of the render surface, as `f32`s.
-    pub screen_size: [f32; 2],
+    pub inverse_screen_size: [f32; 2],
 }
 
 /// Define the pipeline used for the FXAA post-processing effect.
-struct FxaaPipeline {
+struct Pipeline {
     render_pass: ash::vk::RenderPass,
     layout: ash::vk::PipelineLayout,
     pipeline: ash::vk::Pipeline,
@@ -22,7 +22,7 @@ struct FxaaPipeline {
     fxaa_frag_shader: ash::vk::ShaderModule,
 }
 
-impl FxaaPipeline {
+impl Pipeline {
     /// Create a new graphics pipeline for the FXAA post-processing effect.
     pub fn new(
         device: &ash::Device,
@@ -32,21 +32,17 @@ impl FxaaPipeline {
         // Create the shader modules for the vertex and fragment shaders.
         // TODO: Allow caching of these shader modules.
         let fullscreen_vert_shader =
-            utils::create_shader_module(device, super::shaders::FULLSCREEN_VERTEX);
-        let fxaa_frag_shader = utils::create_shader_module(device, FXAA_FRAGMENT);
+            super::create_shader_module(device, super::shaders::FULLSCREEN_VERTEX);
+        let fxaa_frag_shader = super::create_shader_module(device, FXAA_FRAGMENT);
         let shader_stages = [
-            ash::vk::PipelineShaderStageCreateInfo {
-                stage: ash::vk::ShaderStageFlags::VERTEX,
-                module: fullscreen_vert_shader,
-                p_name: ENTRY_POINT_MAIN.as_ptr(),
-                ..Default::default()
-            },
-            ash::vk::PipelineShaderStageCreateInfo {
-                stage: ash::vk::ShaderStageFlags::FRAGMENT,
-                module: fxaa_frag_shader,
-                p_name: ENTRY_POINT_MAIN.as_ptr(),
-                ..Default::default()
-            },
+            ash::vk::PipelineShaderStageCreateInfo::default()
+                .stage(ash::vk::ShaderStageFlags::VERTEX)
+                .module(fullscreen_vert_shader)
+                .name(ENTRY_POINT_MAIN),
+            ash::vk::PipelineShaderStageCreateInfo::default()
+                .stage(ash::vk::ShaderStageFlags::FRAGMENT)
+                .module(fxaa_frag_shader)
+                .name(ENTRY_POINT_MAIN),
         ];
 
         // Define the push constants that will be used by the fragment shader.
@@ -57,11 +53,9 @@ impl FxaaPipeline {
         };
 
         // Define the pipeline viewport and scissor rectangle.
-        let viewport_state = ash::vk::PipelineViewportStateCreateInfo {
-            viewport_count: 1,
-            scissor_count: 1,
-            ..Default::default()
-        };
+        let viewport_state = ash::vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
 
         // Define the pipeline input assembly state.
         let input_state = ash::vk::PipelineInputAssemblyStateCreateInfo::default()
@@ -76,7 +70,7 @@ impl FxaaPipeline {
 
         // Define the color blend state.
         // TODO: This is likely overkill for FXAA post-processing.
-        let color_blend_attachment = ash::vk::PipelineColorBlendAttachmentState {
+        let color_blend_attachment = [ash::vk::PipelineColorBlendAttachmentState {
             src_color_blend_factor: ash::vk::BlendFactor::SRC_ALPHA,
             dst_color_blend_factor: ash::vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
             color_blend_op: ash::vk::BlendOp::ADD, // This is the default.
@@ -85,25 +79,20 @@ impl FxaaPipeline {
             alpha_blend_op: ash::vk::BlendOp::ADD,
             color_write_mask: ash::vk::ColorComponentFlags::RGBA,
             ..Default::default()
-        };
-        let color_blend_state = ash::vk::PipelineColorBlendStateCreateInfo {
-            attachment_count: 1,
-            p_attachments: &color_blend_attachment,
-            ..Default::default()
-        };
+        }];
+        let color_blend_state = ash::vk::PipelineColorBlendStateCreateInfo::default()
+            .attachments(&color_blend_attachment);
 
         // Create the descriptor set layout.
         let descriptor_set_layout = {
+            let sampler = [sampler];
             let descriptor_set_info = ash::vk::DescriptorSetLayoutCreateInfo {
                 binding_count: 1,
-                p_bindings: &ash::vk::DescriptorSetLayoutBinding {
-                    binding: 0,
-                    descriptor_type: ash::vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                    descriptor_count: 1,
-                    stage_flags: ash::vk::ShaderStageFlags::FRAGMENT,
-                    p_immutable_samplers: &sampler, // NOTE: This "array" must be equal in size to `descriptor_count`.
-                    ..Default::default()
-                },
+                p_bindings: &ash::vk::DescriptorSetLayoutBinding::default()
+                    .binding(0)
+                    .descriptor_type(ash::vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .stage_flags(ash::vk::ShaderStageFlags::FRAGMENT)
+                    .immutable_samplers(&sampler), // NOTE: This helper also sets the `descriptor_count` property to ensure valid usage.
                 ..Default::default()
             };
 
@@ -113,28 +102,21 @@ impl FxaaPipeline {
 
         // Create the pipeline layout.
         let pipeline_layout = {
-            let layout_info = ash::vk::PipelineLayoutCreateInfo {
-                set_layout_count: 1,
-                p_set_layouts: &descriptor_set_layout,
-                push_constant_range_count: 1,
-                p_push_constant_ranges: &push_constants_range,
-                ..Default::default()
-            };
+            let descriptor_set_layout = [descriptor_set_layout];
+            let push_constants_range = [push_constants_range];
+            let layout_info = ash::vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&descriptor_set_layout)
+                .push_constant_ranges(&push_constants_range);
 
             unsafe { device.create_pipeline_layout(&layout_info, None) }
                 .expect("Failed to create pipeline layout for FXAA post-processing")
         };
 
         // Use dynamic states for the viewport and scissor rectangles.
-        let dynamic_states = ash::vk::PipelineDynamicStateCreateInfo {
-            dynamic_state_count: 2,
-            p_dynamic_states: [
-                ash::vk::DynamicState::VIEWPORT,
-                ash::vk::DynamicState::SCISSOR,
-            ]
-            .as_ptr(),
-            ..Default::default()
-        };
+        let dynamic_states = ash::vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&[
+            ash::vk::DynamicState::VIEWPORT,
+            ash::vk::DynamicState::SCISSOR,
+        ]);
 
         // Create the FXAA pipeline.
         let pipeline = {
@@ -179,7 +161,7 @@ impl FxaaPipeline {
 /// An implementation of a FXAA render pass.
 /// This can be used as a post-processing effect in a larger render pipeline.
 pub struct FxaaPass {
-    pipeline: FxaaPipeline,
+    pipeline: Pipeline,
     pub sampler: ash::vk::Sampler,
     pub framebuffers: Vec<(
         ash::vk::Framebuffer,
@@ -192,6 +174,9 @@ pub struct FxaaPass {
 }
 
 impl FxaaPass {
+    const OPTIMAL_INTERNAL_IMAGE_LAYOUT: ash::vk::ImageLayout =
+        ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+
     /// Create a new FXAA render pass and associated resources.
     pub fn new(
         device: &ash::Device,
@@ -208,9 +193,10 @@ impl FxaaPass {
                 mag_filter: ash::vk::Filter::NEAREST,
                 min_filter: ash::vk::Filter::NEAREST,
                 mipmap_mode: ash::vk::SamplerMipmapMode::NEAREST,
-                address_mode_u: ash::vk::SamplerAddressMode::REPEAT,
-                address_mode_v: ash::vk::SamplerAddressMode::REPEAT,
-                address_mode_w: ash::vk::SamplerAddressMode::REPEAT,
+                address_mode_u: ash::vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                address_mode_v: ash::vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                address_mode_w: ash::vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                max_lod: ash::vk::LOD_CLAMP_NONE,
                 ..Default::default()
             };
             unsafe { device.create_sampler(&sampler_info, None) }
@@ -219,7 +205,7 @@ impl FxaaPass {
 
         // Create the FXAA render pass and graphics pipeline.
         let render_pass = Self::create_render_pass(device, swapchain_format, destination_layout);
-        let pipeline = FxaaPipeline::new(device, render_pass, sampler);
+        let pipeline = Pipeline::new(device, render_pass, sampler);
 
         // Create the framebuffers that will be used during this render.
         let framebuffers = Self::create_framebuffers(
@@ -235,14 +221,11 @@ impl FxaaPass {
         let descriptor_pool = {
             let pool_sizes = [ash::vk::DescriptorPoolSize {
                 ty: ash::vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: 1 as u32,
+                descriptor_count: destination_views.len() as u32, // One descriptor per framebuffer.
             }];
-            let pool_info = ash::vk::DescriptorPoolCreateInfo {
-                max_sets: framebuffers.len() as u32,
-                pool_size_count: pool_sizes.len() as u32,
-                p_pool_sizes: pool_sizes.as_ptr(),
-                ..Default::default()
-            };
+            let pool_info = ash::vk::DescriptorPoolCreateInfo::default()
+                .max_sets(framebuffers.len() as u32)
+                .pool_sizes(&pool_sizes);
             unsafe { device.create_descriptor_pool(&pool_info, None) }
                 .expect("Failed to create descriptor pool for FXAA post-processing")
         };
@@ -310,47 +293,42 @@ impl FxaaPass {
         swapchain_format: ash::vk::Format,
         destination_layout: ash::vk::ImageLayout,
     ) -> ash::vk::RenderPass {
-        // Define the color attachment for the render pass.
-        let attachment = ash::vk::AttachmentDescription {
+        // Define the color attachment for the render pass, i.e., the output image of this pass.
+        let attachment = [ash::vk::AttachmentDescription {
             format: swapchain_format,
             samples: ash::vk::SampleCountFlags::TYPE_1,
-            load_op: ash::vk::AttachmentLoadOp::CLEAR,
+            load_op: ash::vk::AttachmentLoadOp::DONT_CARE, // Each bit of the surface will be re-drawn so a clear is not necessary.
             store_op: ash::vk::AttachmentStoreOp::STORE,
             initial_layout: ash::vk::ImageLayout::UNDEFINED,
             final_layout: destination_layout,
             ..Default::default()
-        };
-        let color_attachment_reference = ash::vk::AttachmentReference {
+        }];
+        let color_attachment_reference = [ash::vk::AttachmentReference {
             attachment: 0,
             layout: ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        };
+        }];
 
         // Define the single subpass that will be used in the render pass.
-        let subpass_description = ash::vk::SubpassDescription {
-            pipeline_bind_point: ash::vk::PipelineBindPoint::GRAPHICS,
-            color_attachment_count: 1,
-            p_color_attachments: &color_attachment_reference,
+        let subpass_description = [ash::vk::SubpassDescription::default()
+            .pipeline_bind_point(ash::vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&color_attachment_reference)];
+
+        // Define the subpass dependencies.
+        let subpass_dependencies = [ash::vk::SubpassDependency {
+            src_subpass: ash::vk::SUBPASS_EXTERNAL,
+            dst_subpass: 0,
+            src_stage_mask: ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            dst_stage_mask: ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            src_access_mask: ash::vk::AccessFlags::NONE,
+            dst_access_mask: ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             ..Default::default()
-        };
+        }];
 
         // Create the render pass.
-        let render_pass_info = ash::vk::RenderPassCreateInfo {
-            attachment_count: 1,
-            p_attachments: &attachment,
-            subpass_count: 1,
-            p_subpasses: &subpass_description,
-            dependency_count: 1,
-            p_dependencies: &ash::vk::SubpassDependency {
-                src_subpass: ash::vk::SUBPASS_EXTERNAL,
-                dst_subpass: 0,
-                src_stage_mask: ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                src_access_mask: ash::vk::AccessFlags::empty(),
-                dst_stage_mask: ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                dst_access_mask: ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let render_pass_info = ash::vk::RenderPassCreateInfo::default()
+            .attachments(&attachment)
+            .subpasses(&subpass_description)
+            .dependencies(&subpass_dependencies);
         unsafe { device.create_render_pass(&render_pass_info, None) }
             .expect("Failed to create render pass for FXAA post-processing")
     }
@@ -389,8 +367,8 @@ impl FxaaPass {
                     ..Default::default()
                 };
                 let (image, allocation) =
-                    utils::create_image(device, memory_allocator, &image_info, "FXAA Image");
-                let image_view = utils::create_image_view(device, image, swapchain_format, 1);
+                    super::create_image(device, memory_allocator, &image_info, "FXAA Image");
+                let image_view = super::create_image_view(device, image, swapchain_format, 1);
 
                 let framebuffer_info = ash::vk::FramebufferCreateInfo {
                     render_pass,
@@ -419,20 +397,17 @@ impl FxaaPass {
     where
         I: IntoIterator<Item = ash::vk::ImageView>,
     {
-        let descriptor_set_info = ash::vk::DescriptorSetAllocateInfo {
-            descriptor_pool,
-            descriptor_set_count: 1,
-            p_set_layouts: &descriptor_set_layout,
-            ..Default::default()
-        };
+        let descriptor_set_layout = [descriptor_set_layout];
+        let descriptor_set_info = ash::vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&descriptor_set_layout);
         internal_image_views
             .into_iter()
             .map(|image_view| {
-                let set = unsafe { device.allocate_descriptor_sets(&descriptor_set_info) }
+                let &set = unsafe { device.allocate_descriptor_sets(&descriptor_set_info) }
                     .expect("Failed to allocate descriptor set for FXAA post-processing")
                     .first()
-                    .expect("FXAA descriptor set allocation returned an empty list")
-                    .clone();
+                    .expect("FXAA descriptor set allocation returned an empty list");
 
                 // Update the descriptor set with the image attachment that will be sampled.
                 unsafe {
@@ -441,17 +416,17 @@ impl FxaaPass {
                             dst_set: set,
                             dst_binding: 0,
                             dst_array_element: 0,
-                            descriptor_count: 1,
+                            descriptor_count: 1, // The number of elements pointed to by `p_image_info`.
                             descriptor_type: ash::vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                             p_image_info: &ash::vk::DescriptorImageInfo {
                                 sampler,
                                 image_view,
-                                image_layout: ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                image_layout: Self::OPTIMAL_INTERNAL_IMAGE_LAYOUT,
                             },
                             ..Default::default()
                         }],
                         &[],
-                    )
+                    );
                 };
                 set
             })
@@ -459,61 +434,56 @@ impl FxaaPass {
     }
 
     /// Record the commands necessary to perform FXAA post-processing on the input image and write the result to the output image.
+    /// # Safety
+    /// * The command buffer must be in the recording state.
+    /// * The image index must be a valid index into the framebuffers array.
+    /// * The image index must specify an internal image that currently has layout `COLOR_ATTACHMENT_OPTIMAL`.
     pub fn render_frame(
         &self,
         device: &ash::Device,
         command_buffer: ash::vk::CommandBuffer,
         extent: ash::vk::Extent2D,
         image_index: usize,
-        destination_layout: ash::vk::ImageLayout,
-        destination_image: ash::vk::Image,
     ) {
         unsafe {
-            // Use a pipeline barrier to ensure that we are able to read the input sampler in the correct layout.
-            device.cmd_pipeline_barrier(
+            //Use a pipeline barrier to ensure that we are able to read the input sampler in the correct layout.
+            let image_barrier = ash::vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(ash::vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(ash::vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .dst_stage_mask(ash::vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(ash::vk::AccessFlags2::SHADER_READ)
+                .old_layout(ash::vk::ImageLayout::ATTACHMENT_OPTIMAL)
+                .new_layout(ash::vk::ImageLayout::READ_ONLY_OPTIMAL)
+                .image(self.framebuffers[image_index].2)
+                .subresource_range(ash::vk::ImageSubresourceRange {
+                    aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            device.cmd_pipeline_barrier2(
                 command_buffer,
-                ash::vk::PipelineStageFlags::TOP_OF_PIPE,
-                ash::vk::PipelineStageFlags::FRAGMENT_SHADER,
-                ash::vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[ash::vk::ImageMemoryBarrier {
-                    dst_access_mask: ash::vk::AccessFlags::SHADER_READ,
-                    old_layout: ash::vk::ImageLayout::UNDEFINED,
-                    new_layout: ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    image: self.framebuffers[image_index].2,
-                    subresource_range: ash::vk::ImageSubresourceRange {
-                        aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    },
-                    ..Default::default()
-                }],
+                &ash::vk::DependencyInfo::default().image_memory_barriers(&[image_barrier]),
             );
 
             // Begin the render pass for the current frame.
             device.cmd_begin_render_pass(
                 command_buffer,
-                &ash::vk::RenderPassBeginInfo {
-                    render_pass: self.pipeline.render_pass,
-                    framebuffer: self.framebuffers[image_index].0,
-                    render_area: ash::vk::Rect2D {
+                &ash::vk::RenderPassBeginInfo::default()
+                    .render_pass(self.pipeline.render_pass)
+                    .framebuffer(self.framebuffers[image_index].0)
+                    .render_area(ash::vk::Rect2D {
                         offset: ash::vk::Offset2D::default(),
                         extent,
-                    },
-                    clear_value_count: 1,
-                    p_clear_values: &ash::vk::ClearValue::default(),
-                    ..Default::default()
-                },
+                    }),
                 ash::vk::SubpassContents::INLINE,
             );
         }
 
         // Set the shader push constants.
         let push_constants = PushConstants {
-            screen_size: [extent.width as f32, extent.height as f32],
+            inverse_screen_size: [1. / extent.width as f32, 1. / extent.height as f32],
         };
         unsafe {
             device.cmd_push_constants(
@@ -521,10 +491,7 @@ impl FxaaPass {
                 self.pipeline.layout,
                 ash::vk::ShaderStageFlags::FRAGMENT,
                 0,
-                std::slice::from_raw_parts(
-                    (&push_constants as *const PushConstants).cast(),
-                    std::mem::size_of::<PushConstants>(),
-                ),
+                super::data_byte_slice(&push_constants),
             );
         }
 
@@ -578,32 +545,6 @@ impl FxaaPass {
 
         // End the render pass.
         unsafe { device.cmd_end_render_pass(command_buffer) };
-
-        // Use a pipeline barrier to ensure that the temporary image is in the correct layout for the next render pass.
-        unsafe {
-            device.cmd_pipeline_barrier(
-                command_buffer,
-                ash::vk::PipelineStageFlags::FRAGMENT_SHADER,
-                ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                ash::vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[ash::vk::ImageMemoryBarrier {
-                    src_access_mask: ash::vk::AccessFlags::SHADER_READ,
-                    old_layout: ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    new_layout: ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    image: self.framebuffers[image_index].2,
-                    subresource_range: ash::vk::ImageSubresourceRange {
-                        aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    },
-                    ..Default::default()
-                }],
-            );
-        }
     }
 
     /// Recreate the framebuffers used by this FXAA render pass instance, as well as the resources that use them.
