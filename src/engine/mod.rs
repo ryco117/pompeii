@@ -1,3 +1,6 @@
+use std::{collections::HashSet, ffi::CStr};
+
+use example_fluid::FluidDisplayTexture;
 use smallvec::{smallvec, SmallVec};
 use utils::{fxaa_pass::FxaaPass, EXPECTED_MAX_FRAMES_IN_FLIGHT, FIVE_SECONDS_IN_NANOSECONDS};
 
@@ -5,10 +8,8 @@ pub mod example_fluid;
 pub mod example_triangle;
 pub mod utils;
 
-/// Store the state of optional features that aren't required but we may want to leverage.
-pub struct DeviceFeatures {
-    pub enabled_swapchain_maintenance: bool,
-}
+/// A sane constant for the expected maximum number of enabled device extensions. This is not for restrictions but to allow optimizations to avoid heap allocation.
+const EXPECTED_MAX_ENABLED_DEVICE_EXTENSIONS: usize = 4;
 
 /// The demos the application is capable of rendering.
 pub enum DemoPipeline {
@@ -17,16 +18,18 @@ pub enum DemoPipeline {
 }
 
 /// The push constants necessary to render the active demo.
+/// Each demo needs a unique set of information to render each frame.
 pub enum DemoPushConstants {
     Triangle(example_triangle::PushConstants),
-    Fluid(example_fluid::PushConstants, u32),
+    Fluid(example_fluid::PushConstants, FluidDisplayTexture),
 }
 
 /// Define which rendering objects are necessary for this application.
 pub struct Renderer {
     pub physical_device: ash::vk::PhysicalDevice,
-    pub device_features: DeviceFeatures,
+    pub device_extensions: HashSet<&'static CStr>,
     pub logical_device: ash::Device,
+    pageable_device_local_memory: Option<ash::ext::pageable_device_local_memory::Device>,
 
     pub surface: ash::vk::SurfaceKHR,
     pub memory_allocator: gpu_allocator::vulkan::Allocator,
@@ -57,6 +60,7 @@ pub enum DemoSpecializationConstants {
 }
 
 /// The new demo to switch to, and any unique parameters necessary to initialize it.
+#[derive(Clone, Copy, Debug)]
 pub enum NewDemo {
     Triangle(example_triangle::SpecializationConstants),
     Fluid,
@@ -74,95 +78,128 @@ impl Renderer {
         // Required device extensions for the swapchain.
         const DEVICE_EXTENSIONS: [*const i8; 1] = [ash::khr::swapchain::NAME.as_ptr()];
 
-        // Use simple heuristics to find the best suitable physical device.
-        let (physical_device, device_properties) = *utils::get_sorted_physical_devices(
-            &vulkan.instance,
-            vulkan.version,
-            &DEVICE_EXTENSIONS,
-            utils::EnginePhysicalDeviceFeatures {
-                buffer_device_address: ash::vk::PhysicalDeviceBufferDeviceAddressFeatures::default(
-                )
+        // Define the device features that are required from this application.
+        let required_device_features = utils::EnginePhysicalDeviceFeatures {
+            buffer_device_address: ash::vk::PhysicalDeviceBufferDeviceAddressFeatures::default()
                 .buffer_device_address(true),
-                dynamic_rendering: true,
-                descriptor_indexing: ash::vk::PhysicalDeviceDescriptorIndexingFeaturesEXT::default(
-                )
-                .descriptor_binding_update_unused_while_pending(true)
-                .descriptor_binding_partially_bound(true),
-                synchronization2: true,
-                ..Default::default()
-            },
-        )
-        .first()
-        .expect("Unable to find a suitable physical device");
+            dynamic_rendering: true,
+            synchronization2: true,
+            ..Default::default()
+        };
+
+        // Use simple heuristics to find the best suitable physical device.
+        let (physical_device, device_properties, device_features) =
+            *utils::get_sorted_physical_devices(
+                &vulkan.instance,
+                vulkan.version,
+                &DEVICE_EXTENSIONS,
+                &required_device_features,
+            )
+            .first()
+            .expect("Unable to find a suitable physical device");
 
         #[cfg(debug_assertions)]
         println!(
-            "Selected physical device: {:?}",
+            "Selected physical device: {:?}\n Features: {device_features:?}",
             device_properties
                 .device_name_as_c_str()
                 .expect("Unable to get device name")
         );
 
         // Check the physical device for optional features we can enable for this application.
-        let mut custom_extensions = Vec::new();
-        let (device_extensions, enabled_swapchain_maintenance) = if vulkan
-            .enabled_instance_extension(ash::ext::surface_maintenance1::NAME)
-        {
-            let extensions = unsafe {
-                vulkan
-                    .instance
-                    .enumerate_device_extension_properties(physical_device)
-                    .expect("Unable to enumerate device extensions")
-            };
+        let mut custom_extensions =
+            SmallVec::<[*const i8; EXPECTED_MAX_ENABLED_DEVICE_EXTENSIONS]>::new();
+        let available_extensions = unsafe {
+            vulkan
+                .instance
+                .enumerate_device_extension_properties(physical_device)
+                .expect("Unable to enumerate device extensions")
+        };
+        let enabled_swapchain_maintenance =
+            if vulkan.enabled_instance_extension(ash::ext::surface_maintenance1::NAME) {
+                if utils::extensions_list_contains(
+                    &available_extensions,
+                    ash::ext::swapchain_maintenance1::NAME,
+                ) {
+                    #[cfg(debug_assertions)]
+                    println!("Enabling VK_EXT_swapchain_maintenance1 device extension");
+                    custom_extensions.push(ash::ext::swapchain_maintenance1::NAME.as_ptr());
 
-            if utils::extensions_list_contains(&extensions, ash::ext::swapchain_maintenance1::NAME)
-            {
-                #[cfg(debug_assertions)]
-                println!("Enabling VK_EXT_swapchain_maintenance1 device extension");
-
-                // Enable all of the default device extensions.
-                custom_extensions.extend_from_slice(&DEVICE_EXTENSIONS);
-
-                // Enable the specific extension for the swapchain maintenance.
-                custom_extensions.push(ash::ext::swapchain_maintenance1::NAME.as_ptr());
-
-                (&custom_extensions[..], true)
+                    true
+                } else {
+                    false
+                }
             } else {
-                (&DEVICE_EXTENSIONS[..], false)
-            }
+                false
+            };
+        let enabled_pageable_device_local_memory = if utils::extensions_list_contains(
+            &available_extensions,
+            ash::ext::memory_priority::NAME,
+        ) && utils::extensions_list_contains(
+            &available_extensions,
+            ash::ext::pageable_device_local_memory::NAME,
+        ) {
+            #[cfg(debug_assertions)]
+            println!("Enabling VK_EXT_memory_priority device extension");
+            custom_extensions.push(ash::ext::memory_priority::NAME.as_ptr());
+            #[cfg(debug_assertions)]
+            println!("Enabling VK_EXT_pageable_device_local_memory device extension");
+            custom_extensions.push(ash::ext::pageable_device_local_memory::NAME.as_ptr());
+            true
         } else {
-            (&DEVICE_EXTENSIONS[..], false)
+            false
         };
 
         // We required these features in physical device selection.
         // Now we can request the features be enabled over the logical device we create.
-        let mut descriptor_indexing_feature =
-            ash::vk::PhysicalDeviceDescriptorIndexingFeaturesEXT::default()
-                .descriptor_binding_update_unused_while_pending(true)
-                .descriptor_binding_partially_bound(true);
-        let mut dynamic_rendering_feature =
-            ash::vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
-        let mut synchronization2_feature =
-            ash::vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+        // TODO: Use the `device_features` struct instead to build the `features` struct.
         let mut buffer_device_address_feature =
             ash::vk::PhysicalDeviceBufferDeviceAddressFeatures::default()
                 .buffer_device_address(true);
+        let mut dynamic_rendering_feature =
+            ash::vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+        let mut pageable_device_local_memory_feature =
+            ash::vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT::default()
+                .pageable_device_local_memory(true);
+        let mut synchronization2_feature =
+            ash::vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
 
         // Ignore the features we are not interested in, and enable the ones we are.
         let mut features = ash::vk::PhysicalDeviceFeatures2::default()
-            .push_next(&mut descriptor_indexing_feature)
             .push_next(&mut dynamic_rendering_feature)
             .push_next(&mut synchronization2_feature)
             .push_next(&mut buffer_device_address_feature);
+
+        // Add optional device features when they are available.
+        if enabled_pageable_device_local_memory && device_features.pageable_device_local_memory {
+            features = features.push_next(&mut pageable_device_local_memory_feature);
+        }
+
+        // Collect all the device extensions we need to enable.
+        let all_extension_pointers = DEVICE_EXTENSIONS
+            .iter()
+            .chain(custom_extensions.iter())
+            .copied()
+            .collect::<Vec<_>>();
 
         // Create a logical device capable of rendering to the surface and performing compute operations.
         let (logical_device, queue_families) = utils::new_device(
             vulkan,
             physical_device,
             surface,
-            device_extensions,
+            &all_extension_pointers,
             Some(&mut features),
         );
+
+        let pageable_device_local_memory = if enabled_pageable_device_local_memory {
+            Some(ash::ext::pageable_device_local_memory::Device::new(
+                &vulkan.instance,
+                &logical_device,
+            ))
+        } else {
+            None
+        };
+
         let (graphics_index, compute_index, present_index) = {
             // NOTE: Prefer that the graphics and compute queues are equivalent because the `example_fluid` module will benefit from shared resources.
             let graphics = if let Some(gc) = queue_families.queue_families.iter().position(|f| {
@@ -325,6 +362,7 @@ impl Renderer {
                     ash::vk::ImageLayout::PRESENT_SRC_KHR,
                     swapchain.image_views(),
                     compute_command_pool.map_or(command_pool, |(pool, _)| pool),
+                    pageable_device_local_memory.as_ref(),
                 );
                 DemoPipeline::Fluid(demo)
             }
@@ -367,10 +405,12 @@ impl Renderer {
 
         Self {
             physical_device,
-            device_features: DeviceFeatures {
-                enabled_swapchain_maintenance,
-            },
+            device_extensions: custom_extensions
+                .into_iter()
+                .map(|p| unsafe { CStr::from_ptr(p) })
+                .collect::<HashSet<_>>(),
             logical_device,
+            pageable_device_local_memory,
             surface,
             memory_allocator,
 
@@ -409,10 +449,10 @@ impl Renderer {
             // Destroy the graphics pipeline and its dependent resources.
             match self.active_demo {
                 DemoPipeline::Triangle(pipeline) => {
-                    pipeline.destroy(&self.logical_device, true, true)
+                    pipeline.destroy(&self.logical_device, true, true);
                 }
                 DemoPipeline::Fluid(mut simulation) => {
-                    simulation.destroy(&self.logical_device, &mut self.memory_allocator)
+                    simulation.destroy(&self.logical_device, &mut self.memory_allocator);
                 }
             }
 
@@ -500,6 +540,7 @@ impl Renderer {
                         &mut self.memory_allocator,
                         extent,
                         self.swapchain.image_views(),
+                        self.pageable_device_local_memory.as_ref(),
                     );
                 }
             }
@@ -535,6 +576,7 @@ impl Renderer {
                         self.swapchain.image_views(),
                         self.compute_command_pool
                             .map_or(self.command_pool, |(pool, _)| pool),
+                        self.pageable_device_local_memory.as_ref(),
                     );
                     simulation.destroy(&self.logical_device, &mut self.memory_allocator);
                     *simulation = new_sim;
@@ -547,20 +589,20 @@ impl Renderer {
     pub fn render_frame(&mut self, vulkan: &utils::VulkanCore, push_constants: &DemoPushConstants) {
         // Synchronize the CPU with the GPU for the resources previously used for this frame in flight.
         // Specifically, the command buffer cannot be reused until the fence is signaled.
-        let resource_fence = self.frame_fences[self.swapchain.current_frame()];
+        let current_frame = self.swapchain.current_frame();
+        let frame_graphics_fence = self.frame_fences[current_frame];
         let presentation_fence = self.swapchain.present_complete();
         unsafe {
             self.logical_device
-                .wait_for_fences(&[resource_fence], true, FIVE_SECONDS_IN_NANOSECONDS)
+                .wait_for_fences(&[frame_graphics_fence], true, FIVE_SECONDS_IN_NANOSECONDS)
                 .expect("Unable to wait for fence to begin frame");
         }
 
         // Get the next image to render to. Has internal synchronization to ensure the previous acquire completed on the GPU.
-        let utils::NextFrame {
-            current_frame,
-            image_index,
-            ..
-        } = match self.swapchain.acquire_next_image() {
+        let utils::NextSwapchainImage { image_index, .. } = match self
+            .swapchain
+            .acquire_next_image()
+        {
             Ok(f) if !f.suboptimal => f,
 
             // TODO: Consider accepting suboptimal for this draw, but set a flag to recreate the swapchain next frame.
@@ -636,21 +678,20 @@ impl Renderer {
                 };
                 simulation.render_frame(
                     &self.logical_device,
-                    self.compute_command_pool
-                        .map(
-                            |(command_pool, compute_semaphore)| example_fluid::ComputeInfo {
-                                command_pool,
-                                compute_semaphore,
-                                compute_family_index: self.compute_queue.family_index,
-                                graphics_family_index: self.graphics_queue.family_index,
-                            },
-                        ),
+                    self.compute_command_pool.map(|(_, compute_semaphore)| {
+                        example_fluid::ComputeInfo {
+                            compute_semaphore,
+                            compute_family_index: self.compute_queue.family_index,
+                            graphics_family_index: self.graphics_queue.family_index,
+                        }
+                    }),
                     self.compute_queue.queue,
                     command_buffer,
                     extent,
                     image_index as usize,
                     push_constants,
                     *display_texture,
+                    frame_graphics_fence,
                 );
             }
         }
@@ -678,24 +719,32 @@ impl Renderer {
             ..Default::default()
         };
         unsafe {
-            if self.device_features.enabled_swapchain_maintenance {
+            if self
+                .device_extensions
+                .contains(ash::ext::swapchain_maintenance1::NAME)
+            {
                 self.logical_device
                     .wait_for_fences(&[presentation_fence], true, FIVE_SECONDS_IN_NANOSECONDS)
                     .expect("Unable to wait for fence to end frame");
             }
 
             self.logical_device
-                .reset_fences(&[resource_fence, presentation_fence])
+                .reset_fences(&[frame_graphics_fence, presentation_fence])
                 .expect("Unable to reset fence for this frame's resources");
             self.logical_device
-                .queue_submit(self.graphics_queue.queue, &[submit_info], resource_fence)
+                .queue_submit(
+                    self.graphics_queue.queue,
+                    &[submit_info],
+                    frame_graphics_fence,
+                )
                 .expect("Unable to submit command buffer");
         }
 
         // Queue the presentation of the swapchain image.
         match self.swapchain.present(
             self.presentation_queue.queue,
-            self.device_features.enabled_swapchain_maintenance,
+            self.device_extensions
+                .contains(ash::ext::swapchain_maintenance1::NAME),
         ) {
             Ok(_) => (),
             Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR) => {
@@ -756,7 +805,10 @@ impl Renderer {
     /// Wait for the GPU to finish processing all tasks submitted by this renderer.
     fn wait_for_tasks(&self) {
         unsafe {
-            if self.device_features.enabled_swapchain_maintenance {
+            if self
+                .device_extensions
+                .contains(ash::ext::swapchain_maintenance1::NAME)
+            {
                 let present_fences: SmallVec<[_; EXPECTED_MAX_FRAMES_IN_FLIGHT]> = self
                     .swapchain
                     .frame_syncs()
@@ -827,6 +879,7 @@ impl Renderer {
                     self.swapchain.image_views(),
                     self.compute_command_pool
                         .map_or(self.command_pool, |(pool, _)| pool),
+                    self.pageable_device_local_memory.as_ref(),
                 ));
 
                 self.wait_for_tasks();

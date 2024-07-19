@@ -380,7 +380,7 @@ impl Pipeline {
         .expect("vkCreateGraphicsPipelines returned an empty list of pipelines");
 
         // Create the framebuffers for this application.
-        let framebuffers = create_framebuffers(&device, &swapchain, render_pass, fxaa_pass);
+        let framebuffers = create_framebuffers(device, swapchain, render_pass, fxaa_pass);
 
         Self {
             handle: pipeline,

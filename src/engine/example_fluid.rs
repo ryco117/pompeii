@@ -1,5 +1,3 @@
-use smallvec::SmallVec;
-
 use crate::engine::utils::{
     self,
     shaders::{ENTRY_POINT_MAIN, FULLSCREEN_VERTEX},
@@ -60,6 +58,26 @@ pub struct PushConstants {
     pub vorticity_strength: f32,
 }
 
+/// Define the texture to display from the fluid simulation.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, strum::EnumCount, strum::FromRepr)]
+pub enum FluidDisplayTexture {
+    #[default]
+    Velocity,
+    Dye,
+    Pressure,
+    ColorField,
+}
+impl FluidDisplayTexture {
+    /// Get the next fluid display variant in a cycle of types.
+    pub fn next(self) -> Self {
+        FluidDisplayTexture::from_repr(
+        (self as u32)
+            .wrapping_add(1))
+            .unwrap_or(FluidDisplayTexture::Velocity)
+    }
+}
+
 /// Use a separate set of push constants to choose how to render the output of the fluid simulation.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -67,10 +85,11 @@ struct FragmentPushConstants {
     // GPU device addresses.
     pub velocity_buffer: ash::vk::DeviceAddress,
     pub dye_buffer: ash::vk::DeviceAddress,
+    pub pressure_buffer: ash::vk::DeviceAddress,
 
     // Fluid simulation parameters.
     pub screen_size: [u32; 2],
-    pub display_texture: u32,
+    pub display_texture: FluidDisplayTexture,
 }
 
 /// Create the render pass capable of orchestrating the rendering of framebuffers for this application.
@@ -158,6 +177,7 @@ impl AllocatedBuffer {
         memory_allocator: &mut gpu_allocator::vulkan::Allocator,
         buffer_info: &ash::vk::BufferCreateInfo,
         image_debug_name: &str,
+        pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
     ) -> Self {
         let (buffer, requirements) = unsafe {
             let buffer = device
@@ -168,8 +188,8 @@ impl AllocatedBuffer {
             // Ensure that the buffer is aligned to 16 bytes.
             // The shaders are each expecting the storage buffers to be aligned to 16 bytes.
             if requirements.alignment > 16 {
-                eprintln!(
-                    "Buffer alignment is not 16 bytes: {}",
+                println!(
+                    "INFO: Buffer alignment requirement is greater than 16 bytes: {}",
                     requirements.alignment
                 );
             } else {
@@ -188,7 +208,16 @@ impl AllocatedBuffer {
                 allocation_scheme: gpu_allocator::vulkan::AllocationScheme::DedicatedBuffer(buffer),
             })
             .expect("Unable to allocate the buffer for the fluid simulation");
-        unsafe { device.bind_buffer_memory(buffer, allocation.memory(), 0) }
+        let memory = unsafe { allocation.memory() };
+
+        // Optionally, set the memory priority to allow the driver to optimize the memory usage.
+        if let Some(device_ext) = pageable_device_local_memory {
+            unsafe {
+                (device_ext.fp().set_device_memory_priority_ext)(device.handle(), memory, 1.0);
+            };
+        }
+
+        unsafe { device.bind_buffer_memory(buffer, memory, allocation.offset()) }
             .expect("Unable to bind the buffer memory for the fluid simulation");
 
         let device_address = unsafe {
@@ -196,6 +225,11 @@ impl AllocatedBuffer {
                 &ash::vk::BufferDeviceAddressInfo::default().buffer(buffer),
             )
         };
+        #[cfg(debug_assertions)]
+        assert_ne!(
+            device_address, 0,
+            "The device address of the buffer is zero"
+        );
 
         Self {
             buffer,
@@ -226,6 +260,7 @@ pub fn create_framebuffers(
     extent: ash::vk::Extent2D,
     destination_views: &[ash::vk::ImageView],
     render_pass: ash::vk::RenderPass,
+    pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
 ) -> (Vec<ash::vk::Framebuffer>, [AllocatedBuffer; 8]) {
     // Create several images for storing the partial results of the fluid simulation each frame.
     // These images are not strictly part of the framebuffers, but are used in the fluid simulation and dependent on the size of the surface.
@@ -233,7 +268,7 @@ pub fn create_framebuffers(
         ash::vk::BufferUsageFlags::STORAGE_BUFFER
             | ash::vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
     );
-    let pixel_count = extent.width as u64 * extent.height as u64;
+    let pixel_count = u64::from(extent.width) * u64::from(extent.height);
 
     buffer_info.size = pixel_count * std::mem::size_of::<[f32; 2]>() as u64;
     let input_velocity_image = AllocatedBuffer::new(
@@ -241,6 +276,7 @@ pub fn create_framebuffers(
         memory_allocator,
         &buffer_info,
         "Fluid Sim input velocity buffer",
+        pageable_device_local_memory,
     );
 
     buffer_info.size = pixel_count * std::mem::size_of::<f32>() as u64;
@@ -249,24 +285,28 @@ pub fn create_framebuffers(
         memory_allocator,
         &buffer_info,
         "Fluid Sim curl buffer",
+        pageable_device_local_memory,
     );
     let divergence_image = AllocatedBuffer::new(
         device,
         memory_allocator,
         &buffer_info,
         "Fluid Sim divergence buffer",
+        pageable_device_local_memory,
     );
     let alpha_pressure_image = AllocatedBuffer::new(
         device,
         memory_allocator,
         &buffer_info,
         "Fluid Sim alpha pressure buffer",
+        pageable_device_local_memory,
     );
     let beta_pressure_image = AllocatedBuffer::new(
         device,
         memory_allocator,
         &buffer_info,
         "Fluid Sim beta pressure buffer",
+        pageable_device_local_memory,
     );
 
     buffer_info.size = pixel_count * std::mem::size_of::<[f32; 2]>() as u64;
@@ -275,6 +315,7 @@ pub fn create_framebuffers(
         memory_allocator,
         &buffer_info,
         "Fluid Sim output velocity buffer",
+        pageable_device_local_memory,
     );
 
     buffer_info.size = pixel_count * std::mem::size_of::<[f32; 4]>() as u64;
@@ -283,12 +324,14 @@ pub fn create_framebuffers(
         memory_allocator,
         &buffer_info,
         "Fluid Sim input dye buffer",
+        pageable_device_local_memory,
     );
     let output_dye_image = AllocatedBuffer::new(
         device,
         memory_allocator,
         &buffer_info,
         "Fluid Sim output dye buffer",
+        pageable_device_local_memory,
     );
 
     // The actual render pass framebuffers simply draw to the destination views as color attachments.
@@ -540,19 +583,15 @@ fn create_graphics_pipeline(
         .rasterization_samples(ash::vk::SampleCountFlags::TYPE_1)
         .min_sample_shading(1.); // Only does something when `sample_shading_enable` is true.
 
-    let color_blend_attachment = ash::vk::PipelineColorBlendAttachmentState {
-        blend_enable: ash::vk::FALSE, // TODO: Enable blending for the color attachment.
-        color_write_mask: ash::vk::ColorComponentFlags::R
-            | ash::vk::ColorComponentFlags::G
-            | ash::vk::ColorComponentFlags::B
-            | ash::vk::ColorComponentFlags::A,
-        ..Default::default()
-    };
-    let color_blending = ash::vk::PipelineColorBlendStateCreateInfo {
-        attachment_count: 1,
-        p_attachments: &color_blend_attachment,
-        ..Default::default()
-    };
+    let color_blend_attachments = [ash::vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(
+            ash::vk::ColorComponentFlags::R
+                | ash::vk::ColorComponentFlags::G
+                | ash::vk::ColorComponentFlags::B
+                | ash::vk::ColorComponentFlags::A,
+        )];
+    let color_blending =
+        ash::vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
 
     unsafe {
         device.create_graphics_pipelines(
@@ -581,7 +620,6 @@ fn create_graphics_pipeline(
 /// When the graphics and compute queues are in separate families, additional information is required to synchronize the compute and graphics operations.
 #[derive(Clone, Copy, Debug)]
 pub struct ComputeInfo {
-    pub command_pool: ash::vk::CommandPool,
     pub compute_semaphore: ash::vk::Semaphore,
     pub compute_family_index: u32,
     pub graphics_family_index: u32,
@@ -596,8 +634,9 @@ pub struct FluidSimulation {
     compute_pipelines: FluidComputeStages,
     graphics_pipeline: ash::vk::Pipeline,
     framebuffers: Vec<ash::vk::Framebuffer>,
-    allocated_images: SmallVec<[AllocatedBuffer; 8]>,
+    allocated_images: Vec<AllocatedBuffer>,
     compute_fence: ash::vk::Fence,
+    graphics_fence: Option<ash::vk::Fence>,
     compute_command_buffer: ash::vk::CommandBuffer,
 }
 impl FluidSimulation {
@@ -610,6 +649,7 @@ impl FluidSimulation {
         destination_layout: ash::vk::ImageLayout,
         destination_views: &[ash::vk::ImageView],
         compute_command_pool: ash::vk::CommandPool,
+        pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
     ) -> Self {
         let shaders = FluidShaders::new(device);
         let [compute_pipeline_layout, graphics_pipeline_layout] = create_pipeline_layout(device);
@@ -626,6 +666,7 @@ impl FluidSimulation {
             extent,
             destination_views,
             render_pass,
+            pageable_device_local_memory,
         );
 
         // Create the compute fence to ensure that compute resources can be accessed by the CPU after queue submission.
@@ -659,6 +700,7 @@ impl FluidSimulation {
             framebuffers,
             allocated_images: allocated_images.into(),
             compute_fence,
+            graphics_fence: None,
             compute_command_buffer,
         }
     }
@@ -702,9 +744,29 @@ impl FluidSimulation {
         memory_allocator: &mut gpu_allocator::vulkan::Allocator,
         extent: ash::vk::Extent2D,
         destination_views: &[ash::vk::ImageView],
+        pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
     ) {
-        // unsafe { device.wait_for_fences(&[self.compute_fence], true, FIVE_SECONDS_IN_NANOSECONDS) }
-        //     .expect("Unable to wait for the compute fence to signal");
+        // Wait for the compute fence to ensure all resources are available.
+        unsafe {
+            let fences = [
+                self.compute_fence,
+                self.graphics_fence.take().unwrap_or_default(),
+            ];
+            device
+                .wait_for_fences(
+                    if self.graphics_fence.is_some() {
+                        &fences
+                    } else {
+                        &fences[..1]
+                    },
+                    true,
+                    FIVE_SECONDS_IN_NANOSECONDS,
+                )
+                .expect(
+                    "Failed to wait for the compute or graphics fence for the fluid simulation",
+                );
+        }
+
         unsafe {
             device.destroy_fence(self.compute_fence, None);
             self.compute_fence = device
@@ -729,6 +791,7 @@ impl FluidSimulation {
             extent,
             destination_views,
             self.render_pass,
+            pageable_device_local_memory,
         );
         self.framebuffers = framebuffers;
         self.allocated_images = allocated_images.into();
@@ -752,7 +815,7 @@ impl FluidSimulation {
                 .begin_command_buffer(self.compute_command_buffer, &command_buffer_begin_info)
                 .expect(
                     "Failed to begin recording a compute command buffer for the fluid simulation",
-                )
+                );
         };
 
         // Helper lambda to add memory barriers to the command buffer.
@@ -783,10 +846,10 @@ impl FluidSimulation {
                 utils::data_byte_slice(push_constants),
             );
 
-            // NOTE: The use of `16` here is directly related to the workgroup size in the compute shaders.
-            // 16*16=256 is a multiple of 64 to accommodate NVIDIA and AMD physical hardware.
-            let workgroups_x = extent.width / 16 + 1;
-            let workgroups_y = extent.height / 16 + 1;
+            // NOTE: The use of `8` here is directly related to the local group size in the compute shaders.
+            // 8*8=64 is a multiple of 64 to accommodate NVIDIA and AMD physical hardware.
+            let workgroups_x = extent.width / 8 + u32::from(extent.width % 8 != 0);
+            let workgroups_y = extent.height / 8 + u32::from(extent.height % 8 != 0);
 
             // Apply the curl compute shader.
             device.cmd_bind_pipeline(
@@ -900,7 +963,7 @@ impl FluidSimulation {
                 ..
             }) = compute_info
             {
-                let pixel_count = extent.width as u64 * extent.height as u64;
+                let pixel_count = u64::from(extent.width) * u64::from(extent.height);
                 let velocity_memory_barrier = ash::vk::BufferMemoryBarrier2::default()
                     .src_stage_mask(ash::vk::PipelineStageFlags2::COMPUTE_SHADER)
                     .src_access_mask(ash::vk::AccessFlags2::SHADER_WRITE)
@@ -941,13 +1004,26 @@ impl FluidSimulation {
         extent: ash::vk::Extent2D,
         image_index: usize,
         push_constants: &PushConstants,
-        display_texture: u32, // TODO: Use an enum to differentiate the available options.
+        display_texture: FluidDisplayTexture,
+        current_graphics_fence: ash::vk::Fence,
     ) {
         // Wait for the compute fence to ensure all resources are available.
         unsafe {
+            let fences = [self.compute_fence, self.graphics_fence.unwrap_or_default()];
             device
-                .wait_for_fences(&[self.compute_fence], true, FIVE_SECONDS_IN_NANOSECONDS)
-                .expect("Failed to wait for the compute fence for the fluid simulation");
+                .wait_for_fences(
+                    if self.graphics_fence.is_some() {
+                        &fences
+                    } else {
+                        &fences[..1]
+                    },
+                    true,
+                    FIVE_SECONDS_IN_NANOSECONDS,
+                )
+                .expect(
+                    "Failed to wait for the compute or graphics fence for the fluid simulation",
+                );
+            self.graphics_fence = Some(current_graphics_fence);
         }
 
         // Record the compute commands for the fluid simulation to the desired command buffer.
@@ -980,9 +1056,10 @@ impl FluidSimulation {
         // Ensure that the graphics command buffer has the proper push constants bound.
         unsafe {
             let push_constants = FragmentPushConstants {
-                screen_size: [extent.width, extent.height],
                 velocity_buffer: self.allocated_images[5].device_address,
                 dye_buffer: self.allocated_images[7].device_address,
+                pressure_buffer: self.allocated_images[3].device_address,
+                screen_size: [extent.width, extent.height],
                 display_texture,
             };
             device.cmd_push_constants(
@@ -1080,9 +1157,9 @@ impl FluidSimulation {
             screen_size: [extent.width, extent.height],
 
             delta_time,
-            velocity_diffusion_rate: 0.14,
+            velocity_diffusion_rate: 0.12,
             dye_diffusion_rate: 0.9,
-            vorticity_strength: 50.,
+            vorticity_strength: 22.,
         }
     }
 }

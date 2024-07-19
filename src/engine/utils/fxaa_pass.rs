@@ -69,7 +69,6 @@ impl Pipeline {
             .rasterization_samples(ash::vk::SampleCountFlags::TYPE_1);
 
         // Define the color blend state.
-        // TODO: This is likely overkill for FXAA post-processing.
         let color_blend_attachment = [ash::vk::PipelineColorBlendAttachmentState {
             src_color_blend_factor: ash::vk::BlendFactor::SRC_ALPHA,
             dst_color_blend_factor: ash::vk::BlendFactor::ONE_MINUS_SRC_ALPHA,

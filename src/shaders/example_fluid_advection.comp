@@ -3,7 +3,7 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_scalar_block_layout : require
 
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer InputVelocityTexture {
   vec2 v[];
@@ -27,7 +27,7 @@ layout(scalar, buffer_reference, buffer_reference_align = 16) writeonly buffer O
   vec4 c[];
 };
 
-layout(push_constant) uniform PushConstants {
+layout(scalar, push_constant) uniform PushConstants {
   // Store GPU pointers to each texture/buffer.
   InputVelocityTexture input_velocity;
   CurlTexture curl;
@@ -53,24 +53,30 @@ int texture_index(ivec2 uv) {
   return uv.y * push_constants.screen_size.x + uv.x;
 }
 
-vec2 bilerp_velocity(ivec2 uv) {
-  vec2 a = push_constants.input_velocity.v[texture_index(uv + ivec2(-1, -1))];
-  vec2 b = push_constants.input_velocity.v[texture_index(uv + ivec2(1, -1))];
-  vec2 c = push_constants.input_velocity.v[texture_index(uv + ivec2(-1, 1))];
-  vec2 d = push_constants.input_velocity.v[texture_index(uv + ivec2(1, 1))];
-  vec2 e = push_constants.input_velocity.v[texture_index(uv)];
+vec2 bilerp_velocity(vec2 uv) {
+  vec2 st = uv - 0.5;
+  vec2 iuv = floor(st);
+  vec2 fuv = fract(st);
 
-  return 0.125 * (a + b + c + d) + 0.5 * e;
+  vec2 a = push_constants.input_velocity.v[texture_index(ivec2(iuv + vec2(0.5, 0.5)))];
+  vec2 b = push_constants.input_velocity.v[texture_index(ivec2(iuv + vec2(1.5, 0.5)))];
+  vec2 c = push_constants.input_velocity.v[texture_index(ivec2(iuv + vec2(0.5, 1.5)))];
+  vec2 d = push_constants.input_velocity.v[texture_index(ivec2(iuv + vec2(1.5, 1.5)))];
+
+  return mix(mix(a, b, fuv.x), mix(c, d, fuv.x), fuv.y);
 }
 
-vec4 bilerp_dye(ivec2 uv) {
-  vec4 a = push_constants.input_dye.c[texture_index(uv + ivec2(-1, -1))];
-  vec4 b = push_constants.input_dye.c[texture_index(uv + ivec2(1, -1))];
-  vec4 c = push_constants.input_dye.c[texture_index(uv + ivec2(-1, 1))];
-  vec4 d = push_constants.input_dye.c[texture_index(uv + ivec2(1, 1))];
-  vec4 e = push_constants.input_dye.c[texture_index(uv)];
+vec4 bilerp_dye(vec2 uv) {
+  vec2 st = uv - 0.5;
+  vec2 iuv = floor(st);
+  vec2 fuv = fract(st);
 
-  return 0.125 * (a + b + c + d) + 0.5 * e;
+  vec4 a = push_constants.input_dye.c[texture_index(ivec2(iuv + vec2(0.5, 0.5)))];
+  vec4 b = push_constants.input_dye.c[texture_index(ivec2(iuv + vec2(1.5, 0.5)))];
+  vec4 c = push_constants.input_dye.c[texture_index(ivec2(iuv + vec2(0.5, 1.5)))];
+  vec4 d = push_constants.input_dye.c[texture_index(ivec2(iuv + vec2(1.5, 1.5)))];
+
+  return mix(mix(a, b, fuv.x), mix(c, d, fuv.x), fuv.y);
 }
 
 // Perform the main advection step of the fluid simulation along the velocity and dye fields.
@@ -85,8 +91,8 @@ void main() {
   const vec2 velocity = bilerp_velocity(coords);
 
   // Move the field texture coordinates backwards along the velocity vector to get a reference coordinate for advection.
-  const ivec2 reference_coord = ivec2(gl_GlobalInvocationID.xy - push_constants.delta_time * velocity);
-  const int reference_index = texture_index(reference_coord);
+  // Add 0.5 to the coordinates to sample the texture at the center of the pixel.
+  const vec2 reference_coord = gl_GlobalInvocationID.xy + vec2(0.5) - push_constants.delta_time * velocity;
 
   const float velocity_diffusion = exp(-push_constants.velocity_diffusion_rate * push_constants.delta_time);
   vec2 new_velocity = velocity_diffusion * bilerp_velocity(reference_coord);
@@ -95,8 +101,8 @@ void main() {
   vec3 new_dye = dye_diffusion * bilerp_dye(reference_coord).rgb;
 
   // Apply additional velocity and fluid from the cursor. Use ~1/70th of the screen size as a distance threshold.
-  const vec2 cursor_distance = 70.0 * (push_constants.cursor_position - gl_GlobalInvocationID.xy) / min(push_constants.screen_size.x, push_constants.screen_size.y);
-  const float cursor_effect = exp(-dot(cursor_distance, cursor_distance));
+  const vec2 cursor_distance = 70.0 * (push_constants.cursor_position - gl_GlobalInvocationID.xy) / max(1, min(push_constants.screen_size.x, push_constants.screen_size.y));
+  const float cursor_effect = push_constants.cursor_dye.a*exp(-dot(cursor_distance, cursor_distance));
   new_velocity = mix(new_velocity, push_constants.cursor_velocity, cursor_effect);
   new_dye = mix(new_dye, push_constants.cursor_dye.rgb, cursor_effect);
 

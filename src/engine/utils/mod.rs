@@ -1,6 +1,9 @@
-use std::{collections::HashSet, ffi::CStr, num::NonZeroU32};
+use std::{
+    collections::HashSet,
+    ffi::{c_void, CStr},
+    num::NonZeroU32,
+};
 
-use ash::ext::{buffer_device_address, descriptor_indexing};
 use smallvec::SmallVec;
 use strum::EnumCount as _;
 
@@ -266,42 +269,22 @@ pub fn query_physical_feature_support(
     let mut feature_chain = ash::vk::PhysicalDeviceFeatures2::default();
 
     // Ensure there are no circular references in the feature chain.
-    requested_features.clear_pointer();
+    requested_features.clear_pointers();
 
     let mut dynamic_rendering = ash::vk::PhysicalDeviceDynamicRenderingFeatures::default();
     let mut synchronization2 = ash::vk::PhysicalDeviceSynchronization2Features::default();
+    let mut pageable_device_local_memory =
+        ash::vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT::default();
     let mut ray_query = ash::vk::PhysicalDeviceRayQueryFeaturesKHR::default();
 
-    if requested_features
-        .acceleration_structure
-        .acceleration_structure
-        == ash::vk::TRUE
-    {
-        feature_chain = feature_chain.push_next(&mut requested_features.acceleration_structure);
-    }
-    if requested_features
-        .buffer_device_address
-        .buffer_device_address
-        == ash::vk::TRUE
-    {
-        feature_chain = feature_chain.push_next(&mut requested_features.buffer_device_address);
-    }
-
-    // Unconditionally apply `descriptor_indexing` features.
+    feature_chain = feature_chain.push_next(&mut requested_features.acceleration_structure);
+    feature_chain = feature_chain.push_next(&mut requested_features.buffer_device_address);
     feature_chain = feature_chain.push_next(&mut requested_features.descriptor_indexing);
-
-    if requested_features.dynamic_rendering {
-        feature_chain = feature_chain.push_next(&mut dynamic_rendering);
-    }
-    if requested_features.synchronization2 {
-        feature_chain = feature_chain.push_next(&mut synchronization2);
-    }
-    if requested_features.ray_query {
-        feature_chain = feature_chain.push_next(&mut ray_query);
-    }
-    if requested_features.ray_tracing.ray_tracing_pipeline == ash::vk::TRUE {
-        feature_chain = feature_chain.push_next(&mut requested_features.ray_tracing);
-    }
+    feature_chain = feature_chain.push_next(&mut dynamic_rendering);
+    feature_chain = feature_chain.push_next(&mut synchronization2);
+    feature_chain = feature_chain.push_next(&mut pageable_device_local_memory);
+    feature_chain = feature_chain.push_next(&mut ray_query);
+    feature_chain = feature_chain.push_next(&mut requested_features.ray_tracing);
 
     let features = {
         // Query the physical device for the selected features.
@@ -310,12 +293,14 @@ pub fn query_physical_feature_support(
     };
 
     // Update the caller's feature struct with the results.
-    requested_features.dynamic_rendering = dynamic_rendering.dynamic_rendering > 0;
-    requested_features.synchronization2 = synchronization2.synchronization2 > 0;
-    requested_features.ray_query = ray_query.ray_query > 0;
+    requested_features.dynamic_rendering = dynamic_rendering.dynamic_rendering == ash::vk::TRUE;
+    requested_features.synchronization2 = synchronization2.synchronization2 == ash::vk::TRUE;
+    requested_features.pageable_device_local_memory =
+        pageable_device_local_memory.pageable_device_local_memory == ash::vk::TRUE;
+    requested_features.ray_query = ray_query.ray_query == ash::vk::TRUE;
 
     // Don't confuse the caller with pointers to features.
-    requested_features.clear_pointer();
+    requested_features.clear_pointers();
 
     // Return the features described in the default structure.
     features
@@ -369,6 +354,9 @@ pub struct EnginePhysicalDeviceFeatures {
     /// Corresponds to `VkPhysicalDeviceDynamicRenderingFeatures`.
     pub dynamic_rendering: bool,
 
+    /// Corresponds to `VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT`.
+    pub pageable_device_local_memory: bool,
+
     /// Corresponds to `VkPhysicalDeviceRayQueryFeaturesKHR`.
     pub ray_query: bool,
 
@@ -385,20 +373,22 @@ impl EnginePhysicalDeviceFeatures {
     pub fn contains_mask(self, mask: &EnginePhysicalDeviceFeatures) -> bool {
         (mask.acceleration_structure.acceleration_structure != ash::vk::TRUE
             || self.acceleration_structure.acceleration_structure == ash::vk::TRUE)
-            && (mask.buffer_device_address.buffer_device_address == ash::vk::TRUE
+            && (mask.buffer_device_address.buffer_device_address != ash::vk::TRUE
                 || self.buffer_device_address.buffer_device_address == ash::vk::TRUE)
             && (!mask.dynamic_rendering || self.dynamic_rendering)
-            && (!mask.synchronization2 || self.synchronization2)
+            && (!mask.pageable_device_local_memory || self.pageable_device_local_memory)
             && (!mask.ray_query || self.ray_query)
             && (mask.ray_tracing.ray_tracing_pipeline != ash::vk::TRUE
                 || self.ray_tracing.ray_tracing_pipeline == ash::vk::TRUE)
+            && (!mask.synchronization2 || self.synchronization2)
     }
 
     /// Clear all feature pointers to `NULL` or `0` to indicate that no features are enabled.
-    fn clear_pointer(&mut self) {
-        self.acceleration_structure.p_next = std::ptr::null_mut::<std::ffi::c_void>();
-        self.buffer_device_address.p_next = std::ptr::null_mut::<std::ffi::c_void>();
-        self.ray_tracing.p_next = std::ptr::null_mut::<std::ffi::c_void>();
+    fn clear_pointers(&mut self) {
+        self.acceleration_structure.p_next = std::ptr::null_mut::<c_void>();
+        self.buffer_device_address.p_next = std::ptr::null_mut::<c_void>();
+        self.descriptor_indexing.p_next = std::ptr::null_mut::<c_void>();
+        self.ray_tracing.p_next = std::ptr::null_mut::<c_void>();
     }
 }
 
@@ -407,10 +397,13 @@ pub fn get_sorted_physical_devices(
     instance: &ash::Instance,
     minimum_version: u32,
     required_extensions: &[*const i8],
-    required_features: EnginePhysicalDeviceFeatures,
+    required_features: &EnginePhysicalDeviceFeatures,
 ) -> SmallVec<
-    [(ash::vk::PhysicalDevice, ash::vk::PhysicalDeviceProperties);
-        EXPECTED_MAX_VULKAN_PHYSICAL_DEVICES],
+    [(
+        ash::vk::PhysicalDevice,
+        ash::vk::PhysicalDeviceProperties,
+        EnginePhysicalDeviceFeatures,
+    ); EXPECTED_MAX_VULKAN_PHYSICAL_DEVICES],
 > {
     /// A helper for scoring a device's dedication to graphics processing.
     fn score_device_type(device_type: ash::vk::PhysicalDeviceType) -> u8 {
@@ -456,9 +449,9 @@ pub fn get_sorted_physical_devices(
             }
 
             // Ensure the device supports all required features.
-            let mut copy_features = required_features;
+            let mut copy_features = *required_features;
             let _ = query_physical_feature_support(instance, device, &mut copy_features);
-            if !copy_features.contains_mask(&required_features) {
+            if !copy_features.contains_mask(required_features) {
                 #[cfg(debug_assertions)]
                 println!("Physical device {device:?}: does not support all the required features {required_features:?}: Actual features {copy_features:?}");
                 return None;
@@ -475,12 +468,12 @@ pub fn get_sorted_physical_devices(
                 }
                 exists
             }) {
-                Some((device, properties))
+                Some((device, properties, copy_features))
             } else {
                 None
             }
         })
-        .collect::<SmallVec<[(ash::vk::PhysicalDevice, ash::vk::PhysicalDeviceProperties); 4]>>();
+        .collect::<SmallVec<[(ash::vk::PhysicalDevice, ash::vk::PhysicalDeviceProperties, EnginePhysicalDeviceFeatures); 4]>>();
 
     #[cfg(debug_assertions)]
     if physical_devices.spilled() {
@@ -492,7 +485,7 @@ pub fn get_sorted_physical_devices(
     }
 
     // Sort the physical devices by the device type with preference for GPU's, then descending by graphics dedication.
-    physical_devices.sort_by(|(_, a), (_, b)| {
+    physical_devices.sort_by(|(_, a, _), (_, b, _)| {
         // Sorting order is reversed (`b.cmp(a)`) to sort the highest scoring device first.
         let device_type_cmp =
             score_device_type(b.device_type).cmp(&score_device_type(a.device_type));
@@ -869,8 +862,7 @@ pub struct Swapchain {
 }
 
 /// The result of acquiring the next image from the swapchain and advancing to the next frame in flight.
-pub struct NextFrame {
-    pub current_frame: usize,
+pub struct NextSwapchainImage {
     pub image_view: ash::vk::ImageView,
     pub image_index: u32,
     pub suboptimal: bool,
@@ -1329,7 +1321,7 @@ impl Swapchain {
     }
 
     /// Acquire the next image in the swapchain. Maintain the index of the acquired image.
-    pub fn acquire_next_image(&mut self) -> ash::prelude::VkResult<NextFrame> {
+    pub fn acquire_next_image(&mut self) -> ash::prelude::VkResult<NextSwapchainImage> {
         // Acquire the next image in the swapchain, using the same fence to signal completion.
         let (acquired_index, suboptimal) = unsafe {
             self.swapchain_device.acquire_next_image(
@@ -1343,8 +1335,7 @@ impl Swapchain {
         // Update our internal state with the acquired image's index.
         self.acquired_index = Some(acquired_index);
 
-        Ok(NextFrame {
-            current_frame: self.current_frame,
+        Ok(NextSwapchainImage {
             image_view: self.image_views[acquired_index as usize],
             image_index: acquired_index,
             suboptimal,
@@ -1536,11 +1527,9 @@ pub fn new_device_buffer(
     // Create a staging buffer to copy the data to the device-local buffer.
     let staging_buffer = unsafe {
         device.create_buffer(
-            &ash::vk::BufferCreateInfo {
-                size: data.len() as u64,
-                usage: ash::vk::BufferUsageFlags::TRANSFER_SRC,
-                ..Default::default()
-            },
+            &ash::vk::BufferCreateInfo::default()
+                .size(data.len() as u64)
+                .usage(ash::vk::BufferUsageFlags::TRANSFER_SRC),
             None,
         )?
     };
@@ -1576,12 +1565,12 @@ pub fn new_device_buffer(
     // Create the device-local buffer.
     let device_buffer = unsafe {
         device.create_buffer(
-            &ash::vk::BufferCreateInfo {
-                size: data.len() as u64,
-                usage: ash::vk::BufferUsageFlags::TRANSFER_DST
-                    | ash::vk::BufferUsageFlags::STORAGE_BUFFER,
-                ..Default::default()
-            },
+            &ash::vk::BufferCreateInfo::default()
+                .size(data.len() as u64)
+                .usage(
+                    ash::vk::BufferUsageFlags::TRANSFER_DST
+                        | ash::vk::BufferUsageFlags::STORAGE_BUFFER,
+                ),
             None,
         )?
     };

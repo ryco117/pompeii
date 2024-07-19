@@ -6,7 +6,7 @@
 // Use a toggle to invert which buffer is read from and which is written to.
 layout(constant_id = 0) const bool read_from_alpha = false;
 
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer VelocityTexture {
   vec2 v[];
@@ -24,7 +24,7 @@ layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer Dy
   vec4 c[];
 };
 
-layout(push_constant) uniform PushConstants {
+layout(scalar, push_constant) uniform PushConstants {
   // Store GPU pointers to each texture/buffer.
   VelocityTexture input_velocity;
   CurlTexture curl;

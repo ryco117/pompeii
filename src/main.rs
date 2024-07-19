@@ -1,4 +1,4 @@
-use std::{ffi::CStr, ops::Neg};
+use std::ffi::CStr;
 
 use smallvec::SmallVec;
 use winit::{
@@ -17,7 +17,10 @@ const TICK_SAMPLING_LENGTH: u64 = 6_000;
 
 mod cli;
 mod engine;
-use engine::utils::{self, SwapchainPreferences};
+use engine::{
+    example_fluid::FluidDisplayTexture,
+    utils::{self, SwapchainPreferences},
+};
 
 fn main() {
     // Parse the command-line arguments.
@@ -69,8 +72,9 @@ struct PompeiiApp {
     start_time: std::time::Instant,
     last_frame_time: Option<std::time::Instant>,
     last_mouse_position: Option<(winit::dpi::PhysicalPosition<f64>, std::time::Instant)>,
+    mouse_click: Option<[f32; 2]>,
     mouse_velocity: [f32; 2],
-    user_toggle: bool,
+    user_toggles: u32,
 }
 
 impl PompeiiApp {
@@ -122,8 +126,9 @@ impl PompeiiApp {
             start_time: std::time::Instant::now(),
             last_frame_time: None,
             last_mouse_position: None,
+            mouse_click: None,
             mouse_velocity: [0., 0.],
-            user_toggle: false,
+            user_toggles: 0,
         }
     }
 
@@ -201,29 +206,26 @@ impl PompeiiApp {
                 let dye_cycle = 12. * time;
                 let push_constants = fluid.new_push_constants(
                     extent,
-                    self.last_mouse_position.map_or([-1.; 2], |m| m.0.into()),
+                    self.last_mouse_position.map_or([-1024.; 2], |m| m.0.into()),
                     self.mouse_velocity,
                     [
-                        ((dye_cycle - 0.86).sin() + 0.5).max(0.) * (2. / 3.),
-                        (-dye_cycle.sin()).max(0.),
-                        dye_cycle.cos().max(0.),
-                        ((self.mouse_velocity[0] * self.mouse_velocity[0]
-                            + self.mouse_velocity[1] * self.mouse_velocity[1])
-                            .sqrt()
-                            + 1.)
-                            .ln()
-                            .neg()
-                            .exp(),
+                        ((dye_cycle - 0.7).sin() + 0.5).max(0.) * (2. / 3.),
+                        ((-dye_cycle - 0.3).sin() + 0.2).max(0.) * (5. / 6.),
+                        (dye_cycle - 0.1).cos().max(0.),
+                        f32::from(self.mouse_click.is_none()),
                     ],
                     delta_time,
                 );
-                engine::DemoPushConstants::Fluid(push_constants, self.user_toggle.into())
+                engine::DemoPushConstants::Fluid(
+                    push_constants,
+                    FluidDisplayTexture::from_repr(self.user_toggles).unwrap_or_default(),
+                )
             }
         };
 
         {
             // Decay constants.
-            let decay = (-2. * delta_time).exp();
+            let decay = (-8. * delta_time).exp();
             self.mouse_velocity[0] *= decay;
             self.mouse_velocity[1] *= decay;
         }
@@ -268,24 +270,31 @@ impl PompeiiApp {
 
                 // Handle the `T` key to toggle the user toggle.
                 winit::keyboard::Key::Character("t") => {
-                    self.user_toggle = !self.user_toggle;
-                    println!("User toggle is now {}", self.user_toggle);
+                    let Some(PompeiiGraphics { renderer, .. }) = &mut self.graphics else {
+                        return;
+                    };
 
-                    // Update the specialization constants for the renderer.
-                    if let Some(PompeiiGraphics { renderer, .. }) = &mut self.graphics {
-                        match &renderer.active_demo {
-                            engine::DemoPipeline::Triangle(_) => {
-                                renderer.update_specialization_constants(
-                                    engine::DemoSpecializationConstants::Triangle(
-                                        engine::example_triangle::SpecializationConstants {
-                                            toggle: u32::from(self.user_toggle),
-                                        },
-                                    ),
-                                );
-                            }
-                            engine::DemoPipeline::Fluid(_) => {}
+                    match &renderer.active_demo {
+                        engine::DemoPipeline::Triangle(_) => {
+                            self.user_toggles = (self.user_toggles + 1) % 2;
+
+                            // Update the specialization constants for the renderer.
+                            renderer.update_specialization_constants(
+                                engine::DemoSpecializationConstants::Triangle(
+                                    engine::example_triangle::SpecializationConstants {
+                                        toggle: self.user_toggles,
+                                    },
+                                ),
+                            );
+                        }
+                        engine::DemoPipeline::Fluid(_) => {
+                            self.user_toggles = FluidDisplayTexture::from_repr(self.user_toggles)
+                                .map(FluidDisplayTexture::next)
+                                .unwrap_or_default()
+                                as u32;
                         }
                     }
+                    println!("User toggle is now {}", self.user_toggles);
                 }
 
                 winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab) => {
@@ -298,10 +307,12 @@ impl PompeiiApp {
                         engine::DemoPipeline::Triangle(_) => engine::NewDemo::Fluid,
                         engine::DemoPipeline::Fluid(_) => engine::NewDemo::Triangle(
                             engine::example_triangle::SpecializationConstants {
-                                toggle: u32::from(self.user_toggle),
+                                toggle: self.user_toggles,
                             },
                         ),
                     };
+
+                    println!("Switching to new demo: {new_demo:?}");
                     renderer.switch_demo(new_demo);
                 }
                 _ => (),
@@ -364,11 +375,7 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
             &self.vulkan,
             surface,
             swapchain_preferences,
-            engine::DemoSpecializationConstants::Triangle(
-                engine::example_triangle::SpecializationConstants {
-                    toggle: u32::from(self.user_toggle),
-                },
-            ),
+            engine::DemoSpecializationConstants::Fluid,
             self.args.fxaa,
         );
 
@@ -410,12 +417,27 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
                             (position.x - last_position.x) / delta_time,
                             (position.y - last_position.y) / delta_time,
                         );
-                        [delta.0 as f32, delta.1 as f32]
+                        [
+                            0.6 * (delta.0 as f32) + 0.4 * self.mouse_velocity[0],
+                            0.6 * (delta.1 as f32) + 0.4 * self.mouse_velocity[1],
+                        ]
                     }
                     None => [0.; 2],
                 };
 
                 self.last_mouse_position = Some((position, now));
+            }
+            winit::event::WindowEvent::MouseInput {
+                button: winit::event::MouseButton::Left,
+                state,
+                ..
+            } => {
+                if matches!(state, winit::event::ElementState::Pressed) {
+                    self.mouse_click =
+                        Some(self.last_mouse_position.map_or([-1024.; 2], |m| m.0.into()));
+                } else {
+                    self.mouse_click = None;
+                }
             }
 
             // Ignore other events.
