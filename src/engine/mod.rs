@@ -1,6 +1,5 @@
 use std::{collections::HashSet, ffi::CStr};
 
-use example_fluid::FluidDisplayTexture;
 use smallvec::{smallvec, SmallVec};
 use utils::{fxaa_pass::FxaaPass, EXPECTED_MAX_FRAMES_IN_FLIGHT, FIVE_SECONDS_IN_NANOSECONDS};
 
@@ -21,7 +20,7 @@ pub enum DemoPipeline {
 /// Each demo needs a unique set of information to render each frame.
 pub enum DemoPushConstants {
     Triangle(example_triangle::PushConstants),
-    Fluid(example_fluid::PushConstants, FluidDisplayTexture),
+    Fluid(example_fluid::PushConstants),
 }
 
 /// Define which rendering objects are necessary for this application.
@@ -32,22 +31,22 @@ pub struct Renderer {
     pageable_device_local_memory: Option<ash::ext::pageable_device_local_memory::Device>,
 
     pub surface: ash::vk::SurfaceKHR,
-    pub memory_allocator: gpu_allocator::vulkan::Allocator,
+    memory_allocator: gpu_allocator::vulkan::Allocator,
     pub swapchain: utils::Swapchain,
 
     // The specific object we are interested in rendering.
     pub active_demo: DemoPipeline,
 
-    pub graphics_queue: utils::IndexedQueue,
-    pub compute_queue: utils::IndexedQueue,
-    pub presentation_queue: utils::IndexedQueue,
-    pub command_pool: ash::vk::CommandPool,
-    pub compute_command_pool: Option<(ash::vk::CommandPool, ash::vk::Semaphore)>, // Optional compute command pool and compute semaphore if the graphics and compute queue families are separate.
+    graphics_queue: utils::IndexedQueue,
+    compute_queue: utils::IndexedQueue,
+    presentation_queue: utils::IndexedQueue,
+    command_pool: ash::vk::CommandPool,
+    compute_command_pool: Option<(ash::vk::CommandPool, ash::vk::Semaphore)>, // Optional compute command pool and compute semaphore if the graphics and compute queue families are separate.
 
-    pub command_buffers: Vec<ash::vk::CommandBuffer>,
-    pub frame_fences: Vec<ash::vk::Fence>,
+    command_buffers: Vec<ash::vk::CommandBuffer>,
+    frame_fences: Vec<ash::vk::Fence>,
 
-    pub fxaa_pass: Option<FxaaPass>,
+    fxaa_pass: Option<FxaaPass>,
     pub swapchain_preferences: utils::SwapchainPreferences,
 }
 
@@ -82,13 +81,15 @@ impl Renderer {
         let required_device_features = utils::EnginePhysicalDeviceFeatures {
             buffer_device_address: ash::vk::PhysicalDeviceBufferDeviceAddressFeatures::default()
                 .buffer_device_address(true),
-            dynamic_rendering: true,
-            synchronization2: true,
+            dynamic_rendering: ash::vk::PhysicalDeviceDynamicRenderingFeatures::default()
+                .dynamic_rendering(true),
+            synchronization2: ash::vk::PhysicalDeviceSynchronization2Features::default()
+                .synchronization2(true),
             ..Default::default()
         };
 
         // Use simple heuristics to find the best suitable physical device.
-        let (physical_device, device_properties, device_features) =
+        let (physical_device, device_properties, mut device_features) =
             *utils::get_sorted_physical_devices(
                 &vulkan.instance,
                 vulkan.version,
@@ -122,7 +123,7 @@ impl Renderer {
                     ash::ext::swapchain_maintenance1::NAME,
                 ) {
                     #[cfg(debug_assertions)]
-                    println!("Enabling VK_EXT_swapchain_maintenance1 device extension");
+                    println!("INFO: Enabling VK_EXT_swapchain_maintenance1 device extension");
                     custom_extensions.push(ash::ext::swapchain_maintenance1::NAME.as_ptr());
 
                     true
@@ -140,10 +141,10 @@ impl Renderer {
             ash::ext::pageable_device_local_memory::NAME,
         ) {
             #[cfg(debug_assertions)]
-            println!("Enabling VK_EXT_memory_priority device extension");
+            println!("INFO: Enabling VK_EXT_memory_priority device extension");
             custom_extensions.push(ash::ext::memory_priority::NAME.as_ptr());
             #[cfg(debug_assertions)]
-            println!("Enabling VK_EXT_pageable_device_local_memory device extension");
+            println!("INFO: Enabling VK_EXT_pageable_device_local_memory device extension");
             custom_extensions.push(ash::ext::pageable_device_local_memory::NAME.as_ptr());
             true
         } else {
@@ -152,27 +153,20 @@ impl Renderer {
 
         // We required these features in physical device selection.
         // Now we can request the features be enabled over the logical device we create.
-        // TODO: Use the `device_features` struct instead to build the `features` struct.
-        let mut buffer_device_address_feature =
-            ash::vk::PhysicalDeviceBufferDeviceAddressFeatures::default()
-                .buffer_device_address(true);
-        let mut dynamic_rendering_feature =
-            ash::vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
-        let mut pageable_device_local_memory_feature =
-            ash::vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT::default()
-                .pageable_device_local_memory(true);
-        let mut synchronization2_feature =
-            ash::vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
-
         // Ignore the features we are not interested in, and enable the ones we are.
+        let enabled_pageable_device_local_memory =
+            enabled_pageable_device_local_memory && device_features.pageable_device_local_memory();
         let mut features = ash::vk::PhysicalDeviceFeatures2::default()
-            .push_next(&mut dynamic_rendering_feature)
-            .push_next(&mut synchronization2_feature)
-            .push_next(&mut buffer_device_address_feature);
+            .push_next(&mut device_features.dynamic_rendering)
+            .push_next(&mut device_features.synchronization2)
+            .push_next(&mut device_features.buffer_device_address);
 
         // Add optional device features when they are available.
-        if enabled_pageable_device_local_memory && device_features.pageable_device_local_memory {
-            features = features.push_next(&mut pageable_device_local_memory_feature);
+        if enabled_pageable_device_local_memory {
+            #[cfg(debug_assertions)]
+            println!("INFO: Enabling VK_EXT_pageable_device_local_memory device feature");
+
+            features = features.push_next(&mut device_features.pageable_device_local_memory);
         }
 
         // Collect all the device extensions we need to enable.
@@ -202,22 +196,21 @@ impl Renderer {
 
         let (graphics_index, compute_index, present_index) = {
             // NOTE: Prefer that the graphics and compute queues are equivalent because the `example_fluid` module will benefit from shared resources.
-            let graphics = if let Some(gc) = queue_families.queue_families.iter().position(|f| {
-                f.queue_flags
-                    .contains(ash::vk::QueueFlags::COMPUTE | ash::vk::QueueFlags::GRAPHICS)
-            }) {
-                gc as u32
-            } else {
-                *queue_families
-                    .graphics
-                    .first()
-                    .expect("Unable to find a graphics queue family")
-            };
+            let graphics = utils::get_queue_family_index(
+                ash::vk::QueueFlags::GRAPHICS,
+                ash::vk::QueueFlags::COMPUTE,
+                &queue_families,
+            );
 
             // Prefer using the graphics queue for presentation if possible.
             let present = if queue_families.present.contains(&graphics) {
                 graphics
             } else {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "WARN: Using different queue families for presentation and primary graphics"
+                );
+
                 // Choose the first queue family that supports presentation.
                 *queue_families
                     .present
@@ -291,9 +284,12 @@ impl Renderer {
                 .expect("Unable to create command pool")
         };
 
-        let compute_command_pool = if graphics_index == compute_index {
+        let compute_queue_extra = if graphics_index == compute_index {
             None
         } else {
+            #[cfg(debug_assertions)]
+            println!("Creating separate compute command pool and compute semaphore");
+
             let pool = unsafe {
                 logical_device.create_command_pool(
                     &ash::vk::CommandPoolCreateInfo {
@@ -361,7 +357,7 @@ impl Renderer {
                     image_format,
                     ash::vk::ImageLayout::PRESENT_SRC_KHR,
                     swapchain.image_views(),
-                    compute_command_pool.map_or(command_pool, |(pool, _)| pool),
+                    compute_queue_extra.map_or(command_pool, |(pool, _)| pool),
                     pageable_device_local_memory.as_ref(),
                 );
                 DemoPipeline::Fluid(demo)
@@ -420,7 +416,7 @@ impl Renderer {
             compute_queue,
             presentation_queue,
             command_pool,
-            compute_command_pool,
+            compute_command_pool: compute_queue_extra,
 
             command_buffers,
             frame_fences,
@@ -460,6 +456,12 @@ impl Renderer {
                 fxaa_pass.destroy(&self.logical_device, &mut self.memory_allocator);
             }
 
+            // Destroy additional compute resources if the exist.
+            if let Some((command_pool, semaphore)) = self.compute_command_pool {
+                self.logical_device.destroy_command_pool(command_pool, None);
+                self.logical_device.destroy_semaphore(semaphore, None);
+            }
+
             // Destroy the swapchain and its dependent resources.
             self.swapchain
                 .destroy(&self.logical_device, &mut self.memory_allocator);
@@ -468,11 +470,15 @@ impl Renderer {
             self.logical_device.destroy_device(None);
 
             // Destroy the Vulkan surface.
-            vulkan.khr.destroy_surface(self.surface, None);
+            if let Some(khr) = vulkan.khr.as_ref() {
+                khr.destroy_surface(self.surface, None);
+            } else {
+                eprintln!(
+                    "ERROR: Unable to destroy surface because the `khr` extension is not available"
+                );
+            }
         }
     }
-
-    /// Helper for creating framebuffers for the given render topology.
 
     /// Recreate the swapchain, including the framebuffers and image views for the frames owned by the swapchain.
     /// The `self.swapchain_preferences` are used to recreate the swapchain and do not need to match those used with the initial swapchain creation.
@@ -586,6 +592,8 @@ impl Renderer {
     }
 
     /// Attempt to render the next frame of the application. If there is a recoverable error, then the swapchain is recreated and the function bails early without rendering.
+    /// # Panics
+    /// * The `utils::VulkanCore` struct must have a `khr` field that is not `None`.
     pub fn render_frame(&mut self, vulkan: &utils::VulkanCore, push_constants: &DemoPushConstants) {
         // Synchronize the CPU with the GPU for the resources previously used for this frame in flight.
         // Specifically, the command buffer cannot be reused until the fence is signaled.
@@ -610,6 +618,8 @@ impl Renderer {
                 let surface_capabilities = unsafe {
                     vulkan
                         .khr
+                        .as_ref()
+                        .unwrap()
                         .get_physical_device_surface_capabilities(
                             self.physical_device,
                             self.surface,
@@ -672,25 +682,18 @@ impl Renderer {
                 }
             }
             DemoPipeline::Fluid(simulation) => {
-                let DemoPushConstants::Fluid(push_constants, display_texture) = push_constants
-                else {
+                let DemoPushConstants::Fluid(push_constants) = push_constants else {
                     panic!("Push constants do not match the active demo");
                 };
                 simulation.render_frame(
                     &self.logical_device,
-                    self.compute_command_pool.map(|(_, compute_semaphore)| {
-                        example_fluid::ComputeInfo {
-                            compute_semaphore,
-                            compute_family_index: self.compute_queue.family_index,
-                            graphics_family_index: self.graphics_queue.family_index,
-                        }
-                    }),
+                    self.compute_command_pool
+                        .map(|(_, compute_semaphore)| compute_semaphore),
                     self.compute_queue.queue,
                     command_buffer,
                     extent,
                     image_index as usize,
                     push_constants,
-                    *display_texture,
                     frame_graphics_fence,
                 );
             }
@@ -705,13 +708,18 @@ impl Renderer {
 
         // Submit the draw command buffer to the GPU.
         let mut semaphores: SmallVec<[_; 2]> = smallvec![self.swapchain.image_available()];
-        if let Some((_, compute_semaphore)) = &self.compute_command_pool {
-            semaphores.push(*compute_semaphore);
+        let mut semaphore_access: SmallVec<[_; 2]> =
+            smallvec![ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        if matches!(self.active_demo, DemoPipeline::Fluid(_)) {
+            if let Some((_, compute_semaphore)) = &self.compute_command_pool {
+                semaphores.push(*compute_semaphore);
+                semaphore_access.push(ash::vk::PipelineStageFlags::FRAGMENT_SHADER);
+            }
         }
         let submit_info = ash::vk::SubmitInfo {
             wait_semaphore_count: semaphores.len() as u32,
             p_wait_semaphores: semaphores.as_ptr(),
-            p_wait_dst_stage_mask: &ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            p_wait_dst_stage_mask: semaphore_access.as_ptr(),
             command_buffer_count: 1,
             p_command_buffers: &command_buffer,
             signal_semaphore_count: 1,
@@ -751,6 +759,8 @@ impl Renderer {
                 let surface_capabilities = unsafe {
                     vulkan
                         .khr
+                        .as_ref()
+                        .unwrap()
                         .get_physical_device_surface_capabilities(
                             self.physical_device,
                             self.surface,

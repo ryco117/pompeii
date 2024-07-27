@@ -27,7 +27,7 @@ pub mod shaders {
 
 /// The constant used to define the number of iterations used to adjust the pressure towards a divergence-free field.
 /// This value is half the number of iterations used elsewhere because each iteration has two stages which are interleaved.
-const MAX_PRESSURE_SMOOTHING_ITERATIONS: u32 = 20;
+const MAX_PRESSURE_SMOOTHING_ITERATIONS: u32 = 16;
 
 /// Define the shared push constants for each compute stage of this minimal fluid simulation.
 #[repr(C)]
@@ -66,14 +66,15 @@ pub enum FluidDisplayTexture {
     Velocity,
     Dye,
     Pressure,
-    ColorField,
+    ColorFieldNormal,
+    ColorFieldLine,
+    ColorFieldCircle,
+    ColorFieldGradient,
 }
 impl FluidDisplayTexture {
     /// Get the next fluid display variant in a cycle of types.
     pub fn next(self) -> Self {
-        FluidDisplayTexture::from_repr(
-        (self as u32)
-            .wrapping_add(1))
+        FluidDisplayTexture::from_repr((self as u32).wrapping_add(1))
             .unwrap_or(FluidDisplayTexture::Velocity)
     }
 }
@@ -617,14 +618,6 @@ fn create_graphics_pipeline(
         .into_iter().next().expect("vkCreateGraphicsPipelines returned an empty list of pipelines but provided a successful result")
 }
 
-/// When the graphics and compute queues are in separate families, additional information is required to synchronize the compute and graphics operations.
-#[derive(Clone, Copy, Debug)]
-pub struct ComputeInfo {
-    pub compute_semaphore: ash::vk::Semaphore,
-    pub compute_family_index: u32,
-    pub graphics_family_index: u32,
-}
-
 /// The fluid simulation renderer and resources.
 pub struct FluidSimulation {
     shaders: FluidShaders,
@@ -638,6 +631,7 @@ pub struct FluidSimulation {
     compute_fence: ash::vk::Fence,
     graphics_fence: Option<ash::vk::Fence>,
     compute_command_buffer: ash::vk::CommandBuffer,
+    current_display_texture: FluidDisplayTexture,
 }
 impl FluidSimulation {
     /// Create a new fluid simulation renderer from the swapchain image properties.
@@ -702,6 +696,7 @@ impl FluidSimulation {
             compute_fence,
             graphics_fence: None,
             compute_command_buffer,
+            current_display_texture: FluidDisplayTexture::default(),
         }
     }
 
@@ -805,7 +800,6 @@ impl FluidSimulation {
         device: &ash::Device,
         extent: ash::vk::Extent2D,
         push_constants: &PushConstants,
-        compute_info: Option<ComputeInfo>,
     ) {
         // Ensure that the command buffer is in the recording state.
         unsafe {
@@ -956,33 +950,6 @@ impl FluidSimulation {
             );
             device.cmd_dispatch(self.compute_command_buffer, workgroups_x, workgroups_y, 1);
 
-            // Add an additional "release barrier" to ensure that the final buffer data is ready for rendering in the case when the compute and graphics queue families are different.
-            if let Some(ComputeInfo {
-                compute_family_index,
-                graphics_family_index,
-                ..
-            }) = compute_info
-            {
-                let pixel_count = u64::from(extent.width) * u64::from(extent.height);
-                let velocity_memory_barrier = ash::vk::BufferMemoryBarrier2::default()
-                    .src_stage_mask(ash::vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .src_access_mask(ash::vk::AccessFlags2::SHADER_WRITE)
-                    .dst_stage_mask(ash::vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                    .dst_access_mask(ash::vk::AccessFlags2::SHADER_READ)
-                    .src_queue_family_index(compute_family_index)
-                    .dst_queue_family_index(graphics_family_index)
-                    .buffer(self.allocated_images[5].buffer)
-                    .size(pixel_count * std::mem::size_of::<[f32; 2]>() as u64);
-                let dye_memory_barrier = velocity_memory_barrier
-                    .buffer(self.allocated_images[7].buffer)
-                    .size(pixel_count * std::mem::size_of::<[f32; 4]>() as u64);
-                device.cmd_pipeline_barrier2(
-                    self.compute_command_buffer,
-                    &ash::vk::DependencyInfoKHR::default()
-                        .buffer_memory_barriers(&[velocity_memory_barrier, dye_memory_barrier]),
-                );
-            }
-
             // End the command buffer recording.
             device
                 .end_command_buffer(self.compute_command_buffer)
@@ -992,19 +959,28 @@ impl FluidSimulation {
         }
     }
 
+    /// Update the internal active display texture to the next in the cycle.
+    pub fn next_display_texture(&mut self) {
+        self.current_display_texture = self.current_display_texture.next();
+
+        println!(
+            "Switched to the next display texture: {:?}",
+            self.current_display_texture
+        );
+    }
+
     /// Render the fluid simulation.
     /// # Safety
     /// The `graphics_command_buffer` must be in the recording state to be submitted by the caller.
     pub fn render_frame(
         &mut self,
         device: &ash::Device,
-        compute_info: Option<ComputeInfo>,
+        compute_semaphore: Option<ash::vk::Semaphore>,
         compute_queue: ash::vk::Queue,
         graphics_command_buffer: ash::vk::CommandBuffer,
         extent: ash::vk::Extent2D,
         image_index: usize,
         push_constants: &PushConstants,
-        display_texture: FluidDisplayTexture,
         current_graphics_fence: ash::vk::Fence,
     ) {
         // Wait for the compute fence to ensure all resources are available.
@@ -1027,7 +1003,7 @@ impl FluidSimulation {
         }
 
         // Record the compute commands for the fluid simulation to the desired command buffer.
-        self.create_compute_command_buffer(device, extent, push_constants, compute_info);
+        self.create_compute_command_buffer(device, extent, push_constants);
 
         unsafe {
             // Requires some hoops to satisfy the borrow checker, but sets the command buffer to the submit info.
@@ -1036,10 +1012,7 @@ impl FluidSimulation {
             let mut submit_info =
                 ash::vk::SubmitInfo::default().command_buffers(&compute_command_buffer);
             // Optionally, add a semaphore in the case when the compute and graphics queue families are different.
-            if let Some(ComputeInfo {
-                compute_semaphore, ..
-            }) = compute_info
-            {
+            if let Some(compute_semaphore) = compute_semaphore {
                 semaphores[0] = compute_semaphore;
                 submit_info = submit_info.signal_semaphores(&semaphores);
             }
@@ -1060,7 +1033,7 @@ impl FluidSimulation {
                 dye_buffer: self.allocated_images[7].device_address,
                 pressure_buffer: self.allocated_images[3].device_address,
                 screen_size: [extent.width, extent.height],
-                display_texture,
+                display_texture: self.current_display_texture,
             };
             device.cmd_push_constants(
                 graphics_command_buffer,
@@ -1158,7 +1131,7 @@ impl FluidSimulation {
 
             delta_time,
             velocity_diffusion_rate: 0.12,
-            dye_diffusion_rate: 0.9,
+            dye_diffusion_rate: 1.2,
             vorticity_strength: 22.,
         }
     }

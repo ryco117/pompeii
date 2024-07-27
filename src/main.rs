@@ -17,10 +17,7 @@ const TICK_SAMPLING_LENGTH: u64 = 6_000;
 
 mod cli;
 mod engine;
-use engine::{
-    example_fluid::FluidDisplayTexture,
-    utils::{self, SwapchainPreferences},
-};
+use engine::utils::{self, SwapchainPreferences};
 
 fn main() {
     // Parse the command-line arguments.
@@ -74,7 +71,6 @@ struct PompeiiApp {
     last_mouse_position: Option<(winit::dpi::PhysicalPosition<f64>, std::time::Instant)>,
     mouse_click: Option<[f32; 2]>,
     mouse_velocity: [f32; 2],
-    user_toggles: u32,
 }
 
 impl PompeiiApp {
@@ -94,7 +90,7 @@ impl PompeiiApp {
         .collect::<SmallVec<[_; utils::EXPECTED_MAX_ENABLED_INSTANCE_EXTENSIONS]>>();
 
         #[cfg(debug_assertions)]
-        println!("Enabling `ash_window` required extensions: {extension_names:?}");
+        println!("INFO: Enabling `ash_window` required extensions: {extension_names:?}");
 
         // Attempt to initialize the core Vulkan objects. In case of failure, safely close after the user has seen the error.
         let vulkan = match utils::VulkanCore::new(&extension_names, &[]) {
@@ -128,7 +124,6 @@ impl PompeiiApp {
             last_mouse_position: None,
             mouse_click: None,
             mouse_velocity: [0., 0.],
-            user_toggles: 0,
         }
     }
 
@@ -164,11 +159,11 @@ impl PompeiiApp {
                 if window_size.width == 0 || window_size.height == 0 {
                     // Skip all operations if the window contains no pixels.
                     #[cfg(debug_assertions)]
-                    println!("Window size is zero, skipping frame");
+                    println!("INFO: Window size is zero, skipping frame");
                 } else {
                     #[cfg(debug_assertions)]
                     println!(
-                        "Swapchain is out of date at window-size check, needs to be recreated."
+                        "INFO: Swapchain is out of date at window-size check, needs to be recreated."
                     );
 
                     renderer.recreate_swapchain(
@@ -216,10 +211,7 @@ impl PompeiiApp {
                     ],
                     delta_time,
                 );
-                engine::DemoPushConstants::Fluid(
-                    push_constants,
-                    FluidDisplayTexture::from_repr(self.user_toggles).unwrap_or_default(),
-                )
+                engine::DemoPushConstants::Fluid(push_constants)
             }
         };
 
@@ -268,33 +260,25 @@ impl PompeiiApp {
                     }
                 }
 
-                // Handle the `T` key to toggle the user toggle.
-                winit::keyboard::Key::Character("t") => {
+                // Handle the `SPACE` key to toggle the user toggle.
+                winit::keyboard::Key::Named(winit::keyboard::NamedKey::Space) => {
                     let Some(PompeiiGraphics { renderer, .. }) = &mut self.graphics else {
                         return;
                     };
 
-                    match &renderer.active_demo {
-                        engine::DemoPipeline::Triangle(_) => {
-                            self.user_toggles = (self.user_toggles + 1) % 2;
+                    match &mut renderer.active_demo {
+                        engine::DemoPipeline::Triangle(t) => {
+                            let toggle = (t.specialization_constants().toggle + 1) % 2;
 
                             // Update the specialization constants for the renderer.
                             renderer.update_specialization_constants(
                                 engine::DemoSpecializationConstants::Triangle(
-                                    engine::example_triangle::SpecializationConstants {
-                                        toggle: self.user_toggles,
-                                    },
+                                    engine::example_triangle::SpecializationConstants { toggle },
                                 ),
                             );
                         }
-                        engine::DemoPipeline::Fluid(_) => {
-                            self.user_toggles = FluidDisplayTexture::from_repr(self.user_toggles)
-                                .map(FluidDisplayTexture::next)
-                                .unwrap_or_default()
-                                as u32;
-                        }
+                        engine::DemoPipeline::Fluid(f) => f.next_display_texture(),
                     }
-                    println!("User toggle is now {}", self.user_toggles);
                 }
 
                 winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab) => {
@@ -306,9 +290,7 @@ impl PompeiiApp {
                     let new_demo = match renderer.active_demo {
                         engine::DemoPipeline::Triangle(_) => engine::NewDemo::Fluid,
                         engine::DemoPipeline::Fluid(_) => engine::NewDemo::Triangle(
-                            engine::example_triangle::SpecializationConstants {
-                                toggle: self.user_toggles,
-                            },
+                            engine::example_triangle::SpecializationConstants::default(),
                         ),
                     };
 
@@ -356,21 +338,33 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
 
         let current_extent = window.inner_size();
         #[cfg(debug_assertions)]
-        println!("Window size at creation: {current_extent:?}");
+        println!("INFO: Window size at creation: {current_extent:?}");
 
         // Create a renderer specific to this application's needs.
-        // NOTE: Some platforms require us to specify the preferred extent for the swapchain.
+        // NOTE: Some platforms require us to specify the preferred extent for the swapchain before
+        // a current one will be established.
         let preferred_extent = Some(ash::vk::Extent2D {
             width: current_extent.width,
             height: current_extent.height,
         });
-        // TODO: Allow the CLI to specify the image format and color-space preferences.
-        let swapchain_preferences = utils::SwapchainPreferences {
+        let mut swapchain_preferences = utils::SwapchainPreferences {
             present_mode: Some(self.args.present_mode.into()),
             preferred_extent,
             color_samples: Some(self.args.msaa.into()),
             ..Default::default()
         };
+
+        if self.args.hdr
+            && self
+                .vulkan
+                .enabled_instance_extension(ash::ext::swapchain_colorspace::NAME)
+        {
+            // TODO: Let swapchain know what kind of format/colorspace we want (HDR/SDR) and let
+            // them choose the specifics.
+            swapchain_preferences.format = Some(ash::vk::Format::A2B10G10R10_UNORM_PACK32);
+            swapchain_preferences.color_space = Some(ash::vk::ColorSpaceKHR::HDR10_ST2084_EXT);
+        }
+
         let renderer = engine::Renderer::new(
             &self.vulkan,
             surface,

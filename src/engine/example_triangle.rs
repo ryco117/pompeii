@@ -16,7 +16,7 @@ pub mod shaders {
 /// Define the specialization constants that can be used with the shaders of this application.
 /// Specifically, this shader only accepts a single `boolean32` that toggles the reflection of the triangle along the Y axis.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct SpecializationConstants {
     /// Reflect the vertices of the triangle along their Y axis.
     pub toggle: u32,
