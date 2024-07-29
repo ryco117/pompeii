@@ -23,16 +23,23 @@ pub enum DemoPushConstants {
     Fluid(example_fluid::PushConstants),
 }
 
+/// Whether a swapchain resize is necessary or not.
+enum ResizeSwapchainState {
+    None,
+    Resized,
+}
+
 /// Define which rendering objects are necessary for this application.
 pub struct Renderer {
-    pub physical_device: ash::vk::PhysicalDevice,
-    pub device_extensions: HashSet<&'static CStr>,
+    physical_device: ash::vk::PhysicalDevice,
+    device_extensions: HashSet<&'static CStr>,
     pub logical_device: ash::Device,
     pageable_device_local_memory: Option<ash::ext::pageable_device_local_memory::Device>,
-
-    pub surface: ash::vk::SurfaceKHR,
     memory_allocator: gpu_allocator::vulkan::Allocator,
+
+    surface: ash::vk::SurfaceKHR,
     pub swapchain: utils::Swapchain,
+    resize_swapchain: ResizeSwapchainState,
 
     // The specific object we are interested in rendering.
     pub active_demo: DemoPipeline,
@@ -407,10 +414,12 @@ impl Renderer {
                 .collect::<HashSet<_>>(),
             logical_device,
             pageable_device_local_memory,
-            surface,
             memory_allocator,
 
+            surface,
             swapchain,
+            resize_swapchain: ResizeSwapchainState::None,
+
             active_demo,
             graphics_queue,
             compute_queue,
@@ -480,13 +489,24 @@ impl Renderer {
         }
     }
 
+    /// Indicate that the swapchain needs to be recreated before next use.
+    pub fn swapchain_resize_required(&mut self, new_extent: Option<ash::vk::Extent2D>) {
+        if let Some(extent) = new_extent {
+            self.swapchain_preferences.preferred_extent = Some(extent);
+        }
+        self.resize_swapchain = ResizeSwapchainState::Resized;
+    }
+
+    /// Handle any impending swapchain recreations.
+    pub fn handle_swapchain_resize(&mut self, vulkan: &utils::VulkanCore) {
+        if matches!(self.resize_swapchain, ResizeSwapchainState::Resized) {
+            self.recreate_swapchain(vulkan);
+        }
+    }
+
     /// Recreate the swapchain, including the framebuffers and image views for the frames owned by the swapchain.
     /// The `self.swapchain_preferences` are used to recreate the swapchain and do not need to match those used with the initial swapchain creation.
-    pub fn recreate_swapchain(
-        &mut self,
-        vulkan: &utils::VulkanCore,
-        swapchain_preferences: utils::SwapchainPreferences,
-    ) {
+    pub fn recreate_swapchain(&mut self, vulkan: &utils::VulkanCore) {
         let old_format = self.swapchain.image_format();
 
         // Recreate the swapchain using the new preferences.
@@ -496,7 +516,7 @@ impl Renderer {
             &self.logical_device,
             self.surface,
             &mut self.memory_allocator,
-            swapchain_preferences,
+            self.swapchain_preferences,
         );
 
         // Check if the image format has changed and recreate the render pass and graphics pipeline if necessary.
@@ -589,6 +609,9 @@ impl Renderer {
                 }
             }
         }
+
+        // Reset the flag indicating the swapchain needs to be recreated.
+        self.resize_swapchain = ResizeSwapchainState::None;
     }
 
     /// Attempt to render the next frame of the application. If there is a recoverable error, then the swapchain is recreated and the function bails early without rendering.
@@ -607,14 +630,14 @@ impl Renderer {
         }
 
         // Get the next image to render to. Has internal synchronization to ensure the previous acquire completed on the GPU.
-        let utils::NextSwapchainImage { image_index, .. } = match self
-            .swapchain
-            .acquire_next_image()
-        {
-            Ok(f) if !f.suboptimal => f,
+        let utils::NextSwapchainImage {
+            image_index,
+            suboptimal,
+            ..
+        } = match self.swapchain.acquire_next_image() {
+            Ok(f) => f,
 
-            // TODO: Consider accepting suboptimal for this draw, but set a flag to recreate the swapchain next frame.
-            Ok(_) | Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+            Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 let surface_capabilities = unsafe {
                     vulkan
                         .khr
@@ -626,6 +649,9 @@ impl Renderer {
                         )
                         .expect("Unable to get surface capabilities")
                 };
+
+                // Zero-sized surfaces are a special case where we should not recreate or render
+                // until a non-zero size is requested.
                 if surface_capabilities.max_image_extent.width == 0
                     || surface_capabilities.max_image_extent.height == 0
                 {
@@ -634,12 +660,26 @@ impl Renderer {
                 }
 
                 println!("WARN: Swapchain is out of date at image acquire, needs to be recreated.");
-                self.recreate_swapchain(vulkan, self.swapchain_preferences);
+                self.swapchain_resize_required(
+                    if surface_capabilities.current_extent == utils::SPECIAL_SURFACE_EXTENT {
+                        None
+                    } else {
+                        Some(surface_capabilities.current_extent)
+                    },
+                );
                 return;
             }
 
             Err(e) => panic!("Unable to acquire next image from swapchain: {e}"),
         };
+
+        // Ensure suboptimal images are acknowledged.
+        if suboptimal {
+            println!(
+                "WARN: Swapchain image is suboptimal, recreating the swapchain after this frame"
+            );
+            self.resize_swapchain = ResizeSwapchainState::None;
+        }
 
         let command_buffer = self.command_buffers[current_frame];
         unsafe {
@@ -767,6 +807,9 @@ impl Renderer {
                         )
                         .expect("Unable to get surface capabilities")
                 };
+
+                // Zero-sized surfaces are a special case where we should not recreate or render
+                // until a non-zero size is requested.
                 if surface_capabilities.max_image_extent.width == 0
                     || surface_capabilities.max_image_extent.height == 0
                 {
@@ -778,7 +821,13 @@ impl Renderer {
                 println!(
                     "WARN: Swapchain is out of date at image presentation, needs to be recreated."
                 );
-                self.recreate_swapchain(vulkan, self.swapchain_preferences);
+                self.swapchain_resize_required(
+                    if surface_capabilities.current_extent == utils::SPECIAL_SURFACE_EXTENT {
+                        None
+                    } else {
+                        Some(surface_capabilities.current_extent)
+                    },
+                );
             }
             Err(e) => panic!("Unable to present swapchain image: {e:?}"),
         }

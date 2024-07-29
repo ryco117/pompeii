@@ -17,7 +17,7 @@ const TICK_SAMPLING_LENGTH: u64 = 6_000;
 
 mod cli;
 mod engine;
-use engine::utils::{self, SwapchainPreferences};
+use engine::utils;
 
 fn main() {
     // Parse the command-line arguments.
@@ -127,62 +127,15 @@ impl PompeiiApp {
         }
     }
 
-    /// Redraw the window surface if we have initialized the relevant components.
-    fn redraw(&mut self) {
-        let Some(PompeiiGraphics {
-            window, renderer, ..
-        }) = &mut self.graphics
-        else {
-            return;
+    /// Update the game state and return the push constants for the next frame.
+    /// # Panics
+    /// Panics if the `graphics` field is not initialized.
+    fn update_gamestate(&mut self) -> engine::DemoPushConstants {
+        let Some(PompeiiGraphics { renderer, .. }) = &mut self.graphics else {
+            panic!("Graphics state not initialized");
         };
 
-        // Request a redraw of the window surface whenever possible.
-        window.request_redraw();
-
-        // Increment the tick count for the application.
-        if self.tick_count % TICK_SAMPLING_LENGTH == 0 {
-            println!(
-                "{:?} Tick count: {}",
-                std::time::Instant::now(),
-                self.tick_count
-            );
-        }
-        self.tick_count += 1;
-        let extent = renderer.swapchain.extent();
-
-        // Check that the current window size won't affect rendering.
-        // TODO: Consider catching window resizes and minimizes as events, then checking for a flag here.
-        //       This would reduce CPU overhead in the draw loop.
-        {
-            let window_size = window.inner_size();
-            if window_size.width != extent.width || window_size.height != extent.height {
-                if window_size.width == 0 || window_size.height == 0 {
-                    // Skip all operations if the window contains no pixels.
-                    #[cfg(debug_assertions)]
-                    println!("INFO: Window size is zero, skipping frame");
-                } else {
-                    #[cfg(debug_assertions)]
-                    println!(
-                        "INFO: Swapchain is out of date at window-size check, needs to be recreated."
-                    );
-
-                    renderer.recreate_swapchain(
-                        &self.vulkan,
-                        SwapchainPreferences {
-                            preferred_extent: Some(ash::vk::Extent2D {
-                                width: window_size.width,
-                                height: window_size.height,
-                            }),
-                            ..renderer.swapchain_preferences
-                        },
-                    );
-                }
-                return;
-            }
-        }
-
         // Get updated state for drawing.
-        // TODO: Update the game state outside of the render loop.
         let now = std::time::Instant::now();
         let time = now.duration_since(self.start_time).as_secs_f32();
         let delta_time = self.last_frame_time.map_or(time, |last_frame| {
@@ -190,6 +143,7 @@ impl PompeiiApp {
         });
         self.last_frame_time = Some(now);
 
+        // Update the game state and get the per-frame data in the form of push constants.
         let push_constants = match &mut renderer.active_demo {
             engine::DemoPipeline::Triangle(_) => {
                 engine::DemoPushConstants::Triangle(engine::example_triangle::PushConstants {
@@ -200,7 +154,7 @@ impl PompeiiApp {
             engine::DemoPipeline::Fluid(fluid) => {
                 let dye_cycle = 12. * time;
                 let push_constants = fluid.new_push_constants(
-                    extent,
+                    renderer.swapchain.extent(),
                     self.last_mouse_position.map_or([-1024.; 2], |m| m.0.into()),
                     self.mouse_velocity,
                     [
@@ -216,13 +170,33 @@ impl PompeiiApp {
         };
 
         {
-            // Decay constants.
+            // Decay the constants which were set between the current and last frame.
             let decay = (-8. * delta_time).exp();
             self.mouse_velocity[0] *= decay;
             self.mouse_velocity[1] *= decay;
         }
 
-        // Attempt to render the frame, or bail and recreate the swapchain if there is a recoverable error.
+        // Return the push constants for this frame for consumption by the renderer.
+        push_constants
+    }
+
+    /// Redraw the window surface if we have initialized the relevant components.
+    fn redraw(&mut self, push_constants: engine::DemoPushConstants) {
+        let Some(PompeiiGraphics { renderer, .. }) = &mut self.graphics else {
+            return;
+        };
+
+        // Increment the tick count for the application.
+        if self.tick_count % TICK_SAMPLING_LENGTH == 0 {
+            println!(
+                "{:?} Tick count: {}",
+                std::time::Instant::now(),
+                self.tick_count
+            );
+        }
+        self.tick_count += 1;
+
+        // Attempt to render the frame, or bail if there is a recoverable error.
         renderer.render_frame(&self.vulkan, &push_constants);
     }
 
@@ -347,6 +321,7 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
             width: current_extent.width,
             height: current_extent.height,
         });
+
         let mut swapchain_preferences = utils::SwapchainPreferences {
             present_mode: Some(self.args.present_mode.into()),
             preferred_extent,
@@ -394,8 +369,67 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
                 event_loop.exit();
             }
 
+            // Handle window resizing events.
+            winit::event::WindowEvent::Resized(winit::dpi::PhysicalSize { width, height }) => {
+                let Some(PompeiiGraphics { renderer, .. }) = &mut self.graphics else {
+                    return;
+                };
+
+                // Ensure we do not request a swapchain recreation with an area of zero.
+                if width == 0 || height == 0 {
+                    return;
+                }
+
+                renderer.swapchain_resize_required(Some(ash::vk::Extent2D { width, height }));
+            }
+
             // Redraw the window surface when requested.
-            winit::event::WindowEvent::RedrawRequested => self.redraw(),
+            winit::event::WindowEvent::RedrawRequested => {
+                let Some(PompeiiGraphics {
+                    window, renderer, ..
+                }) = &mut self.graphics
+                else {
+                    return;
+                };
+
+                // Request a redraw of the window surface whenever possible.
+                window.request_redraw();
+
+                // Process any pending swapchain recreation requests.
+                renderer.handle_swapchain_resize(&self.vulkan);
+
+                // Check that the current window size won't affect rendering.
+                {
+                    let extent = renderer.swapchain.extent();
+                    let window_size = window.inner_size();
+                    if window_size.width == 0 || window_size.height == 0 {
+                        // Skip all operations if the window contains no pixels.
+                        #[cfg(debug_assertions)]
+                        println!("INFO: Window size is zero, skipping frame");
+                        return;
+                    }
+
+                    let window_size = ash::vk::Extent2D {
+                        width: window_size.width,
+                        height: window_size.height,
+                    };
+                    if window_size != extent {
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "ERROR: Swapchain is out of date at window-size check, needs to be recreated."
+                        );
+
+                        renderer.swapchain_resize_required(Some(window_size));
+                        return;
+                    }
+                }
+
+                // Update the game state and get the push constants for the next frame.
+                let push_constants = self.update_gamestate();
+
+                // Submit to the GPU that the next frame be drawn.
+                self.redraw(push_constants);
+            }
 
             // Handle keyboard input events.
             winit::event::WindowEvent::KeyboardInput { event, .. } => {

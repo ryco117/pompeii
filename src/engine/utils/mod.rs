@@ -560,20 +560,18 @@ pub fn get_queue_families(
     let mut type_indices = [const { Vec::<u32>::new() }; QueueType::COUNT];
     for (family_index, queue_family) in queue_families.iter().enumerate() {
         // Get as a present queue family.
-        let is_present_supported = if let Some(khr) = vulkan.khr.as_ref() {
-            unsafe {
+        if let Some(khr) = vulkan.khr.as_ref() {
+            if unsafe {
                 khr.get_physical_device_surface_support(
                     physical_device,
                     family_index as u32,
                     surface,
                 )
-                .expect("Unable to check if 'present' is supported")
             }
-        } else {
-            false
-        };
-        if is_present_supported {
-            type_indices[QueueType::Present as usize].push(family_index as u32);
+            .expect("Unable to check if 'present' is supported")
+            {
+                type_indices[QueueType::Present as usize].push(family_index as u32);
+            }
         }
 
         // Get as a graphics queue family.
@@ -601,7 +599,6 @@ pub fn get_queue_families(
         }
     }
 
-    // TODO: Allow the caller to choose which queue types are needed.
     let graphics = std::mem::take(&mut type_indices[QueueType::Graphics as usize]);
     let compute = std::mem::take(&mut type_indices[QueueType::Compute as usize]);
     let transfer = std::mem::take(&mut type_indices[QueueType::Transfer as usize]);
@@ -878,6 +875,13 @@ pub struct Swapchain {
     enabled_swapchain_maintenance1: bool,
 }
 
+/// Vulkan uses this "special value" to indicate that the application must set a desired extent without a `current_extent` available.
+/// <https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkSurfaceCapabilitiesKHR.html>
+pub const SPECIAL_SURFACE_EXTENT: ash::vk::Extent2D = ash::vk::Extent2D {
+    width: u32::MAX,
+    height: u32::MAX,
+};
+
 /// The result of acquiring the next image from the swapchain and advancing to the next frame in flight.
 pub struct NextSwapchainImage {
     pub image_view: ash::vk::ImageView,
@@ -899,12 +903,6 @@ impl Swapchain {
         enabled_swapchain_maintenance1: bool,
         old_swapchain: Option<ash::vk::SwapchainKHR>,
     ) -> Self {
-        // Vulkan uses a special extent value to indicate that the application must set a desired extent without a `current_extent` available.
-        const SPECIAL_SURFACE_EXTENT: ash::vk::Extent2D = ash::vk::Extent2D {
-            width: u32::MAX,
-            height: u32::MAX,
-        };
-
         let khr = vulkan
             .khr
             .as_ref()
