@@ -90,7 +90,7 @@ impl PompeiiApp {
         .collect::<SmallVec<[_; utils::EXPECTED_MAX_ENABLED_INSTANCE_EXTENSIONS]>>();
 
         #[cfg(debug_assertions)]
-        println!("INFO: Enabling `ash_window` required extensions: {extension_names:?}");
+        println!("INFO: Enabling `ash_window` required instance extensions: {extension_names:?}");
 
         // Attempt to initialize the core Vulkan objects. In case of failure, safely close after the user has seen the error.
         let vulkan = match utils::VulkanCore::new(&extension_names, &[]) {
@@ -131,9 +131,7 @@ impl PompeiiApp {
     /// # Panics
     /// Panics if the `graphics` field is not initialized.
     fn update_gamestate(&mut self) -> engine::DemoPushConstants {
-        let Some(PompeiiGraphics { renderer, .. }) = &mut self.graphics else {
-            panic!("Graphics state not initialized");
-        };
+        assert!(self.graphics.is_some(), "Graphics state not initialized");
 
         // Get updated state for drawing.
         let now = std::time::Instant::now();
@@ -142,9 +140,10 @@ impl PompeiiApp {
             now.duration_since(last_frame).as_secs_f32()
         });
         self.last_frame_time = Some(now);
+        let extent = self.graphics.as_ref().unwrap().renderer.swapchain_extent();
 
         // Update the game state and get the per-frame data in the form of push constants.
-        let push_constants = match &mut renderer.active_demo {
+        let push_constants = match &mut self.graphics.as_mut().unwrap().renderer.active_demo {
             engine::DemoPipeline::Triangle(_) => {
                 engine::DemoPushConstants::Triangle(engine::example_triangle::PushConstants {
                     time,
@@ -154,7 +153,7 @@ impl PompeiiApp {
             engine::DemoPipeline::Fluid(fluid) => {
                 let dye_cycle = 12. * time;
                 let push_constants = fluid.new_push_constants(
-                    renderer.swapchain.extent(),
+                    extent,
                     self.last_mouse_position.map_or([-1024.; 2], |m| m.0.into()),
                     self.mouse_velocity,
                     [
@@ -400,7 +399,7 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
 
                 // Check that the current window size won't affect rendering.
                 {
-                    let extent = renderer.swapchain.extent();
+                    let extent = renderer.swapchain_extent();
                     let window_size = window.inner_size();
                     if window_size.width == 0 || window_size.height == 0 {
                         // Skip all operations if the window contains no pixels.

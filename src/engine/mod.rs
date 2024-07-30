@@ -7,9 +7,6 @@ pub mod example_fluid;
 pub mod example_triangle;
 pub mod utils;
 
-/// A sane constant for the expected maximum number of enabled device extensions. This is not for restrictions but to allow optimizations to avoid heap allocation.
-const EXPECTED_MAX_ENABLED_DEVICE_EXTENSIONS: usize = 4;
-
 /// The demos the application is capable of rendering.
 pub enum DemoPipeline {
     Triangle(example_triangle::Pipeline),
@@ -38,10 +35,10 @@ pub struct Renderer {
     memory_allocator: gpu_allocator::vulkan::Allocator,
 
     surface: ash::vk::SurfaceKHR,
-    pub swapchain: utils::Swapchain,
+    swapchain: utils::Swapchain,
     resize_swapchain: ResizeSwapchainState,
 
-    // The specific object we are interested in rendering.
+    /// The specific object we are interested in rendering.
     pub active_demo: DemoPipeline,
 
     graphics_queue: utils::IndexedQueue,
@@ -115,8 +112,7 @@ impl Renderer {
         );
 
         // Check the physical device for optional features we can enable for this application.
-        let mut custom_extensions =
-            SmallVec::<[*const i8; EXPECTED_MAX_ENABLED_DEVICE_EXTENSIONS]>::new();
+        let mut custom_extensions = Vec::new();
         let available_extensions = unsafe {
             vulkan
                 .instance
@@ -125,44 +121,55 @@ impl Renderer {
         };
         let enabled_swapchain_maintenance =
             if vulkan.enabled_instance_extension(ash::ext::surface_maintenance1::NAME) {
-                if utils::extensions_list_contains(
+                utils::extend_if_all_extensions_are_contained(
                     &available_extensions,
-                    ash::ext::swapchain_maintenance1::NAME,
-                ) {
+                    &[ash::ext::swapchain_maintenance1::NAME],
+                    &mut custom_extensions,
                     #[cfg(debug_assertions)]
-                    println!("INFO: Enabling VK_EXT_swapchain_maintenance1 device extension");
-                    custom_extensions.push(ash::ext::swapchain_maintenance1::NAME.as_ptr());
-
-                    true
-                } else {
-                    false
-                }
+                    utils::ExtensionType::Device,
+                )
             } else {
                 false
             };
-        let enabled_pageable_device_local_memory = if utils::extensions_list_contains(
+        let enabled_ray_tracing_device_extension = utils::extend_if_all_extensions_are_contained(
             &available_extensions,
-            ash::ext::memory_priority::NAME,
-        ) && utils::extensions_list_contains(
-            &available_extensions,
-            ash::ext::pageable_device_local_memory::NAME,
-        ) {
+            &[
+                ash::khr::deferred_host_operations::NAME,
+                ash::khr::acceleration_structure::NAME,
+                ash::khr::ray_query::NAME,
+                ash::khr::ray_tracing_pipeline::NAME,
+            ],
+            &mut custom_extensions,
             #[cfg(debug_assertions)]
-            println!("INFO: Enabling VK_EXT_memory_priority device extension");
-            custom_extensions.push(ash::ext::memory_priority::NAME.as_ptr());
-            #[cfg(debug_assertions)]
-            println!("INFO: Enabling VK_EXT_pageable_device_local_memory device extension");
-            custom_extensions.push(ash::ext::pageable_device_local_memory::NAME.as_ptr());
-            true
+            utils::ExtensionType::Device,
+        );
+
+        // Determine if the physical device supports ray tracing.
+        let ray_tracing = if enabled_ray_tracing_device_extension {
+            utils::physical_supports_ray_tracing(&vulkan.instance, physical_device)
         } else {
-            false
+            None
         };
+
+        let enabled_pageable_device_local_memory = utils::extend_if_all_extensions_are_contained(
+            &available_extensions,
+            &[
+                ash::ext::memory_priority::NAME,
+                ash::ext::pageable_device_local_memory::NAME,
+            ],
+            &mut custom_extensions,
+            #[cfg(debug_assertions)]
+            utils::ExtensionType::Device,
+        ) && device_features
+            .pageable_device_local_memory();
+        if ray_tracing.is_some() {
+            // Ensure that we toggle bits to vocalize our intent to enable ray tracing.
+            device_features.set_ray_tracing(true);
+        }
 
         // We required these features in physical device selection.
         // Now we can request the features be enabled over the logical device we create.
         // Ignore the features we are not interested in, and enable the ones we are.
-        let enabled_pageable_device_local_memory =
-            enabled_pageable_device_local_memory && device_features.pageable_device_local_memory();
         let mut features = ash::vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut device_features.dynamic_rendering)
             .push_next(&mut device_features.synchronization2)
@@ -171,9 +178,21 @@ impl Renderer {
         // Add optional device features when they are available.
         if enabled_pageable_device_local_memory {
             #[cfg(debug_assertions)]
-            println!("INFO: Enabling VK_EXT_pageable_device_local_memory device feature");
-
+            println!("INFO: Enabling VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT");
             features = features.push_next(&mut device_features.pageable_device_local_memory);
+        }
+        if ray_tracing.is_some() {
+            #[cfg(debug_assertions)]
+            println!("INFO: Enabling VkPhysicalDeviceAccelerationStructureFeaturesKHR");
+            features = features.push_next(&mut device_features.acceleration_structure);
+
+            #[cfg(debug_assertions)]
+            println!("INFO: Enabling VkPhysicalDeviceRayQueryFeaturesKHR");
+            features = features.push_next(&mut device_features.ray_query);
+
+            #[cfg(debug_assertions)]
+            println!("INFO: Enabling VkPhysicalDeviceRayTracingPipelineFeaturesKHR");
+            features = features.push_next(&mut device_features.ray_tracing);
         }
 
         // Collect all the device extensions we need to enable.
@@ -487,6 +506,11 @@ impl Renderer {
                 );
             }
         }
+    }
+
+    /// Get the extent of the swapchain images.
+    pub fn swapchain_extent(&self) -> ash::vk::Extent2D {
+        self.swapchain.extent()
     }
 
     /// Indicate that the swapchain needs to be recreated before next use.

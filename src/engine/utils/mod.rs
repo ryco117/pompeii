@@ -40,13 +40,50 @@ pub const EXPECTED_MAX_FRAMES_IN_FLIGHT: usize = 4;
 /// The number of nanoseconds in five seconds. Used for sane timeouts on synchronization objects.
 pub const FIVE_SECONDS_IN_NANOSECONDS: u64 = 5_000_000_000;
 
-/// Check if a list of extensions contains a specific extension name.
+/// Helper to check if a list of available extensions contains a specific extension name.
 pub fn extensions_list_contains(list: &[ash::vk::ExtensionProperties], ext: &CStr) -> bool {
     list.iter().any(|p| {
         p.extension_name_as_c_str()
             .expect("Extension name received from Vulkan is not a valid C-string")
             == ext
     })
+}
+
+#[cfg(debug_assertions)]
+#[derive(strum::Display)]
+#[strum(serialize_all = "snake_case")]
+/// Let helper functions know what kind of extension is being operated on.
+pub enum ExtensionType {
+    Instance,
+    Device,
+}
+
+/// Helper to easily add all of the `dependent_extensions` to the `total` list if they are all available.
+/// Returns `true` if all extensions are available and added to the `total` list.
+/// Otherwise, returns `false` and the `total` list is unchanged.
+pub fn extend_if_all_extensions_are_contained(
+    available_extensions: &[ash::vk::ExtensionProperties],
+    dependent_extensions: &[&CStr],
+    total: &mut Vec<*const i8>,
+    #[cfg(debug_assertions)] extension_type: ExtensionType,
+) -> bool {
+    if dependent_extensions
+        .iter()
+        .all(|ext| extensions_list_contains(&available_extensions, ext))
+    {
+        total.extend(dependent_extensions.iter().map(|ext| {
+            #[cfg(debug_assertions)]
+            println!(
+                "INFO: Enabling {} {extension_type} extension",
+                ext.to_string_lossy()
+            );
+
+            ext.as_ptr()
+        }));
+        true
+    } else {
+        false
+    }
 }
 
 /// A minimal helper for converting a Rust reference `&T` to a byte slice over the same memory.
@@ -90,13 +127,10 @@ impl VulkanCore {
         #[cfg(debug_assertions)]
         println!("INFO: Available instance extensions: {available_extensions:?}\n");
 
-        // Helper lambda for checking if an extension is available.
-        let available_contains = |ext: &CStr| extensions_list_contains(&available_extensions, ext);
-
         // Check that all of the required extensions are available.
         if let Some(missing) = required_extensions
             .iter()
-            .find(|ext| !available_contains(ext))
+            .find(|ext| !extensions_list_contains(&available_extensions, ext))
         {
             return Err(VulkanCoreError::MissingExtension(
                 missing.to_string_lossy().into_owned(),
@@ -105,9 +139,7 @@ impl VulkanCore {
 
         // Track which extensions are being enabled and convert those extensions to a list of pointers.
         let mut enabled_instance_extensions = std::collections::HashSet::new();
-        let mut extension_name_pointers: SmallVec<
-            [*const i8; EXPECTED_MAX_ENABLED_INSTANCE_EXTENSIONS],
-        > = required_extensions
+        let mut extension_name_pointers: Vec<*const i8> = required_extensions
             .iter()
             .map(|&e| {
                 // Add the required extensions to the enabled set.
@@ -119,58 +151,50 @@ impl VulkanCore {
             .collect();
 
         // Add all of the optional extensions to our creation set if they are available.
-        for feature in optional_extensions {
-            if available_contains(feature) {
+        for extension in optional_extensions {
+            if extensions_list_contains(&available_extensions, extension) {
                 #[cfg(debug_assertions)]
-                println!("INFO: Enabling optional extension '{feature:?}'");
+                println!("INFO: Enabling {extension:?} instance extension");
 
-                enabled_instance_extensions.insert(feature);
-                extension_name_pointers.push(feature.as_ptr());
+                enabled_instance_extensions.insert(extension);
+                extension_name_pointers.push(extension.as_ptr());
             }
         }
 
         // Optionally, enable `VK_EXT_swapchain_colorspace` if is is available and the dependent `VK_KHR_surface` is requested.
         let requiring_khr_surface = required_extensions.contains(&ash::khr::surface::NAME);
-        if requiring_khr_surface && available_contains(ash::ext::swapchain_colorspace::NAME) {
-            #[cfg(debug_assertions)]
-            println!("INFO: Enabling VK_EXT_swapchain_colorspace extension");
-
-            enabled_instance_extensions.insert(ash::ext::swapchain_colorspace::NAME);
-            extension_name_pointers.push(ash::ext::swapchain_colorspace::NAME.as_ptr());
+        if requiring_khr_surface {
+            extend_if_all_extensions_are_contained(
+                &available_extensions,
+                &[ash::ext::swapchain_colorspace::NAME],
+                &mut extension_name_pointers,
+                #[cfg(debug_assertions)]
+                ExtensionType::Instance,
+            );
         }
 
         // Optionally, enable `VK_KHR_get_surface_capabilities2` and `VK_EXT_surface_maintenance1` if they are available and the dependent `VK_KHR_surface` is requested.
-        if requiring_khr_surface
-            && available_contains(ash::khr::get_surface_capabilities2::NAME)
-            && available_contains(ash::ext::surface_maintenance1::NAME)
-        {
-            #[cfg(debug_assertions)]
-            println!("INFO: Enabling VK_KHR_get_surface_capabilities2 and VK_EXT_surface_maintenance1 extensions");
-
-            enabled_instance_extensions.insert(ash::khr::get_surface_capabilities2::NAME);
-            extension_name_pointers.push(ash::khr::get_surface_capabilities2::NAME.as_ptr());
-
-            enabled_instance_extensions.insert(ash::ext::surface_maintenance1::NAME);
-            extension_name_pointers.push(ash::ext::surface_maintenance1::NAME.as_ptr());
+        if requiring_khr_surface {
+            extend_if_all_extensions_are_contained(
+                &available_extensions,
+                &[
+                    ash::khr::get_surface_capabilities2::NAME,
+                    ash::ext::surface_maintenance1::NAME,
+                ],
+                &mut extension_name_pointers,
+                #[cfg(debug_assertions)]
+                ExtensionType::Instance,
+            );
         }
 
         // Add the debug utility extension if in debug mode.
         #[cfg(debug_assertions)]
-        if available_contains(ash::ext::debug_utils::NAME) {
-            println!("INFO: Enabling VK_EXT_debug_utils extension");
-
-            enabled_instance_extensions.insert(ash::ext::debug_utils::NAME);
-            extension_name_pointers.push(ash::ext::debug_utils::NAME.as_ptr());
-        }
-
-        #[cfg(debug_assertions)]
-        if extension_name_pointers.spilled() {
-            println!(
-                "INFO: Extension name pointers list has spilled over to the heap. Extension count {} greater than inline size {}",
-                extension_name_pointers.len(),
-                extension_name_pointers.inline_size(),
-            );
-        }
+        extend_if_all_extensions_are_contained(
+            &available_extensions,
+            &[ash::ext::debug_utils::NAME],
+            &mut extension_name_pointers,
+            ExtensionType::Instance,
+        );
 
         // Enable validation layers when using a debug build.
         #[cfg(debug_assertions)]
@@ -299,9 +323,9 @@ pub fn query_physical_feature_support(
     features
 }
 
-/// Query the extended properties of a physical device to determine if it supports ray tracing.
-#[allow(dead_code)]
-pub fn physical_supports_rtx(
+/// Query the extended properties of a physical device to determine if it supports ray tracing (e.g., RTX).
+/// If so, get the ray tracing pipeline properties.
+pub fn physical_supports_ray_tracing(
     instance: &ash::Instance,
     physical_device: ash::vk::PhysicalDevice,
 ) -> Option<ash::vk::PhysicalDeviceRayTracingPipelinePropertiesKHR> {
@@ -371,6 +395,26 @@ impl EnginePhysicalDeviceFeatures {
             && (!mask.synchronization2() || self.synchronization2())
     }
 
+    /// Set the required toggles to enable or disable the Vulkan ray-tracing (RTX) feature.
+    /// # Note
+    /// This function should only be called with `enable==true` if the internal structs are intended to be used to
+    /// query the physical device for support, and not as the truth of a device's support yet.
+    pub fn set_ray_tracing(&mut self, enable: bool) {
+        let enable = if enable {
+            ash::vk::TRUE
+        } else {
+            ash::vk::FALSE
+        };
+        self.acceleration_structure.acceleration_structure = enable;
+        self.ray_query.ray_query = enable;
+        self.ray_tracing.ray_tracing_pipeline = enable;
+    }
+
+    /// Return whether the required toggles are set to enable, or have enabled, Vulkan ray-tracing (RTX).
+    pub fn is_ray_tracing_set(&self) -> bool {
+        self.acceleration_structure() && self.ray_tracing() && self.ray_query()
+    }
+
     // Getters for features with a single state representing their support.
     pub fn acceleration_structure(&self) -> bool {
         self.acceleration_structure.acceleration_structure == ash::vk::TRUE
@@ -409,7 +453,8 @@ impl EnginePhysicalDeviceFeatures {
     }
 }
 
-/// Get all physical devices that support the minimum Vulkan API and the required extensions. Sort them by their likelihood of being the desired device.
+/// Get all physical devices that support the minimum Vulkan API and the required extensions.
+/// Sort them by their likelihood of being the desired device.
 pub fn get_sorted_physical_devices(
     instance: &ash::Instance,
     minimum_version: u32,
@@ -906,7 +951,7 @@ impl Swapchain {
         let khr = vulkan
             .khr
             .as_ref()
-            .expect("Vulkan instance does not support the KHR surface extension");
+            .expect("Vulkan instance does not support the KHR surface instance extension");
         let surface_capabilities = unsafe {
             khr.get_physical_device_surface_capabilities(physical_device, surface)
                 .expect("Unable to get surface capabilities")
