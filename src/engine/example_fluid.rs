@@ -7,20 +7,20 @@ use crate::engine::utils::{
 pub mod shaders {
     /// Standard triangle-example fragment shader.
     pub const FLUID_ADVECTION: &[u32] =
-        inline_spirv::include_spirv!("src/shaders/example_fluid_advection.comp", comp, glsl);
+        inline_spirv::include_spirv!("src/shaders/example_fluid/advection.comp", comp, glsl);
     pub const FLUID_CURL: &[u32] =
-        inline_spirv::include_spirv!("src/shaders/example_fluid_curl.comp", comp, glsl);
+        inline_spirv::include_spirv!("src/shaders/example_fluid/curl.comp", comp, glsl);
     pub const FLUID_DIVERGENCE: &[u32] =
-        inline_spirv::include_spirv!("src/shaders/example_fluid_divergence.comp", comp, glsl);
+        inline_spirv::include_spirv!("src/shaders/example_fluid/divergence.comp", comp, glsl);
     pub const FLUID_GRADIENT_SUBTRACT: &[u32] = inline_spirv::include_spirv!(
-        "src/shaders/example_fluid_gradient_subtract.comp",
+        "src/shaders/example_fluid/gradient_subtract.comp",
         comp,
         glsl
     );
     pub const FLUID_PRESSURE: &[u32] =
-        inline_spirv::include_spirv!("src/shaders/example_fluid_pressure.comp", comp, glsl);
+        inline_spirv::include_spirv!("src/shaders/example_fluid/pressure.comp", comp, glsl);
     pub const FLUID_VORTICITY: &[u32] =
-        inline_spirv::include_spirv!("src/shaders/example_fluid_vorticity.comp", comp, glsl);
+        inline_spirv::include_spirv!("src/shaders/example_fluid/vorticity.comp", comp, glsl);
     pub const FLUID_FRAGMENT: &[u32] =
         inline_spirv::include_spirv!("src/shaders/example_fluid.frag", frag, glsl);
 }

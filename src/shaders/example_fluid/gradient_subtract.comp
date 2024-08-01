@@ -2,13 +2,11 @@
 #version 460
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(scalar, buffer_reference, buffer_reference_align = 16) buffer VelocityTexture {
-  vec2 v[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer UnusedVelocityTexture {
   vec2 v[];
 };
 layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer CurlTexture {
@@ -24,31 +22,7 @@ layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer Dy
   vec4 c[];
 };
 
-layout(scalar, push_constant) uniform PushConstants {
-  // Store GPU pointers to each texture/buffer.
-  VelocityTexture input_velocity;
-  CurlTexture curl;
-  DivergenceTexture divergence;
-  PressureTexture alpha_pressure;
-  PressureTexture beta_pressure;
-  UnusedVelocityTexture output_velocity;
-  DyeTexture input_dye;
-  DyeTexture output_dye;
-
-  vec4 cursor_dye;
-  vec2 cursor_position;
-  vec2 cursor_velocity;
-  ivec2 screen_size;
-  float delta_time;
-  float velocity_diffusion_rate;
-  float dye_diffusion_rate;
-  float vorticity_strength; // Sane values are 0 to 50. Default is 30.
-} push_constants;
-
-int texture_index(ivec2 uv) {
-  uv = clamp(uv, ivec2(0), push_constants.screen_size - ivec2(1));
-  return uv.y * push_constants.screen_size.x + uv.x;
-}
+#include "shared.glsl"
 
 // Use the `curl` field to update the velocity field. The goal is to increase the vorticity of the fluid.
 void main() {
