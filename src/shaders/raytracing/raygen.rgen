@@ -1,0 +1,83 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "shared.glsl"
+
+layout(location = 0) rayPayloadEXT RayPayload ray_payload;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT top_level_accel_struct;
+layout(set = 1, binding = 0, rgba8) uniform image2D output_image;
+
+layout(scalar, push_constant) uniform PushConstants {
+  mat4 view_inverse;
+  mat4 proj_inverse;
+  float time;
+} push_constants;
+
+// The number of sample rays cast per pixel.
+const int MAX_SAMPLES = 1;
+const float INV_MAX_SAMPLES = 1.0 / float(MAX_SAMPLES);
+
+// The maximum number of bounces for a ray.
+const uint MAX_BOUNCES = 1;
+
+void main() {
+  // TODO: Vary the seed over time as well as pixel index.
+  const uint seed_index = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
+
+  // The final color of the pixel accumulated across all samples.
+  vec3 final_color = vec3(0);
+
+  for(int j = 0; j < MAX_SAMPLES; ++j) {
+    // TODO: Random per-sample jittering to help achieve a more uniform distribution of samples.
+    vec2 pixel_center = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
+
+    const vec4 origin = push_constants.view_inverse * vec4(0, 0, 0, 1);
+    const vec4 target = push_constants.proj_inverse * vec4(2.0 * pixel_center / vec2(gl_LaunchSizeEXT.xy) - vec2(1), 1, 1);
+    const vec4 direction = push_constants.view_inverse * vec4(normalize(target.xyz / target.w), 0);
+
+    // Initialize the ray payload parameters.
+    ray_payload.seed = seed_index;
+    ray_payload.bounce_count = 0;
+    ray_payload.exit = false;
+
+    // Set the initial ray lighting values.
+    ray_payload.throughput = vec3(1);
+    ray_payload.radiance = vec3(0);
+
+    // Ray tracing loop.
+    for(uint i = 0; i < MAX_BOUNCES; ++i) {
+      ray_payload.bounce_count = i;
+
+      // The index of the miss shader to execute.
+      uint miss_shader_index = 0;
+
+      // TODO: Enable greater flexibility than strictly opaque intersections.
+      traceRayEXT(top_level_accel_struct, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, miss_shader_index, origin.xyz, 0.001, direction.xyz, 10000.0, 0);
+      if(ray_payload.exit) {
+        break;
+      }
+    }
+
+    // The color accumulated for the current sample ray.
+    vec3 ray_color = ray_payload.radiance / MAX_SAMPLES;
+
+    // Helper to reduce "fireflies" in the ray traced image.
+    float luminance = dot(ray_color, vec3(0.212671, 0.715160, 0.072169));
+    if(luminance > 45.7) {
+      ray_color *= 45.7 / luminance;
+    }
+
+    final_color += ray_color;
+  }
+
+  // Normalize the final color by the number of samples.
+  final_color *= INV_MAX_SAMPLES;
+
+  // TODO: Consider using an accumulation buffer to allow aliasing over time.
+
+  // Write the final color to the output image.
+  imageStore(output_image, ivec2(gl_LaunchIDEXT.xy), vec4(linear_to_srgb(final_color), 0));
+}

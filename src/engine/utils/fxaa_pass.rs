@@ -6,7 +6,7 @@ const FXAA_FRAGMENT: &[u32] =
 
 /// Define the push constants that are used in the fragment shader of the FXAA algorithm.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy, Debug, bytemuck::NoUninit)]
 pub struct PushConstants {
     /// The width and height of the render surface, as `f32`s.
     pub inverse_screen_size: [f32; 2],
@@ -396,10 +396,13 @@ impl FxaaPass {
     where
         I: IntoIterator<Item = ash::vk::ImageView>,
     {
+        // Define the common layout for each descriptor set to create.
         let descriptor_set_layout = [descriptor_set_layout];
         let descriptor_set_info = ash::vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
             .set_layouts(&descriptor_set_layout);
+
+        // Create a descriptor set for each image view that will be sampled from during render passes.
         internal_image_views
             .into_iter()
             .map(|image_view| {
@@ -445,7 +448,7 @@ impl FxaaPass {
         image_index: usize,
     ) {
         unsafe {
-            //Use a pipeline barrier to ensure that we are able to read the input sampler in the correct layout.
+            // Use a pipeline barrier to ensure that we are able to read the input sampler in the correct layout.
             let image_barrier = ash::vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(ash::vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                 .src_access_mask(ash::vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
@@ -453,14 +456,15 @@ impl FxaaPass {
                 .dst_access_mask(ash::vk::AccessFlags2::SHADER_READ)
                 .old_layout(ash::vk::ImageLayout::ATTACHMENT_OPTIMAL)
                 .new_layout(ash::vk::ImageLayout::READ_ONLY_OPTIMAL)
+                .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
                 .image(self.framebuffers[image_index].2)
-                .subresource_range(ash::vk::ImageSubresourceRange {
-                    aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                });
+                .subresource_range(
+                    ash::vk::ImageSubresourceRange::default()
+                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
             device.cmd_pipeline_barrier2(
                 command_buffer,
                 &ash::vk::DependencyInfo::default().image_memory_barriers(&[image_barrier]),
@@ -490,7 +494,7 @@ impl FxaaPass {
                 self.pipeline.layout,
                 ash::vk::ShaderStageFlags::FRAGMENT,
                 0,
-                super::data_byte_slice(&push_constants),
+                bytemuck::bytes_of(&push_constants),
             );
         }
 

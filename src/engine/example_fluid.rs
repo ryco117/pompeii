@@ -31,7 +31,7 @@ const MAX_PRESSURE_SMOOTHING_ITERATIONS: u32 = 16;
 
 /// Define the shared push constants for each compute stage of this minimal fluid simulation.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy, Debug, bytemuck::NoUninit)]
 pub struct PushConstants {
     // GPU device addresses.
     pub input_velocity_buffer: ash::vk::DeviceAddress,
@@ -60,7 +60,7 @@ pub struct PushConstants {
 
 /// Define the texture to display from the fluid simulation.
 #[repr(u32)]
-#[derive(Clone, Copy, Debug, Default, strum::EnumCount, strum::FromRepr)]
+#[derive(Clone, Copy, Debug, Default, strum::EnumCount, strum::FromRepr, bytemuck::NoUninit)]
 pub enum FluidDisplayTexture {
     #[default]
     Velocity,
@@ -81,7 +81,7 @@ impl FluidDisplayTexture {
 
 /// Use a separate set of push constants to choose how to render the output of the fluid simulation.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::NoUninit)]
 struct FragmentPushConstants {
     // GPU device addresses.
     pub velocity_buffer: ash::vk::DeviceAddress,
@@ -91,6 +91,9 @@ struct FragmentPushConstants {
     // Fluid simulation parameters.
     pub screen_size: [u32; 2],
     pub display_texture: FluidDisplayTexture,
+
+    #[allow(dead_code)]
+    _padding: u32,
 }
 
 /// Create the render pass capable of orchestrating the rendering of framebuffers for this application.
@@ -167,63 +170,33 @@ fn create_render_pass(
 
 /// Helper type for managing the resources for an allocated image.
 pub struct AllocatedBuffer {
-    pub buffer: ash::vk::Buffer,
-    pub allocation: gpu_allocator::vulkan::Allocation,
+    pub buffer: utils::buffers::BufferAllocation,
     pub device_address: ash::vk::DeviceAddress,
 }
 impl AllocatedBuffer {
     /// Create a new image with the given information.
     pub fn new(
         device: &ash::Device,
+        pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
         memory_allocator: &mut gpu_allocator::vulkan::Allocator,
         buffer_info: &ash::vk::BufferCreateInfo,
         image_debug_name: &str,
-        pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
     ) -> Self {
-        let (buffer, requirements) = unsafe {
-            let buffer = device
-                .create_buffer(buffer_info, None)
-                .expect("Unable to create the buffer for the fluid simulation");
-            let mut requirements = device.get_buffer_memory_requirements(buffer);
-
-            // Ensure that the buffer is aligned to 16 bytes.
-            // The shaders are each expecting the storage buffers to be aligned to 16 bytes.
-            if requirements.alignment > 16 {
-                println!(
-                    "INFO: Buffer alignment requirement is greater than 16 bytes: {}",
-                    requirements.alignment
-                );
-            } else {
-                requirements.alignment = 16;
-            }
-
-            (buffer, requirements)
-        };
-
-        let allocation = memory_allocator
-            .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
-                name: image_debug_name,
-                requirements,
-                location: gpu_allocator::MemoryLocation::GpuOnly,
-                linear: true,
-                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::DedicatedBuffer(buffer),
-            })
-            .expect("Unable to allocate the buffer for the fluid simulation");
-        let memory = unsafe { allocation.memory() };
-
-        // Optionally, set the memory priority to allow the driver to optimize the memory usage.
-        if let Some(device_ext) = pageable_device_local_memory {
-            unsafe {
-                (device_ext.fp().set_device_memory_priority_ext)(device.handle(), memory, 1.0);
-            };
-        }
-
-        unsafe { device.bind_buffer_memory(buffer, memory, allocation.offset()) }
-            .expect("Unable to bind the buffer memory for the fluid simulation");
+        // Ensure that the buffer is aligned to 16 bytes.
+        // The shaders are each expecting the storage buffers to be aligned to 16 bytes.
+        let buffer = utils::buffers::new_device_local(
+            device,
+            pageable_device_local_memory.map(|d| (d, 1.)),
+            memory_allocator,
+            buffer_info,
+            Some(16),
+            image_debug_name,
+        )
+        .expect("Unable to create fluid simulation buffer");
 
         let device_address = unsafe {
             device.get_buffer_device_address(
-                &ash::vk::BufferDeviceAddressInfo::default().buffer(buffer),
+                &ash::vk::BufferDeviceAddressInfo::default().buffer(buffer.buffer),
             )
         };
         #[cfg(debug_assertions)]
@@ -234,23 +207,17 @@ impl AllocatedBuffer {
 
         Self {
             buffer,
-            allocation,
             device_address,
         }
     }
 
-    /// Destroy the image and its view.
+    /// Destroy the buffer and its memory.
     pub fn destroy(
         self,
         device: &ash::Device,
         memory_allocator: &mut gpu_allocator::vulkan::Allocator,
     ) {
-        unsafe {
-            device.destroy_buffer(self.buffer, None);
-        }
-        memory_allocator
-            .free(self.allocation)
-            .expect("Unable to free the image allocation");
+        self.buffer.destroy(device, memory_allocator);
     }
 }
 
@@ -274,65 +241,65 @@ pub fn create_framebuffers(
     buffer_info.size = pixel_count * std::mem::size_of::<[f32; 2]>() as u64;
     let input_velocity_image = AllocatedBuffer::new(
         device,
+        pageable_device_local_memory,
         memory_allocator,
         &buffer_info,
         "Fluid Sim input velocity buffer",
-        pageable_device_local_memory,
     );
 
     buffer_info.size = pixel_count * std::mem::size_of::<f32>() as u64;
     let curl_image = AllocatedBuffer::new(
         device,
+        pageable_device_local_memory,
         memory_allocator,
         &buffer_info,
         "Fluid Sim curl buffer",
-        pageable_device_local_memory,
     );
     let divergence_image = AllocatedBuffer::new(
         device,
+        pageable_device_local_memory,
         memory_allocator,
         &buffer_info,
         "Fluid Sim divergence buffer",
-        pageable_device_local_memory,
     );
     let alpha_pressure_image = AllocatedBuffer::new(
         device,
+        pageable_device_local_memory,
         memory_allocator,
         &buffer_info,
         "Fluid Sim alpha pressure buffer",
-        pageable_device_local_memory,
     );
     let beta_pressure_image = AllocatedBuffer::new(
         device,
+        pageable_device_local_memory,
         memory_allocator,
         &buffer_info,
         "Fluid Sim beta pressure buffer",
-        pageable_device_local_memory,
     );
 
     buffer_info.size = pixel_count * std::mem::size_of::<[f32; 2]>() as u64;
     let output_velocity_image = AllocatedBuffer::new(
         device,
+        pageable_device_local_memory,
         memory_allocator,
         &buffer_info,
         "Fluid Sim output velocity buffer",
-        pageable_device_local_memory,
     );
 
     buffer_info.size = pixel_count * std::mem::size_of::<[f32; 4]>() as u64;
     let input_dye_image = AllocatedBuffer::new(
         device,
+        pageable_device_local_memory,
         memory_allocator,
         &buffer_info,
         "Fluid Sim input dye buffer",
-        pageable_device_local_memory,
     );
     let output_dye_image = AllocatedBuffer::new(
         device,
+        pageable_device_local_memory,
         memory_allocator,
         &buffer_info,
         "Fluid Sim output dye buffer",
-        pageable_device_local_memory,
     );
 
     // The actual render pass framebuffers simply draw to the destination views as color attachments.
@@ -837,7 +804,7 @@ impl FluidSimulation {
                 self.compute_pipeline_layout,
                 ash::vk::ShaderStageFlags::COMPUTE,
                 0,
-                utils::data_byte_slice(push_constants),
+                bytemuck::bytes_of(push_constants),
             );
 
             // NOTE: The use of `8` here is directly related to the local group size in the compute shaders.
@@ -1034,13 +1001,14 @@ impl FluidSimulation {
                 pressure_buffer: self.allocated_images[3].device_address,
                 screen_size: [extent.width, extent.height],
                 display_texture: self.current_display_texture,
+                ..Default::default()
             };
             device.cmd_push_constants(
                 graphics_command_buffer,
                 self.graphics_pipeline_layout,
                 ash::vk::ShaderStageFlags::FRAGMENT,
                 0,
-                utils::data_byte_slice(&push_constants),
+                bytemuck::bytes_of(&push_constants),
             );
         }
 

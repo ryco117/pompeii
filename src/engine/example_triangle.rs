@@ -16,7 +16,7 @@ pub mod shaders {
 /// Define the specialization constants that can be used with the shaders of this application.
 /// Specifically, this shader only accepts a single `boolean32` that toggles the reflection of the triangle along the Y axis.
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::NoUninit)]
 pub struct SpecializationConstants {
     /// Reflect the vertices of the triangle along their Y axis.
     pub toggle: u32,
@@ -25,7 +25,7 @@ pub struct SpecializationConstants {
 /// Define the push constants that can be used with the shaders of this application (i.e., `BB_TRIANGLE_FRAGMENT`).
 /// Specifically, this shader only accepts a single float representing a time in seconds since the application start.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy, Debug, bytemuck::NoUninit)]
 pub struct PushConstants {
     /// The time in seconds since the application started.
     pub time: f32,
@@ -264,7 +264,7 @@ impl Pipeline {
         }];
         let vertex_specialization_constants = ash::vk::SpecializationInfo::default()
             .map_entries(&specialization_map_toggle)
-            .data(utils::data_byte_slice(&specialization_constants));
+            .data(bytemuck::bytes_of(&specialization_constants));
 
         // Use the input shaders or process the shaders the default.
         let vertex_module = vertex_module
@@ -504,7 +504,7 @@ impl Pipeline {
                 self.layout,
                 ash::vk::ShaderStageFlags::FRAGMENT,
                 0,
-                utils::data_byte_slice(push_constants),
+                bytemuck::bytes_of(push_constants),
             );
         }
 

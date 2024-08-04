@@ -1,5 +1,6 @@
 use std::ffi::CStr;
 
+use nalgebra_glm as glm;
 use smallvec::SmallVec;
 use winit::{
     event_loop::EventLoop,
@@ -166,6 +167,22 @@ impl PompeiiApp {
                 );
                 engine::DemoPushConstants::Fluid(push_constants)
             }
+
+            engine::DemoPipeline::RayTracing(_) => {
+                engine::DemoPushConstants::RayTracing(engine::example_ray_tracing::PushConstants {
+                    view_inverse: glm::Mat4::new_rotation(glm::Vec3::new(0., time, 0.))
+                        * glm::Mat4::new_translation(&glm::Vec3::new(0., 0., 2.5)),
+                    proj_inverse: glm::Mat4::new_perspective(
+                        extent.width as f32 / extent.height as f32,
+                        std::f32::consts::FRAC_PI_2 * (8. / 9.), // 80 degrees.
+                        0.1,
+                        512.,
+                    )
+                    .try_inverse()
+                    .unwrap_or_else(glm::Mat4::identity),
+                    time,
+                })
+            }
         };
 
         {
@@ -180,7 +197,7 @@ impl PompeiiApp {
     }
 
     /// Redraw the window surface if we have initialized the relevant components.
-    fn redraw(&mut self, push_constants: engine::DemoPushConstants) {
+    fn redraw(&mut self, push_constants: &engine::DemoPushConstants) {
         let Some(PompeiiGraphics { renderer, .. }) = &mut self.graphics else {
             return;
         };
@@ -196,7 +213,7 @@ impl PompeiiApp {
         self.tick_count += 1;
 
         // Attempt to render the frame, or bail if there is a recoverable error.
-        renderer.render_frame(&self.vulkan, &push_constants);
+        renderer.render_frame(&self.vulkan, push_constants);
     }
 
     /// Handle keyboard input events.
@@ -251,20 +268,32 @@ impl PompeiiApp {
                             );
                         }
                         engine::DemoPipeline::Fluid(f) => f.next_display_texture(),
+                        engine::DemoPipeline::RayTracing(_) => (),
                     }
                 }
 
                 winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab) => {
-                    // Update the specialization constants for the renderer.
                     let Some(PompeiiGraphics { renderer, .. }) = &mut self.graphics else {
                         return;
                     };
 
+                    let ray_tracing_enabled = renderer.ray_tracing_enabled();
                     let new_demo = match renderer.active_demo {
+                        // Triangle -> Fluid.
                         engine::DemoPipeline::Triangle(_) => engine::NewDemo::Fluid,
-                        engine::DemoPipeline::Fluid(_) => engine::NewDemo::Triangle(
-                            engine::example_triangle::SpecializationConstants::default(),
-                        ),
+
+                        // Fluid -> RayTracing.
+                        // Skip ray tracing if it's not supported.
+                        engine::DemoPipeline::Fluid(_) if ray_tracing_enabled => {
+                            engine::NewDemo::RayTracing
+                        }
+
+                        // RayTracing -> Triangle.
+                        engine::DemoPipeline::Fluid(_) | engine::DemoPipeline::RayTracing(_) => {
+                            engine::NewDemo::Triangle(
+                                engine::example_triangle::SpecializationConstants::default(),
+                            )
+                        }
                     };
 
                     println!("Switching to new demo: {new_demo:?}");
@@ -374,12 +403,14 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
                     return;
                 };
 
-                // Ensure we do not request a swapchain recreation with an area of zero.
-                if width == 0 || height == 0 {
+                // Ensure we do not request a swapchain recreation with an area of zero, or the same .
+                if (width == 0 || height == 0)
+                    || (renderer.swapchain_extent() == ash::vk::Extent2D { width, height })
+                {
                     return;
                 }
 
-                renderer.swapchain_resize_required(Some(ash::vk::Extent2D { width, height }));
+                renderer.swapchain_recreation_required(Some(ash::vk::Extent2D { width, height }));
             }
 
             // Redraw the window surface when requested.
@@ -418,7 +449,7 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
                             "ERROR: Swapchain is out of date at window-size check, needs to be recreated."
                         );
 
-                        renderer.swapchain_resize_required(Some(window_size));
+                        renderer.swapchain_recreation_required(Some(window_size));
                         return;
                     }
                 }
@@ -427,7 +458,7 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
                 let push_constants = self.update_gamestate();
 
                 // Submit to the GPU that the next frame be drawn.
-                self.redraw(push_constants);
+                self.redraw(&push_constants);
             }
 
             // Handle keyboard input events.

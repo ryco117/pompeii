@@ -4,6 +4,7 @@ use smallvec::{smallvec, SmallVec};
 use utils::{fxaa_pass::FxaaPass, EXPECTED_MAX_FRAMES_IN_FLIGHT, FIVE_SECONDS_IN_NANOSECONDS};
 
 pub mod example_fluid;
+pub mod example_ray_tracing;
 pub mod example_triangle;
 pub mod utils;
 
@@ -11,6 +12,7 @@ pub mod utils;
 pub enum DemoPipeline {
     Triangle(example_triangle::Pipeline),
     Fluid(example_fluid::FluidSimulation),
+    RayTracing(example_ray_tracing::ExampleRayTracing),
 }
 
 /// The push constants necessary to render the active demo.
@@ -18,6 +20,7 @@ pub enum DemoPipeline {
 pub enum DemoPushConstants {
     Triangle(example_triangle::PushConstants),
     Fluid(example_fluid::PushConstants),
+    RayTracing(example_ray_tracing::PushConstants),
 }
 
 /// Whether a swapchain resize is necessary or not.
@@ -32,6 +35,11 @@ pub struct Renderer {
     device_extensions: HashSet<&'static CStr>,
     pub logical_device: ash::Device,
     pageable_device_local_memory: Option<ash::ext::pageable_device_local_memory::Device>,
+    ray_tracing: Option<(
+        ash::khr::acceleration_structure::Device,
+        ash::khr::ray_tracing_pipeline::Device,
+        ash::vk::PhysicalDeviceRayTracingPipelinePropertiesKHR<'static>,
+    )>,
     memory_allocator: gpu_allocator::vulkan::Allocator,
 
     surface: ash::vk::SurfaceKHR,
@@ -67,6 +75,7 @@ pub enum DemoSpecializationConstants {
 pub enum NewDemo {
     Triangle(example_triangle::SpecializationConstants),
     Fluid,
+    RayTracing,
 }
 
 impl Renderer {
@@ -138,6 +147,7 @@ impl Renderer {
                 ash::khr::acceleration_structure::NAME,
                 ash::khr::ray_query::NAME,
                 ash::khr::ray_tracing_pipeline::NAME,
+                ash::khr::ray_tracing_maintenance1::NAME,
             ],
             &mut custom_extensions,
             #[cfg(debug_assertions)]
@@ -146,7 +156,7 @@ impl Renderer {
 
         // Determine if the physical device supports ray tracing.
         let ray_tracing = if enabled_ray_tracing_device_extension {
-            utils::physical_supports_ray_tracing(&vulkan.instance, physical_device)
+            utils::ray_tracing::physical_supports_ray_tracing(&vulkan.instance, physical_device)
         } else {
             None
         };
@@ -193,6 +203,10 @@ impl Renderer {
             #[cfg(debug_assertions)]
             println!("INFO: Enabling VkPhysicalDeviceRayTracingPipelineFeaturesKHR");
             features = features.push_next(&mut device_features.ray_tracing);
+
+            #[cfg(debug_assertions)]
+            println!("INFO: Enabling VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR");
+            features = features.push_next(&mut device_features.ray_tracing_maintenance);
         }
 
         // Collect all the device extensions we need to enable.
@@ -211,6 +225,7 @@ impl Renderer {
             Some(&mut features),
         );
 
+        // Create device instances for the optional features enabled on this device.
         let pageable_device_local_memory = if enabled_pageable_device_local_memory {
             Some(ash::ext::pageable_device_local_memory::Device::new(
                 &vulkan.instance,
@@ -219,6 +234,16 @@ impl Renderer {
         } else {
             None
         };
+        let ray_tracing = ray_tracing.map(|p| {
+            #[cfg(debug_assertions)]
+            println!("INFO: Enabling ray tracing pipeline with properties: {p:?}");
+
+            (
+                ash::khr::acceleration_structure::Device::new(&vulkan.instance, &logical_device),
+                ash::khr::ray_tracing_pipeline::Device::new(&vulkan.instance, &logical_device),
+                p,
+            )
+        });
 
         let (graphics_index, compute_index, present_index) = {
             // NOTE: Prefer that the graphics and compute queues are equivalent because the `example_fluid` module will benefit from shared resources.
@@ -401,11 +426,9 @@ impl Renderer {
         let command_buffers = unsafe {
             let mut c = Vec::new();
             c.resize_with(frames_in_flight, || {
-                *logical_device
+                logical_device
                     .allocate_command_buffers(&command_buffer_info)
-                    .expect("Unable to allocate command buffer")
-                    .first()
-                    .expect("No command buffers were allocated")
+                    .expect("Unable to allocate command buffer")[0]
             });
             c
         };
@@ -433,6 +456,7 @@ impl Renderer {
                 .collect::<HashSet<_>>(),
             logical_device,
             pageable_device_local_memory,
+            ray_tracing,
             memory_allocator,
 
             surface,
@@ -478,6 +502,13 @@ impl Renderer {
                 DemoPipeline::Fluid(mut simulation) => {
                     simulation.destroy(&self.logical_device, &mut self.memory_allocator);
                 }
+                DemoPipeline::RayTracing(ray_tracing) => {
+                    ray_tracing.destroy(
+                        &self.logical_device,
+                        &self.ray_tracing.as_ref().unwrap().0,
+                        &mut self.memory_allocator,
+                    );
+                }
             }
 
             if let Some(mut fxaa_pass) = self.fxaa_pass.take() {
@@ -514,7 +545,8 @@ impl Renderer {
     }
 
     /// Indicate that the swapchain needs to be recreated before next use.
-    pub fn swapchain_resize_required(&mut self, new_extent: Option<ash::vk::Extent2D>) {
+    /// Generally, this is used when the window is resized. However, other changes may require a swapchain recreation.
+    pub fn swapchain_recreation_required(&mut self, new_extent: Option<ash::vk::Extent2D>) {
         if let Some(extent) = new_extent {
             self.swapchain_preferences.preferred_extent = Some(extent);
         }
@@ -593,6 +625,8 @@ impl Renderer {
                         self.pageable_device_local_memory.as_ref(),
                     );
                 }
+                DemoPipeline::RayTracing(tracer) => tracer
+                    .recreate_descriptor_sets(&self.logical_device, self.swapchain.image_views()),
             }
         } else {
             // Wait for the resources to be available for destruction.
@@ -631,6 +665,8 @@ impl Renderer {
                     simulation.destroy(&self.logical_device, &mut self.memory_allocator);
                     *simulation = new_sim;
                 }
+                DemoPipeline::RayTracing(tracer) => tracer
+                    .recreate_descriptor_sets(&self.logical_device, self.swapchain.image_views()),
             }
         }
 
@@ -657,7 +693,6 @@ impl Renderer {
         let utils::NextSwapchainImage {
             image_index,
             suboptimal,
-            ..
         } = match self.swapchain.acquire_next_image() {
             Ok(f) => f,
 
@@ -684,7 +719,7 @@ impl Renderer {
                 }
 
                 println!("WARN: Swapchain is out of date at image acquire, needs to be recreated.");
-                self.swapchain_resize_required(
+                self.swapchain_recreation_required(
                     if surface_capabilities.current_extent == utils::SPECIAL_SURFACE_EXTENT {
                         None
                     } else {
@@ -759,6 +794,21 @@ impl Renderer {
                     image_index as usize,
                     push_constants,
                     frame_graphics_fence,
+                );
+            }
+            DemoPipeline::RayTracing(ray_tracing) => {
+                let DemoPushConstants::RayTracing(push_constants) = push_constants else {
+                    panic!("Push constants do not match the active demo");
+                };
+                ray_tracing.record_command_buffer(
+                    &self.logical_device,
+                    &self.ray_tracing.as_ref().unwrap().1,
+                    command_buffer,
+                    &self.ray_tracing.as_ref().unwrap().2,
+                    self.swapchain.images()[image_index as usize],
+                    image_index,
+                    extent,
+                    push_constants,
                 );
             }
         }
@@ -845,7 +895,7 @@ impl Renderer {
                 println!(
                     "WARN: Swapchain is out of date at image presentation, needs to be recreated."
                 );
-                self.swapchain_resize_required(
+                self.swapchain_recreation_required(
                     if surface_capabilities.current_extent == utils::SPECIAL_SURFACE_EXTENT {
                         None
                     } else {
@@ -912,13 +962,13 @@ impl Renderer {
 
     /// Toggle which demo is currently active.
     pub fn switch_demo(&mut self, new_demo: NewDemo) {
-        match new_demo {
+        let mut new_demo = match new_demo {
             NewDemo::Triangle(constants) => {
                 if let DemoPipeline::Triangle(_) = &self.active_demo {
                     return;
                 }
 
-                let mut new_triangle = DemoPipeline::Triangle(example_triangle::Pipeline::new(
+                DemoPipeline::Triangle(example_triangle::Pipeline::new(
                     &self.logical_device,
                     None,
                     None,
@@ -933,27 +983,14 @@ impl Renderer {
                     &self.swapchain,
                     constants,
                     self.fxaa_pass.as_ref(),
-                ));
-
-                self.wait_for_tasks();
-                std::mem::swap(&mut self.active_demo, &mut new_triangle);
-                let old_demo = new_triangle; // Rename for clarity.
-
-                match old_demo {
-                    DemoPipeline::Fluid(mut simulation) => {
-                        simulation.destroy(&self.logical_device, &mut self.memory_allocator);
-                    }
-                    DemoPipeline::Triangle(_) => {
-                        panic!("switch_demo: Wait, I thought we were not using the `Triangle` pipeline at the top of this function...");
-                    }
-                }
+                ))
             }
             NewDemo::Fluid => {
                 if let DemoPipeline::Fluid(_) = &self.active_demo {
                     return;
                 }
 
-                let mut new_fluid = DemoPipeline::Fluid(example_fluid::FluidSimulation::new(
+                DemoPipeline::Fluid(example_fluid::FluidSimulation::new(
                     &self.logical_device,
                     &mut self.memory_allocator,
                     self.swapchain.extent(),
@@ -963,21 +1000,55 @@ impl Renderer {
                     self.compute_command_pool
                         .map_or(self.command_pool, |(pool, _)| pool),
                     self.pageable_device_local_memory.as_ref(),
-                ));
-
-                self.wait_for_tasks();
-                std::mem::swap(&mut self.active_demo, &mut new_fluid);
-                let old_demo = new_fluid; // Rename for clarity.
-
-                match old_demo {
-                    DemoPipeline::Triangle(triangle) => {
-                        triangle.destroy(&self.logical_device, true, true);
-                    }
-                    DemoPipeline::Fluid(_) => {
-                        panic!("switch_demo: Wait, I thought we were not using the `Fluid` pipeline at the top of this function...");
-                    }
+                ))
+            }
+            NewDemo::RayTracing => {
+                if let DemoPipeline::RayTracing(_) = &self.active_demo {
+                    return;
                 }
+
+                let (command_pool, queue) = self.compute_command_pool.clone().map_or(
+                    (self.command_pool, self.graphics_queue.queue),
+                    |(pool, _)| (pool, self.compute_queue.queue),
+                );
+                DemoPipeline::RayTracing(example_ray_tracing::ExampleRayTracing::new(
+                    &self.logical_device,
+                    &self.ray_tracing.as_ref().unwrap().0,
+                    &self.ray_tracing.as_ref().unwrap().1,
+                    self.pageable_device_local_memory.as_ref(),
+                    &mut self.memory_allocator,
+                    command_pool,
+                    queue,
+                    self.swapchain.image_views(),
+                    &self.ray_tracing.as_ref().unwrap().2,
+                ))
+            }
+        };
+
+        self.wait_for_tasks();
+        std::mem::swap(&mut self.active_demo, &mut new_demo);
+        let old_demo = new_demo; // Rename for clarity after swapping.
+
+        // Delete the old demo.
+        match old_demo {
+            DemoPipeline::Triangle(triangle) => {
+                triangle.destroy(&self.logical_device, true, true);
+            }
+            DemoPipeline::Fluid(mut simulation) => {
+                simulation.destroy(&self.logical_device, &mut self.memory_allocator);
+            }
+            DemoPipeline::RayTracing(ray_tracing) => {
+                ray_tracing.destroy(
+                    &self.logical_device,
+                    &self.ray_tracing.as_ref().unwrap().0,
+                    &mut self.memory_allocator,
+                );
             }
         }
+    }
+
+    /// Check if the renderer is capable of using the Vulkan ray tracing pipeline.
+    pub fn ray_tracing_enabled(&self) -> bool {
+        self.ray_tracing.is_some()
     }
 }

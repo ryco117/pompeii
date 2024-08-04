@@ -1,3 +1,6 @@
+#ifndef FLUID_SHARED_GLSL
+#define FLUID_SHARED_GLSL 1
+
 // The push constants are passed to each compute shader used in the fluid simulation demo.
 layout(scalar, push_constant) uniform PushConstants {
   // Store GPU pointers to each texture/buffer.
@@ -26,3 +29,4 @@ int texture_index(ivec2 uv) {
   return uv.y * push_constants.screen_size.x + uv.x;
 }
 
+#endif

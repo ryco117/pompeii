@@ -7,7 +7,9 @@ use std::{
 use smallvec::SmallVec;
 use strum::EnumCount as _;
 
+pub mod buffers;
 pub mod fxaa_pass;
+pub mod ray_tracing;
 
 /// Store the SPIR-V representation of the shaders in the binary.
 pub mod shaders {
@@ -49,6 +51,40 @@ pub fn extensions_list_contains(list: &[ash::vk::ExtensionProperties], ext: &CSt
     })
 }
 
+/// A minimal helper for converting a Rust reference `&T` to a byte slice over the same memory.
+/// # Safety
+/// This function uses `unsafe` code to create a slice from a casted pointer and the `std::mem::size_of_val` bytes of memory.
+pub fn data_byte_slice<T>(data: &T) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(std::ptr::from_ref(data).cast(), std::mem::size_of_val(data))
+    }
+}
+
+/// A helper to round up a size to the nearest multiple of an alignment.
+/// # Safety
+/// The alignment must be a power of two.
+pub fn aligned_size<T>(size: T, alignment: T) -> T
+where
+    T: num_traits::PrimInt + num_traits::Unsigned,
+{
+    #[cfg(debug_assertions)]
+    assert!(
+        alignment.count_ones() == 1,
+        "Alignment must be a power of two"
+    );
+
+    // Get the value of one for the type `T`.
+    let one = T::one();
+
+    // Efficient trick to round up to an alignment when the aligment is a power of two.
+    // Works as follows:
+    // 1 Adds the alignment minus one to the size.
+    //  * This ensures that the alignment bit is increased if and only if size is not already aligned.
+    // 2 Bitwise AND with the negation of the alignment minus one.
+    //  * This ensures that the bits less than our alignment are zero, enforcing alignment.
+    (size + alignment - one) & !(alignment - one)
+}
+
 #[cfg(debug_assertions)]
 #[derive(strum::Display)]
 #[strum(serialize_all = "snake_case")]
@@ -69,7 +105,7 @@ pub fn extend_if_all_extensions_are_contained(
 ) -> bool {
     if dependent_extensions
         .iter()
-        .all(|ext| extensions_list_contains(&available_extensions, ext))
+        .all(|ext| extensions_list_contains(available_extensions, ext))
     {
         total.extend(dependent_extensions.iter().map(|ext| {
             #[cfg(debug_assertions)]
@@ -84,11 +120,6 @@ pub fn extend_if_all_extensions_are_contained(
     } else {
         false
     }
-}
-
-/// A minimal helper for converting a Rust reference `&T` to a byte slice over the same memory.
-pub fn data_byte_slice<T>(data: &T) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(std::ptr::from_ref(data).cast(), std::mem::size_of::<T>()) }
 }
 
 /// The possible errors that may occur when creating a `VulkanCore`.
@@ -286,73 +317,6 @@ impl VulkanCore {
     }
 }
 
-/// Query a physical device for support of a given set of features.
-/// Will only check for features which the caller has set to `true` and will set those features which are not supported to `false`.
-/// # Note
-/// The `p_next` pointers will be ignored by this function and set to `null` before returning.
-pub fn query_physical_feature_support(
-    instance: &ash::Instance,
-    physical_device: ash::vk::PhysicalDevice,
-    requested_features: &mut EnginePhysicalDeviceFeatures,
-) -> ash::vk::PhysicalDeviceFeatures {
-    // Build the feature chain from the provided features.
-    let mut feature_chain = ash::vk::PhysicalDeviceFeatures2::default();
-
-    // Ensure there are no circular references in the feature chain.
-    requested_features.clear_pointers();
-
-    feature_chain = feature_chain.push_next(&mut requested_features.acceleration_structure);
-    feature_chain = feature_chain.push_next(&mut requested_features.buffer_device_address);
-    feature_chain = feature_chain.push_next(&mut requested_features.descriptor_indexing);
-    feature_chain = feature_chain.push_next(&mut requested_features.dynamic_rendering);
-    feature_chain = feature_chain.push_next(&mut requested_features.synchronization2);
-    feature_chain = feature_chain.push_next(&mut requested_features.pageable_device_local_memory);
-    feature_chain = feature_chain.push_next(&mut requested_features.ray_query);
-    feature_chain = feature_chain.push_next(&mut requested_features.ray_tracing);
-
-    let features = {
-        // Query the physical device for the selected features.
-        unsafe { instance.get_physical_device_features2(physical_device, &mut feature_chain) };
-        feature_chain.features
-    };
-
-    // Don't confuse the caller with pointers to features.
-    requested_features.clear_pointers();
-
-    // Return the features described in the default structure.
-    features
-}
-
-/// Query the extended properties of a physical device to determine if it supports ray tracing (e.g., RTX).
-/// If so, get the ray tracing pipeline properties.
-pub fn physical_supports_ray_tracing(
-    instance: &ash::Instance,
-    physical_device: ash::vk::PhysicalDevice,
-) -> Option<ash::vk::PhysicalDeviceRayTracingPipelinePropertiesKHR> {
-    // Query the physical device for ray tracing support features.
-    let mut features = EnginePhysicalDeviceFeatures {
-        acceleration_structure: ash::vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
-            .acceleration_structure(true),
-        ray_query: ash::vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true),
-        ray_tracing: ash::vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default()
-            .ray_tracing_pipeline(true),
-        ..Default::default()
-    };
-    let _ = query_physical_feature_support(instance, physical_device, &mut features);
-
-    // If the physical device supports ray tracing, return the ray tracing pipeline properties.
-    if features.acceleration_structure() && features.ray_tracing() && features.ray_query() {
-        let mut ray_tracing_pipeline =
-            ash::vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
-        let mut properties =
-            ash::vk::PhysicalDeviceProperties2::default().push_next(&mut ray_tracing_pipeline);
-        unsafe { instance.get_physical_device_properties2(physical_device, &mut properties) };
-        Some(ray_tracing_pipeline)
-    } else {
-        None
-    }
-}
-
 /// The Vulkan physical device features which this engine may utilize. This struct is used to query and report enabled features.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EnginePhysicalDeviceFeatures {
@@ -378,10 +342,27 @@ pub struct EnginePhysicalDeviceFeatures {
     /// Corresponds to `VkPhysicalDeviceRayTracingPipelineFeaturesKHR`.
     pub ray_tracing: ash::vk::PhysicalDeviceRayTracingPipelineFeaturesKHR<'static>,
 
+    /// Corresponds to `VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR`.
+    pub ray_tracing_maintenance: ash::vk::PhysicalDeviceRayTracingMaintenance1FeaturesKHR<'static>,
+
     /// Corresponds to `VkPhysicalDeviceSynchronization2Features`.
     pub synchronization2: ash::vk::PhysicalDeviceSynchronization2Features<'static>,
 }
 impl EnginePhysicalDeviceFeatures {
+    pub fn all() -> Self {
+        let mut all = Self::default();
+        all.acceleration_structure.acceleration_structure = ash::vk::TRUE;
+        all.buffer_device_address.buffer_device_address = ash::vk::TRUE;
+        all.dynamic_rendering.dynamic_rendering = ash::vk::TRUE;
+        all.pageable_device_local_memory
+            .pageable_device_local_memory = ash::vk::TRUE;
+        all.ray_query.ray_query = ash::vk::TRUE;
+        all.ray_tracing.ray_tracing_pipeline = ash::vk::TRUE;
+        all.ray_tracing_maintenance.ray_tracing_maintenance1 = ash::vk::TRUE;
+        all.synchronization2.synchronization2 = ash::vk::TRUE;
+        all
+    }
+
     /// A helper to verify that this feature-set contains every enabled (i.e., `true`) feature in the provided mask.
     /// # Note
     /// This doesn't contain checking for sub-properties of a feature. For example, `descriptor_indexing` is not checked because it is only sub-properties.
@@ -392,7 +373,67 @@ impl EnginePhysicalDeviceFeatures {
             && (!mask.pageable_device_local_memory() || self.pageable_device_local_memory())
             && (!mask.ray_query() || self.ray_query())
             && (!mask.ray_tracing() || self.ray_tracing())
+            && (!mask.ray_tracing_maintenance() || self.ray_tracing_maintenance())
             && (!mask.synchronization2() || self.synchronization2())
+    }
+
+    /// Query a physical device for support of a given set of features.
+    /// If a feature has an element which indicates the state of the entire feature,
+    /// then that value is used to determine whether the feature should be included in this query or not.
+    /// # Note
+    /// The `p_next` pointers will be ignored by this function and set to `null` before returning.
+    pub fn query_physical_feature_support(
+        &mut self,
+        instance: &ash::Instance,
+        physical_device: ash::vk::PhysicalDevice,
+    ) -> ash::vk::PhysicalDeviceFeatures {
+        // Build the feature chain from the provided features.
+        let mut feature_chain = ash::vk::PhysicalDeviceFeatures2::default();
+
+        // Ensure there are no circular references in the feature chain.
+        self.clear_pointers();
+
+        if self.acceleration_structure() {
+            feature_chain = feature_chain.push_next(&mut self.acceleration_structure);
+        }
+        if self.buffer_device_address.buffer_device_address == ash::vk::TRUE {
+            feature_chain = feature_chain.push_next(&mut self.buffer_device_address);
+        }
+        feature_chain = feature_chain.push_next(&mut self.descriptor_indexing);
+        if self.dynamic_rendering.dynamic_rendering == ash::vk::TRUE {
+            feature_chain = feature_chain.push_next(&mut self.dynamic_rendering);
+        }
+        if self.synchronization2.synchronization2 == ash::vk::TRUE {
+            feature_chain = feature_chain.push_next(&mut self.synchronization2);
+        }
+        if self
+            .pageable_device_local_memory
+            .pageable_device_local_memory
+            == ash::vk::TRUE
+        {
+            feature_chain = feature_chain.push_next(&mut self.pageable_device_local_memory);
+        }
+        if self.ray_query.ray_query == ash::vk::TRUE {
+            feature_chain = feature_chain.push_next(&mut self.ray_query);
+        }
+        if self.ray_tracing.ray_tracing_pipeline == ash::vk::TRUE {
+            feature_chain = feature_chain.push_next(&mut self.ray_tracing);
+        }
+        if self.ray_tracing_maintenance.ray_tracing_maintenance1 == ash::vk::TRUE {
+            feature_chain = feature_chain.push_next(&mut self.ray_tracing_maintenance);
+        }
+
+        let features = {
+            // Query the physical device for the selected features.
+            unsafe { instance.get_physical_device_features2(physical_device, &mut feature_chain) };
+            feature_chain.features
+        };
+
+        // Don't confuse the caller with pointers to features.
+        self.clear_pointers();
+
+        // Return the features described in the default structure.
+        features
     }
 
     /// Set the required toggles to enable or disable the Vulkan ray-tracing (RTX) feature.
@@ -408,6 +449,7 @@ impl EnginePhysicalDeviceFeatures {
         self.acceleration_structure.acceleration_structure = enable;
         self.ray_query.ray_query = enable;
         self.ray_tracing.ray_tracing_pipeline = enable;
+        self.ray_tracing_maintenance.ray_tracing_maintenance1 = enable;
     }
 
     /// Return whether the required toggles are set to enable, or have enabled, Vulkan ray-tracing (RTX).
@@ -436,6 +478,9 @@ impl EnginePhysicalDeviceFeatures {
     pub fn ray_tracing(&self) -> bool {
         self.ray_tracing.ray_tracing_pipeline == ash::vk::TRUE
     }
+    pub fn ray_tracing_maintenance(&self) -> bool {
+        self.ray_tracing_maintenance.ray_tracing_maintenance1 == ash::vk::TRUE
+    }
     pub fn synchronization2(&self) -> bool {
         self.synchronization2.synchronization2 == ash::vk::TRUE
     }
@@ -449,6 +494,7 @@ impl EnginePhysicalDeviceFeatures {
         self.pageable_device_local_memory.p_next = std::ptr::null_mut::<c_void>();
         self.ray_query.p_next = std::ptr::null_mut::<c_void>();
         self.ray_tracing.p_next = std::ptr::null_mut::<c_void>();
+        self.ray_tracing_maintenance.p_next = std::ptr::null_mut::<c_void>();
         self.synchronization2.p_next = std::ptr::null_mut::<c_void>();
     }
 }
@@ -511,8 +557,8 @@ pub fn get_sorted_physical_devices(
             }
 
             // Ensure the device supports all required features.
-            let mut copy_features = *required_features;
-            let _ = query_physical_feature_support(instance, device, &mut copy_features);
+            let mut copy_features = EnginePhysicalDeviceFeatures::all();
+            let _ = copy_features.query_physical_feature_support(instance, device);
             if !copy_features.contains_mask(required_features) {
                 #[cfg(debug_assertions)]
                 println!("INFO: Physical device {device:?}: does not support all the required features {required_features:?}: Actual features {copy_features:?}");
@@ -929,7 +975,6 @@ pub const SPECIAL_SURFACE_EXTENT: ash::vk::Extent2D = ash::vk::Extent2D {
 
 /// The result of acquiring the next image from the swapchain and advancing to the next frame in flight.
 pub struct NextSwapchainImage {
-    pub image_view: ash::vk::ImageView,
     pub image_index: u32,
     pub suboptimal: bool,
 }
@@ -1066,7 +1111,8 @@ impl Swapchain {
             image_color_space,
             image_extent: extent,
             image_array_layers: 1, // Always 1 unless stereoscopic-3D / XR is used.
-            image_usage: ash::vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            image_usage: ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | ash::vk::ImageUsageFlags::STORAGE, // TODO: Allow callers to define the swapchain image usage.
             image_sharing_mode: ash::vk::SharingMode::EXCLUSIVE, // Only one queue family will access the images.
             pre_transform: surface_capabilities.current_transform, // Do not apply additional transformation to the surface.
             composite_alpha,
@@ -1399,7 +1445,6 @@ impl Swapchain {
         self.acquired_index = Some(acquired_index);
 
         Ok(NextSwapchainImage {
-            image_view: self.image_views[acquired_index as usize],
             image_index: acquired_index,
             suboptimal,
         })
@@ -1582,8 +1627,8 @@ pub fn query_multisample_support(
     }
 }
 
-/// A helper to get a queue family index that supports the required queue flags and prefers sharing
-/// the queue family with the specified flags, and not sharing with the rest.
+/// A helper to get a queue family index that supports the required queue flags and prefers
+/// sharing the queue family with the specified flags, and not sharing with the rest.
 pub fn get_queue_family_index(
     required_capabilities: ash::vk::QueueFlags,
     prefer_sharing_capabilities: ash::vk::QueueFlags,
@@ -1595,6 +1640,7 @@ pub fn get_queue_family_index(
         .enumerate()
         .filter_map(|(i, f)| {
             if f.queue_flags.contains(required_capabilities) {
+                #[allow(clippy::cast_possible_wrap)]
                 Some((
                     i as u32,
                     (f.queue_flags & prefer_sharing_capabilities)
@@ -1612,111 +1658,4 @@ pub fn get_queue_family_index(
         .max_by_key(|(_, score)| *score)
         .expect("Unable to find a queue family with the required flags")
         .0
-}
-
-/// Create a new device-local buffer with the given data using a staging buffer.
-pub fn new_device_buffer(
-    device: &ash::Device,
-    allocator: &mut gpu_allocator::vulkan::Allocator,
-    command_pool: ash::vk::CommandPool,
-    queue: ash::vk::Queue,
-    data: &[u8],
-) -> Result<(ash::vk::Buffer, ash::vk::Fence), ash::vk::Result> {
-    // Create a staging buffer to copy the data to the device-local buffer.
-    let staging_buffer = unsafe {
-        device.create_buffer(
-            &ash::vk::BufferCreateInfo::default()
-                .size(data.len() as u64)
-                .usage(ash::vk::BufferUsageFlags::TRANSFER_SRC),
-            None,
-        )?
-    };
-
-    // Allocate memory for the staging buffer.
-    // TODO: Consider allowing for reuse of the staging buffer for multiple transfers.
-    let staging_requirements = unsafe { device.get_buffer_memory_requirements(staging_buffer) };
-    let mut staging_allocation = allocator
-        .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
-            name: "Staging buffer",
-            requirements: staging_requirements,
-            location: gpu_allocator::MemoryLocation::CpuToGpu,
-            linear: true, // "Buffers are always linear" as per README.
-            allocation_scheme: gpu_allocator::vulkan::AllocationScheme::DedicatedBuffer(
-                staging_buffer,
-            ),
-        })
-        .expect("Unable to allocate memory for staging buffer");
-
-    // Bind the staging buffer to the allocated memory.
-    unsafe {
-        device.bind_buffer_memory(
-            staging_buffer,
-            staging_allocation.memory(),
-            staging_allocation.offset(),
-        )?;
-    }
-    staging_allocation
-        .mapped_slice_mut()
-        .expect("Staging buffer did not allocate a mapping")
-        .copy_from_slice(data);
-
-    // Create the device-local buffer.
-    let device_buffer = unsafe {
-        device.create_buffer(
-            &ash::vk::BufferCreateInfo::default()
-                .size(data.len() as u64)
-                .usage(
-                    ash::vk::BufferUsageFlags::TRANSFER_DST
-                        | ash::vk::BufferUsageFlags::STORAGE_BUFFER,
-                ),
-            None,
-        )?
-    };
-
-    // Allocate memory for the device-local buffer.
-    let device_requirements = unsafe { device.get_buffer_memory_requirements(device_buffer) };
-    let device_allocation = allocator
-        .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
-            name: "Device buffer",
-            requirements: device_requirements,
-            location: gpu_allocator::MemoryLocation::GpuOnly,
-            linear: true, // "Buffers are always linear" as per README.
-            allocation_scheme: gpu_allocator::vulkan::AllocationScheme::DedicatedBuffer(
-                device_buffer,
-            ),
-        })
-        .expect("Unable to allocate memory for device buffer");
-
-    // Bind the device-local buffer to the allocated memory.
-    unsafe {
-        device.bind_buffer_memory(
-            device_buffer,
-            device_allocation.memory(),
-            device_allocation.offset(),
-        )?;
-    }
-
-    // Copy the data from the staging buffer to the device-local buffer.
-    let command_buffer = unsafe {
-        device.allocate_command_buffers(&ash::vk::CommandBufferAllocateInfo {
-            command_pool,
-            level: ash::vk::CommandBufferLevel::PRIMARY,
-            command_buffer_count: 1,
-            ..Default::default()
-        })?
-    }[0];
-    unsafe {
-        device.cmd_copy_buffer(
-            command_buffer,
-            staging_buffer,
-            device_buffer,
-            &[ash::vk::BufferCopy {
-                src_offset: 0,
-                dst_offset: 0,
-                size: data.len() as u64,
-            }],
-        );
-    }
-
-    todo!()
 }
