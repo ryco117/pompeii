@@ -56,7 +56,16 @@ pub struct Renderer {
     compute_command_pool: Option<(ash::vk::CommandPool, ash::vk::Semaphore)>, // Optional compute command pool and compute semaphore if the graphics and compute queue families are separate.
 
     command_buffers: Vec<ash::vk::CommandBuffer>,
+
+    /// The graphics queue submit fence for each frame in flight.
     frame_fences: Vec<ash::vk::Fence>,
+
+    /// Fences that must be waited on before the next frame can be rendered.
+    /// Fences will be added and removed as dependencies are created and resolved.
+    /// NOTE: This memory will also be used to wait on the current frame's graphics fence.
+    ///       To be specific, the fence for the current frame is pushed and popped from this list
+    ///       at the beginning of the frame to wait for all the relevant fences at once.
+    blocking_fences: SmallVec<[ash::vk::Fence; 3]>,
 
     fxaa_pass: Option<FxaaPass>,
     pub swapchain_preferences: utils::SwapchainPreferences,
@@ -472,6 +481,7 @@ impl Renderer {
 
             command_buffers,
             frame_fences,
+            blocking_fences: SmallVec::new(),
 
             fxaa_pass,
             swapchain_preferences,
@@ -529,7 +539,7 @@ impl Renderer {
             self.logical_device.destroy_device(None);
 
             // Destroy the Vulkan surface.
-            if let Some(khr) = vulkan.khr.as_ref() {
+            if let Some(khr) = vulkan.surface_instance.as_ref() {
                 khr.destroy_surface(self.surface, None);
             } else {
                 eprintln!(
@@ -625,8 +635,16 @@ impl Renderer {
                         self.pageable_device_local_memory.as_ref(),
                     );
                 }
-                DemoPipeline::RayTracing(tracer) => tracer
-                    .recreate_descriptor_sets(&self.logical_device, self.swapchain.image_views()),
+                DemoPipeline::RayTracing(tracer) => tracer.recreate_view_sets(
+                    &self.logical_device,
+                    self.pageable_device_local_memory.as_ref(),
+                    &mut self.memory_allocator,
+                    self.compute_command_pool
+                        .map_or(self.command_pool, |(pool, _)| pool),
+                    self.compute_queue.queue,
+                    self.swapchain.image_views(),
+                    extent,
+                ),
             }
         } else {
             // Wait for the resources to be available for destruction.
@@ -665,8 +683,16 @@ impl Renderer {
                     simulation.destroy(&self.logical_device, &mut self.memory_allocator);
                     *simulation = new_sim;
                 }
-                DemoPipeline::RayTracing(tracer) => tracer
-                    .recreate_descriptor_sets(&self.logical_device, self.swapchain.image_views()),
+                DemoPipeline::RayTracing(tracer) => tracer.recreate_view_sets(
+                    &self.logical_device,
+                    self.pageable_device_local_memory.as_ref(),
+                    &mut self.memory_allocator,
+                    self.compute_command_pool
+                        .map_or(self.command_pool, |(pool, _)| pool),
+                    self.compute_queue.queue,
+                    self.swapchain.image_views(),
+                    extent,
+                ),
             }
         }
 
@@ -684,9 +710,18 @@ impl Renderer {
         let frame_graphics_fence = self.frame_fences[current_frame];
         let presentation_fence = self.swapchain.present_complete();
         unsafe {
+            self.blocking_fences.push(frame_graphics_fence);
             self.logical_device
-                .wait_for_fences(&[frame_graphics_fence], true, FIVE_SECONDS_IN_NANOSECONDS)
+                .wait_for_fences(&self.blocking_fences, true, FIVE_SECONDS_IN_NANOSECONDS)
                 .expect("Unable to wait for fence to begin frame");
+
+            // Pop the per-frame graphics fence.
+            self.blocking_fences.pop();
+
+            // Destroy the one-time fences.
+            for fence in self.blocking_fences.drain(..) {
+                self.logical_device.destroy_fence(fence, None);
+            }
         }
 
         // Get the next image to render to. Has internal synchronization to ensure the previous acquire completed on the GPU.
@@ -699,7 +734,7 @@ impl Renderer {
             Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 let surface_capabilities = unsafe {
                     vulkan
-                        .khr
+                        .surface_instance
                         .as_ref()
                         .unwrap()
                         .get_physical_device_surface_capabilities(
@@ -872,7 +907,7 @@ impl Renderer {
             Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 let surface_capabilities = unsafe {
                     vulkan
-                        .khr
+                        .surface_instance
                         .as_ref()
                         .unwrap()
                         .get_physical_device_surface_capabilities(
@@ -1007,7 +1042,7 @@ impl Renderer {
                     return;
                 }
 
-                let (command_pool, queue) = self.compute_command_pool.clone().map_or(
+                let (command_pool, queue) = self.compute_command_pool.map_or(
                     (self.command_pool, self.graphics_queue.queue),
                     |(pool, _)| (pool, self.compute_queue.queue),
                 );
@@ -1020,6 +1055,7 @@ impl Renderer {
                     command_pool,
                     queue,
                     self.swapchain.image_views(),
+                    self.swapchain.extent(),
                     &self.ray_tracing.as_ref().unwrap().2,
                 ))
             }

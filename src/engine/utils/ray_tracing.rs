@@ -98,6 +98,7 @@ impl ScratchBuffer {
 }
 
 /// A struct ensuring that the `geometries` slice and the `geometry_counts` slice that describes it are the same length.
+/// This is necessary for building both top and bottom level acceleration structures.
 pub struct InstancedGeometries<'a, 'b> {
     geometries: &'a [ash::vk::AccelerationStructureGeometryKHR<'b>],
     geometry_counts: &'a [u32],
@@ -244,11 +245,6 @@ impl AccelerationStructure {
                 ash::vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(count)
             })
             .collect::<Vec<_>>();
-        // The build function expects an array of pointers to the range info structs. :/
-        let build_range_info_ptrs = build_range_infos
-            .iter()
-            .map(std::slice::from_ref)
-            .collect::<Vec<_>>();
 
         // Create a one-time command buffer to build the acceleration structure.
         let command_buffer = unsafe {
@@ -273,7 +269,7 @@ impl AccelerationStructure {
             acceleration_device.cmd_build_acceleration_structures(
                 command_buffer,
                 &[build_geometry_info],
-                &build_range_info_ptrs[..],
+                &[&build_range_infos],
             );
             device.end_command_buffer(command_buffer).expect(
                 "Failed to end command buffer for building bottom-level acceleration structure",
@@ -358,13 +354,9 @@ impl AccelerationStructure {
             .geometry_counts()
             .iter()
             .map(|&count| {
+                // NOTE: The `primitive_count` here is the number of instances in this top-level geometry type.
                 ash::vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(count)
             })
-            .collect::<Vec<_>>();
-        // The build function expects an array of pointers to the range info structs. :/
-        let build_range_info_ptrs = build_range_infos
-            .iter()
-            .map(std::slice::from_ref)
             .collect::<Vec<_>>();
 
         // Create a one-time command buffer to build the acceleration structure.
@@ -395,7 +387,7 @@ impl AccelerationStructure {
             acceleration_device.cmd_build_acceleration_structures(
                 command_buffer,
                 &[build_geometry_info],
-                &build_range_info_ptrs[..],
+                &[&build_range_infos],
             );
             device.end_command_buffer(command_buffer).expect(
                 "Failed to end command buffer for building top-level acceleration structure",

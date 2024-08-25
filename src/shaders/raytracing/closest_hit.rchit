@@ -14,7 +14,6 @@ hitAttributeEXT vec2 hit_attributes;
 
 // layout(scalar, push_constant) uniform PushConstants {
 //   mat4 view_inverse;
-//   mat4 proj_inverse;
 //   float time;
 // } push_constants;
 

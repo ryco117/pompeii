@@ -9,10 +9,12 @@ layout(location = 0) rayPayloadEXT RayPayload ray_payload;
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT top_level_accel_struct;
 layout(set = 1, binding = 0, rgba8) uniform image2D output_image;
+layout(set = 2, binding = 0) uniform CameraLens {
+  mat4 proj_inverse;
+} camera_lens;
 
 layout(scalar, push_constant) uniform PushConstants {
   mat4 view_inverse;
-  mat4 proj_inverse;
   float time;
 } push_constants;
 
@@ -32,15 +34,16 @@ void main() {
 
   for(int j = 0; j < MAX_SAMPLES; ++j) {
     // TODO: Random per-sample jittering to help achieve a more uniform distribution of samples.
-    vec2 pixel_center = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
+    const vec2 pixel_center = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
+    const vec2 uv_coord = pixel_center / vec2(gl_LaunchSizeEXT.xy);
+    const vec2 ndc = 2.0 * uv_coord - 1.0;
 
     const vec4 origin = push_constants.view_inverse * vec4(0, 0, 0, 1);
-    const vec4 target = push_constants.proj_inverse * vec4(2.0 * pixel_center / vec2(gl_LaunchSizeEXT.xy) - vec2(1), 1, 1);
-    const vec4 direction = push_constants.view_inverse * vec4(normalize(target.xyz / target.w), 0);
+    const vec4 target = camera_lens.proj_inverse * vec4(ndc, 1, 1);
+    const vec4 direction = push_constants.view_inverse * vec4(normalize(target.xyz), 0);
 
     // Initialize the ray payload parameters.
     ray_payload.seed = seed_index;
-    ray_payload.bounce_count = 0;
     ray_payload.exit = false;
 
     // Set the initial ray lighting values.

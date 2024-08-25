@@ -15,8 +15,14 @@ const MAX_TEXTURES: u32 = 1024;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PushConstants {
     pub view_inverse: glm::Mat4,
-    pub proj_inverse: glm::Mat4,
     pub time: f32,
+}
+
+/// The camera lens uniform data to be used with the ray tracing pipeline.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CameraLens {
+    pub projection_inverse: glm::Mat4,
 }
 
 /// The various shader resources needed for ray tracing.
@@ -96,7 +102,7 @@ impl RayTracingShaders {
 }
 
 /// Simple helper for managing the data for a mesh.
-pub struct MeshData {
+pub struct MeshGpuData {
     pub vertex_buffer: utils::buffers::BufferAllocation,
     pub vertex_address: ash::vk::DeviceAddress,
     pub index_buffer: utils::buffers::BufferAllocation,
@@ -104,7 +110,7 @@ pub struct MeshData {
     pub indices_length: u64,
     pub max_vertex_index: u32,
 }
-impl MeshData {
+impl MeshGpuData {
     /// Destroy the mesh data.
     pub fn destroy(self, device: &ash::Device, allocator: &mut gpu_allocator::vulkan::Allocator) {
         self.index_buffer.destroy(device, allocator);
@@ -114,10 +120,19 @@ impl MeshData {
 
 /// Helper for instancing a mesh which is managed elsewhere, `MeshData`.
 #[derive(Clone, Copy)]
-pub struct MeshInstance {
+pub struct AcceleratedInstance {
+    /// A bottom-level acceleration structure for the mesh.
     pub acceleration_address: ash::vk::DeviceAddress,
+
+    /// The global transformation to apply to this instance.
     pub transform: ash::vk::TransformMatrixKHR,
-    pub indices_length: u64,
+}
+
+/// The vertex data of meshes.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct Vertex {
+    position: glm::Vec3,
 }
 
 /// Helper to create minimal geometry for this simple example.
@@ -127,18 +142,88 @@ fn create_mesh_data(
     allocator: &mut gpu_allocator::vulkan::Allocator,
     command_pool: ash::vk::CommandPool,
     queue: ash::vk::Queue,
-) -> MeshData {
-    // Create the geometry for the bottom-level acceleration structure.
-    // TODO: Do something more interesting than a single triangle.
-    let vertices = [[1.0f32, 1., 0.], [-1., 1., 0.], [0., -1., 0.]];
+) -> MeshGpuData {
+    // Load the test model.
+    static DUCK_BYTES: &[u8] = include_bytes!("../../assets/Duck.glb");
+    let test_gltf = gltf::import_slice(DUCK_BYTES).expect("Failed to load test GLB model");
 
-    // Create the index data to match our vertices.
-    let indices = [0, 1, 2];
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut index_offset = 0;
+    test_gltf.0.nodes().for_each(|node| {
+        let Some(mesh) = node.mesh() else {
+            return;
+        };
+
+        // Determine the transformation matrix for this node and apply it.
+        // NOTE: The glTF vertical axis needs to be flipped to match Vulkan's coordinate system.
+        let t = match node.transform() {
+            gltf::scene::Transform::Matrix { matrix } => {
+                glm::Mat4::from(matrix) * glm::scaling(&glm::Vec3::new(1., -1., 1.))
+            }
+            gltf::scene::Transform::Decomposed {
+                translation,
+                rotation,
+                scale,
+            } => {
+                let translation = glm::Vec3::new(translation[0], translation[1], translation[2]);
+                let rotation = glm::quat(rotation[0], rotation[1], rotation[2], rotation[3]);
+                let scale = glm::Vec3::new(scale[0], -scale[1], scale[2]);
+                glm::translation(&translation) * glm::quat_to_mat4(&rotation) * glm::scaling(&scale)
+            }
+        };
+
+        mesh.primitives().for_each(|primitive| {
+            let texture_index = primitive
+                .material()
+                .pbr_metallic_roughness()
+                .base_color_texture()
+                .map(|t| t.texture().index());
+
+            if primitive.mode() != gltf::mesh::Mode::Triangles {
+                println!("Skipping non-triangle primitive");
+                return;
+            }
+
+            // let material = primitive.material().index();
+            // Read the data for this primitive.
+            let reader = primitive.reader(|buffer| Some(&test_gltf.1[buffer.index()]));
+            let positions = reader.read_positions().expect("Failed to read positions");
+            // let normals = reader.read_normals().expect("Failed to read normals");
+            let read_indices = reader.read_indices().expect("Failed to read indices");
+
+            let mut position_count = 0;
+            for [pos_x, pos_y, pos_z] in positions {
+                position_count += 1;
+                let position = (t * glm::Vec4::new(pos_x, pos_y, pos_z, 1.)).xyz();
+                vertices.push(Vertex { position });
+            }
+
+            read_indices.into_u32().for_each(|i| {
+                indices.push(i + index_offset);
+            });
+            index_offset += position_count;
+        });
+    });
+
+    #[cfg(debug_assertions)]
+    assert!(
+        !vertices.is_empty() && !indices.is_empty(),
+        "Failed to load any vertices or indices from the duck model"
+    );
 
     // Create a staging buffer capable of holding each of the vertex, index, and transform data.
-    let vertex_data_length = std::mem::size_of_val(&vertices);
-    let index_data_length = std::mem::size_of_val(&indices);
-    let max_buffer_size = (vertex_data_length + index_data_length) as u64;
+    let vertex_data = utils::data_slice_byte_slice(&vertices);
+    let index_data = utils::data_slice_byte_slice(&indices);
+
+    #[cfg(debug_assertions)]
+    println!(
+        "INFO: Loaded {} vertex bytes and {} index bytes",
+        vertex_data.len(),
+        index_data.len()
+    );
+
+    let max_buffer_size = (vertex_data.len() + index_data.len()) as u64;
     let mut staging_buffer = utils::buffers::StagingBuffer::new(
         device,
         pageable_device_local_memory,
@@ -159,7 +244,7 @@ fn create_mesh_data(
         allocator,
         command_pool,
         queue,
-        bytemuck::bytes_of(&vertices),
+        vertex_data,
         required_buffer_usage,
         "Vertex Buffer",
         &mut staging_buffer,
@@ -179,11 +264,11 @@ fn create_mesh_data(
         allocator,
         command_pool,
         queue,
-        bytemuck::bytes_of(&indices),
+        index_data,
         required_buffer_usage,
         "Index Buffer",
         &mut staging_buffer,
-        Some(vertex_data_length),
+        Some(vertex_data.len()),
     )
     .expect("Failed to create index buffer for bottom-level acceleration structure");
     let index_address = unsafe {
@@ -209,7 +294,7 @@ fn create_mesh_data(
         device.destroy_fence(index_fence, None);
     }
 
-    MeshData {
+    MeshGpuData {
         vertex_buffer,
         vertex_address,
         index_buffer,
@@ -221,14 +306,12 @@ fn create_mesh_data(
 
 /// Create a new instance of a mesh.
 fn create_mesh_instance(
-    mesh: &MeshData,
     acceleration_address: ash::vk::DeviceAddress,
     transform: ash::vk::TransformMatrixKHR,
-) -> MeshInstance {
-    MeshInstance {
+) -> AcceleratedInstance {
+    AcceleratedInstance {
         acceleration_address,
         transform,
-        indices_length: mesh.indices_length,
     }
 }
 
@@ -242,7 +325,7 @@ fn create_bottom_level_acceleration_structure(
     allocator: &mut gpu_allocator::vulkan::Allocator,
     command_pool: ash::vk::CommandPool,
     queue: ash::vk::Queue,
-    mesh: &MeshData,
+    mesh: &MeshGpuData,
 ) -> utils::ray_tracing::AccelerationStructure {
     // Define the triangle geometry for the bottom-level acceleration structure.
     let mut triangle_geometry_data = ash::vk::AccelerationStructureGeometryDataKHR::default();
@@ -252,7 +335,7 @@ fn create_bottom_level_acceleration_structure(
             .vertex_data(ash::vk::DeviceOrHostAddressConstKHR {
                 device_address: mesh.vertex_address,
             })
-            .vertex_stride(std::mem::size_of::<[f32; 3]>() as u64)
+            .vertex_stride(std::mem::size_of::<Vertex>() as u64)
             .max_vertex(mesh.max_vertex_index)
             .index_type(ash::vk::IndexType::UINT32)
             .index_data(ash::vk::DeviceOrHostAddressConstKHR {
@@ -271,6 +354,12 @@ fn create_bottom_level_acceleration_structure(
 
     // NOTE: There must be an entry here for each geometry in the `build_info.geometries()` array.
     let geometry_counts = [(mesh.indices_length / 3) as u32];
+
+    #[cfg(debug_assertions)]
+    println!(
+        "INFO: Building acceleration structure with {} triangles",
+        geometry_counts[0]
+    );
 
     // Get the build size of this bottom-level acceleration structure.
     let mut acceleration_build_size = ash::vk::AccelerationStructureBuildSizesInfoKHR::default();
@@ -321,7 +410,7 @@ fn create_top_level_acceleration_structure(
     allocator: &mut gpu_allocator::vulkan::Allocator,
     command_pool: ash::vk::CommandPool,
     queue: ash::vk::Queue,
-    mesh_instances: &[MeshInstance],
+    mesh_instances: &[AcceleratedInstance],
 ) -> utils::ray_tracing::AccelerationStructure {
     // Determine the number of acceleration instances to create.
     let instance_count = mesh_instances.len();
@@ -343,13 +432,11 @@ fn create_top_level_acceleration_structure(
         ash::vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8;
 
     // Create an instance for each bottom-level acceleration structure.
-    let (instances, instance_fences): (Vec<_>, Vec<_>) = mesh_instances
+    let instances = mesh_instances
         .iter()
-        .enumerate()
-        .map(|(instance_index, mesh_instance)| {
+        .map(|mesh_instance| {
             // Create an instance of this bottom-level acceleration structure.
-            // TODO: Allow the caller to specify multiple instances of the same BLAS.
-            let instance = ash::vk::AccelerationStructureInstanceKHR {
+            ash::vk::AccelerationStructureInstanceKHR {
                 transform: mesh_instance.transform,
                 instance_custom_index_and_mask: ash::vk::Packed24_8::new(0, 0xFF),
                 instance_shader_binding_table_record_offset_and_flags: ash::vk::Packed24_8::new(
@@ -359,68 +446,60 @@ fn create_top_level_acceleration_structure(
                 acceleration_structure_reference: ash::vk::AccelerationStructureReferenceKHR {
                     device_handle: mesh_instance.acceleration_address,
                 },
-            };
-
-            // Create a device-local buffer for this instance.
-            // TODO: Create a single buffer and index into it for each instance.
-            let (instance_buffer, instance_fence) = utils::buffers::new_data_buffer(
-                device,
-                pageable_device_local_memory.map(|d| (d, 0.5)),
-                allocator,
-                command_pool,
-                queue,
-                utils::data_byte_slice(&instance),
-                ash::vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
-                    | ash::vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                "Instance Buffer",
-                &mut staging_buffer,
-                Some(
-                    instance_index
-                        * std::mem::size_of::<ash::vk::AccelerationStructureInstanceKHR>(),
-                ),
-            )
-            .expect("Failed to create instance buffer for top-level acceleration structure");
-            let instance_address = unsafe {
-                device.get_buffer_device_address(
-                    &ash::vk::BufferDeviceAddressInfo::default().buffer(instance_buffer.buffer),
-                )
-            };
-
-            ((instance_buffer, instance_address), instance_fence)
+            }
         })
-        .unzip();
+        .collect::<Vec<_>>();
+
+    // Create a device-local buffer for this instance.
+    // TODO: Create a single buffer and index into it for each instance.
+    let (instance_buffer, instance_fence) = utils::buffers::new_data_buffer(
+        device,
+        pageable_device_local_memory.map(|d| (d, 0.5)),
+        allocator,
+        command_pool,
+        queue,
+        utils::data_slice_byte_slice(&instances),
+        ash::vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+            | ash::vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        "Instance Buffer",
+        &mut staging_buffer,
+        None,
+    )
+    .expect("Failed to create instance buffer for top-level acceleration structure");
+    let instance_address = unsafe {
+        device.get_buffer_device_address(
+            &ash::vk::BufferDeviceAddressInfo::default().buffer(instance_buffer.buffer),
+        )
+    };
 
     // Wait for the fence to signal that the buffer is ready, then delete the fence.
     unsafe {
         device
-            .wait_for_fences(&instance_fences, true, FIVE_SECONDS_IN_NANOSECONDS)
+            .wait_for_fences(&[instance_fence], true, FIVE_SECONDS_IN_NANOSECONDS)
             .expect("Failed to wait for all instance buffer creation fences");
-        for fence in instance_fences {
-            device.destroy_fence(fence, None);
-        }
+        device.destroy_fence(instance_fence, None);
     }
 
     // TODO: Allow reuse of staging buffer between functions.
     staging_buffer.destroy(device, allocator);
 
     // Describe the geometry and instancing for each bottom-level acceleration structure.
-    let acceleration_geometry_instances = instances
-        .iter()
-        .map(|(_, address)| {
-            let instancing = ash::vk::AccelerationStructureGeometryInstancesDataKHR::default()
-                .array_of_pointers(false)
-                .data(ash::vk::DeviceOrHostAddressConstKHR {
-                    device_address: *address,
-                });
+    let acceleration_geometry_instances = {
+        // Point to our newly created instance buffer for this top-level geometry.
+        let instances = ash::vk::AccelerationStructureGeometryInstancesDataKHR::default()
+            .array_of_pointers(false)
+            .data(ash::vk::DeviceOrHostAddressConstKHR {
+                device_address: instance_address,
+            });
 
-            ash::vk::AccelerationStructureGeometryKHR::default()
-                .geometry_type(ash::vk::GeometryTypeKHR::INSTANCES)
-                .geometry(ash::vk::AccelerationStructureGeometryDataKHR {
-                    instances: instancing,
-                })
-                .flags(ash::vk::GeometryFlagsKHR::OPAQUE)
-        })
-        .collect::<Vec<_>>();
+        [ash::vk::AccelerationStructureGeometryKHR::default()
+            .geometry_type(ash::vk::GeometryTypeKHR::INSTANCES)
+            .geometry(ash::vk::AccelerationStructureGeometryDataKHR { instances })
+            .flags(ash::vk::GeometryFlagsKHR::OPAQUE)]
+    };
+
+    // The number of instances to include in each geometry of `acceleration_geometry_instances`.
+    let primitive_counts = [instance_count as u32];
 
     // Describe the total geometry of the acceleration structure to be built.
     let geometry_info = ash::vk::AccelerationStructureBuildGeometryInfoKHR::default()
@@ -428,13 +507,6 @@ fn create_top_level_acceleration_structure(
         .flags(ash::vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
         .mode(ash::vk::BuildAccelerationStructureModeKHR::BUILD)
         .geometries(&acceleration_geometry_instances);
-
-    // TODO: Determine how to correctly identify the number of primitives in each geometry.
-    // NOTE: There must be an entry for each item in `geometry_info.geometries()`.
-    let primitive_counts = acceleration_geometry_instances
-        .iter()
-        .map(|_| 1)
-        .collect::<Vec<_>>();
 
     // Get the build size of this top-level acceleration structure.
     let acceleration_build_sizes = unsafe {
@@ -477,9 +549,7 @@ fn create_top_level_acceleration_structure(
     scratch_buffer.destroy(device, allocator);
 
     // Delete each instancing buffer.
-    for (buffer, _) in instances {
-        buffer.destroy(device, allocator);
-    }
+    instance_buffer.destroy(device, allocator);
 
     acceleration
 }
@@ -489,10 +559,101 @@ fn create_top_level_acceleration_structure(
 struct DescriptorSetLayouts {
     pub acceleration: ash::vk::DescriptorSetLayout,
     pub output_image: ash::vk::DescriptorSetLayout,
+    pub camera_lens: ash::vk::DescriptorSetLayout,
     // pub textures: ash::vk::DescriptorSetLayout,
     // pub mesh: ash::vk::DescriptorSetLayout,
 }
 impl DescriptorSetLayouts {
+    /// Create the descriptor set layout for the ray tracing pipeline.
+    fn new(device: &ash::Device) -> DescriptorSetLayouts {
+        // Create the layout for the acceleration structure set.
+        let acceleration_binding = [ash::vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(ash::vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+            .descriptor_count(1)
+            .stage_flags(
+                ash::vk::ShaderStageFlags::RAYGEN_KHR /*TODO: | ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR*/,
+            )];
+        let acceleration = unsafe {
+            device.create_descriptor_set_layout(
+                &ash::vk::DescriptorSetLayoutCreateInfo::default().bindings(&acceleration_binding),
+                None,
+            )
+        }
+        .expect("Failed to create acceleration descriptor set layout for the ray tracing demo");
+
+        // Create the layout for the output image set.
+        let storage_image_binding = [ash::vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(ash::vk::DescriptorType::STORAGE_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(ash::vk::ShaderStageFlags::RAYGEN_KHR)];
+        let output_image = unsafe {
+            device.create_descriptor_set_layout(
+                &ash::vk::DescriptorSetLayoutCreateInfo::default().bindings(&storage_image_binding),
+                None,
+            )
+        }
+        .expect("Failed to create image descriptor set layout for the ray tracing demo");
+
+        // Create the layout for the camera lens uniform data.
+        let camera_lens_binding = [ash::vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(ash::vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(ash::vk::ShaderStageFlags::RAYGEN_KHR)];
+        let camera_lens = unsafe {
+            device.create_descriptor_set_layout(
+                &ash::vk::DescriptorSetLayoutCreateInfo::default().bindings(&camera_lens_binding),
+                None,
+            )
+        }
+        .expect("Failed to create camera lens descriptor set layout for the ray tracing demo");
+
+        // // Create the layout for the scene textures and samplers.
+        // let textures_binding = ash::vk::DescriptorSetLayoutBinding::default()
+        //     .binding(0)
+        //     .descriptor_type(ash::vk::DescriptorType::SAMPLED_IMAGE)
+        //     .descriptor_count(MAX_TEXTURES)
+        //     .stage_flags(ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR);
+        // let samplers_binding = ash::vk::DescriptorSetLayoutBinding::default()
+        //     .binding(1)
+        //     .descriptor_type(ash::vk::DescriptorType::SAMPLER)
+        //     .descriptor_count(MAX_TEXTURES)
+        //     .stage_flags(ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR);
+        // let textures = unsafe {
+        //     device.create_descriptor_set_layout(
+        //         &ash::vk::DescriptorSetLayoutCreateInfo::default()
+        //             .bindings(&[textures_binding, samplers_binding]),
+        //         None,
+        //     )
+        // }
+        // .expect("Failed to create texture and sampler descriptor set layout for the ray tracing demo");
+
+        // // Create the layout for the mesh data.
+        // let mech_binding = ash::vk::DescriptorSetLayoutBinding::default()
+        //     .binding(0)
+        //     .descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER)
+        //     .descriptor_count(4) // TODO: I may do something different here to allow for a more
+        //     // straight-forward approach to the mesh indexing.
+        //     .stage_flags(ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR);
+        // let mesh = unsafe {
+        //     device.create_descriptor_set_layout(
+        //         &ash::vk::DescriptorSetLayoutCreateInfo::default().bindings(&[mech_binding]),
+        //         None,
+        //     )
+        // }
+        // .expect("Failed to create mesh descriptor set layout for the ray tracing demo");
+
+        DescriptorSetLayouts {
+            acceleration,
+            output_image,
+            camera_lens,
+            // textures,
+            // mesh,
+        }
+    }
+
     /// Get the contents of this struct as a slice of `ash::vk::DescriptorSetLayout`.
     pub fn layouts(&self) -> &[ash::vk::DescriptorSetLayout] {
         unsafe {
@@ -509,84 +670,10 @@ impl DescriptorSetLayouts {
         unsafe {
             device.destroy_descriptor_set_layout(self.acceleration, None);
             device.destroy_descriptor_set_layout(self.output_image, None);
+            device.destroy_descriptor_set_layout(self.camera_lens, None);
             // device.destroy_descriptor_set_layout(self.textures, None);
             // device.destroy_descriptor_set_layout(self.mesh, None);
         }
-    }
-}
-
-/// Create the descriptor set layout for the ray tracing pipeline.
-fn create_descriptor_set_layout(device: &ash::Device) -> DescriptorSetLayouts {
-    // Create the layout for the acceleration structure set.
-    let acceleration_binding = [ash::vk::DescriptorSetLayoutBinding::default()
-        .binding(0)
-        .descriptor_type(ash::vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
-        .descriptor_count(1)
-        .stage_flags(
-            ash::vk::ShaderStageFlags::RAYGEN_KHR /*TODO: | ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR*/,
-        )];
-    let acceleration = unsafe {
-        device.create_descriptor_set_layout(
-            &ash::vk::DescriptorSetLayoutCreateInfo::default().bindings(&acceleration_binding),
-            None,
-        )
-    }
-    .expect("Failed to create acceleration descriptor set layout for the ray tracing demo");
-
-    // Create the layout for the output image set.
-    let storage_image_binding = [ash::vk::DescriptorSetLayoutBinding::default()
-        .binding(0)
-        .descriptor_type(ash::vk::DescriptorType::STORAGE_IMAGE)
-        .descriptor_count(1)
-        .stage_flags(ash::vk::ShaderStageFlags::RAYGEN_KHR)];
-    let output_image = unsafe {
-        device.create_descriptor_set_layout(
-            &ash::vk::DescriptorSetLayoutCreateInfo::default().bindings(&storage_image_binding),
-            None,
-        )
-    }
-    .expect("Failed to create image descriptor set layout for the ray tracing demo");
-
-    // // Create the layout for the scene textures and samplers.
-    // let textures_binding = ash::vk::DescriptorSetLayoutBinding::default()
-    //     .binding(0)
-    //     .descriptor_type(ash::vk::DescriptorType::SAMPLED_IMAGE)
-    //     .descriptor_count(MAX_TEXTURES)
-    //     .stage_flags(ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR);
-    // let samplers_binding = ash::vk::DescriptorSetLayoutBinding::default()
-    //     .binding(1)
-    //     .descriptor_type(ash::vk::DescriptorType::SAMPLER)
-    //     .descriptor_count(MAX_TEXTURES)
-    //     .stage_flags(ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR);
-    // let textures = unsafe {
-    //     device.create_descriptor_set_layout(
-    //         &ash::vk::DescriptorSetLayoutCreateInfo::default()
-    //             .bindings(&[textures_binding, samplers_binding]),
-    //         None,
-    //     )
-    // }
-    // .expect("Failed to create texture and sampler descriptor set layout for the ray tracing demo");
-
-    // // Create the layout for the mesh data.
-    // let mech_binding = ash::vk::DescriptorSetLayoutBinding::default()
-    //     .binding(0)
-    //     .descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER)
-    //     .descriptor_count(4) // TODO: I may do something different here to allow for a more
-    //     // straight-forward approach to the mesh indexing.
-    //     .stage_flags(ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR);
-    // let mesh = unsafe {
-    //     device.create_descriptor_set_layout(
-    //         &ash::vk::DescriptorSetLayoutCreateInfo::default().bindings(&[mech_binding]),
-    //         None,
-    //     )
-    // }
-    // .expect("Failed to create mesh descriptor set layout for the ray tracing demo");
-
-    DescriptorSetLayouts {
-        acceleration,
-        output_image,
-        // textures,
-        // mesh,
     }
 }
 
@@ -771,7 +858,7 @@ impl Pipeline {
         let shaders = RayTracingShaders::new(device);
 
         // Create the descriptor set layouts describing the shader resource usage.
-        let descriptor_set_layouts = create_descriptor_set_layout(device);
+        let descriptor_set_layouts = DescriptorSetLayouts::new(device);
         let layout = create_pipeline_layout(device, &descriptor_set_layouts);
 
         let ray_gen_shader_info = ash::vk::PipelineShaderStageCreateInfo::default()
@@ -869,30 +956,91 @@ impl Pipeline {
     }
 }
 
+/// Create the uniform buffer for the camera lens data.
+fn create_lens_buffer(
+    device: &ash::Device,
+    pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
+    allocator: &mut gpu_allocator::vulkan::Allocator,
+    command_pool: ash::vk::CommandPool,
+    queue: ash::vk::Queue,
+    extent: ash::vk::Extent2D,
+) -> utils::buffers::BufferAllocation {
+    let projection_inverse = create_projection_matrix(extent)
+        .try_inverse()
+        .unwrap_or_else(glm::Mat4::identity);
+
+    let mut staging = utils::buffers::StagingBuffer::new(
+        device,
+        pageable_device_local_memory,
+        allocator,
+        std::mem::size_of::<glm::Mat4>() as u64,
+    )
+    .expect("Failed to create staging buffer for camera lens data");
+
+    let (camera_lens_buffer, fence) = utils::buffers::new_data_buffer(
+        device,
+        pageable_device_local_memory.map(|d| (d, 0.8)), // The lens is used once per ray; it is high priority, but not maximally so.
+        allocator,
+        command_pool,
+        queue,
+        utils::data_byte_slice(&projection_inverse),
+        ash::vk::BufferUsageFlags::UNIFORM_BUFFER,
+        "Camera Lens Buffer",
+        &mut staging,
+        None,
+    )
+    .expect("Failed to create camera lens buffer for the ray tracing demo");
+
+    // Wait for the fence to signal that the buffer is ready, then delete the fence.
+    unsafe {
+        device
+            .wait_for_fences(&[fence], true, FIVE_SECONDS_IN_NANOSECONDS)
+            .expect("Failed to wait for camera lens buffer creation fence");
+        device.destroy_fence(fence, None);
+    }
+
+    // Clean up the staging buffer.
+    staging.destroy(device, allocator);
+
+    camera_lens_buffer
+}
+
 /// A helper type for managing the descriptor sets for the ray tracing pipeline.
 struct Descriptors {
     pub descriptor_pool: ash::vk::DescriptorPool,
     pub acceleration_set: ash::vk::DescriptorSet,
     pub image_sets: Vec<ash::vk::DescriptorSet>,
+    pub camera_lens_set: ash::vk::DescriptorSet,
+    pub camera_lens_buffer: utils::buffers::BufferAllocation,
 }
 impl Descriptors {
     /// Destroy the descriptor pool and descriptor sets.
-    pub fn destroy(self, device: &ash::Device) {
+    pub fn destroy(self, device: &ash::Device, allocator: &mut gpu_allocator::vulkan::Allocator) {
         unsafe {
             device.destroy_descriptor_pool(self.descriptor_pool, None);
         }
+
+        // Destroy the camera lens uniform buffer.
+        self.camera_lens_buffer.destroy(device, allocator);
     }
 }
 
-// fn create_image_descriptor_sets(device: &ash::Device, descriptor_pool: ash::vk::DescriptorPool, output_images: &[ash::vk::ImageView]) {
-//     // Create the descriptor pool for the ray tracer.
-// }
+fn create_projection_matrix(extent: ash::vk::Extent2D) -> glm::Mat4 {
+    glm::Mat4::new_perspective(
+        extent.width as f32 / extent.height as f32,
+        std::f32::consts::FRAC_PI_2 * (7.5 / 9.), // 75 degrees.
+        0.1,
+        512.,
+    )
+}
+
 /// Create the descriptor sets to store the acceleration structure storage images.
 fn create_descriptor_sets(
     device: &ash::Device,
     output_images: &[ash::vk::ImageView],
     descriptor_set_layouts: &DescriptorSetLayouts,
     top_acceleration: &utils::ray_tracing::AccelerationStructure,
+    camera_lens_buffer: utils::buffers::BufferAllocation,
 ) -> Descriptors {
     let image_count = output_images.len() as u32;
 
@@ -900,10 +1048,11 @@ fn create_descriptor_sets(
     // TODO: Allow for texture and mesh descriptor sets.
     // TODO: Consider whether multiple top-level acceleration structures are needed.
     //       It could facilitate updating the scene in-flight, but I don't know for certain.
+    // TODO: Calculate `max_sets` based on the `DescriptorSetLayouts`.
     let descriptor_pool = unsafe {
         device.create_descriptor_pool(
             &ash::vk::DescriptorPoolCreateInfo::default()
-                .max_sets(1 + image_count)
+                .max_sets(2 + image_count)
                 .pool_sizes(&[
                     ash::vk::DescriptorPoolSize {
                         ty: ash::vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
@@ -913,6 +1062,10 @@ fn create_descriptor_sets(
                         ty: ash::vk::DescriptorType::STORAGE_IMAGE,
                         descriptor_count: image_count,
                     },
+                    ash::vk::DescriptorPoolSize {
+                        ty: ash::vk::DescriptorType::UNIFORM_BUFFER,
+                        descriptor_count: 1,
+                    },
                 ]),
             None,
         )
@@ -920,26 +1073,35 @@ fn create_descriptor_sets(
     .expect("Failed to create ray tracer descriptor pool");
 
     // Allocate the acceleration descriptor set.
-    let acceleration_descriptor_info = &ash::vk::DescriptorSetAllocateInfo::default()
+    let acceleration_descriptor_info = ash::vk::DescriptorSetAllocateInfo::default()
         .descriptor_pool(descriptor_pool)
         .set_layouts(std::slice::from_ref(&descriptor_set_layouts.acceleration));
-    let acceleration_set = unsafe { device.allocate_descriptor_sets(acceleration_descriptor_info) }
-        .expect("Failed to allocate acceleration descriptor set for the ray tracer")[0];
+    let acceleration_set =
+        unsafe { device.allocate_descriptor_sets(&acceleration_descriptor_info) }
+            .expect("Failed to allocate acceleration descriptor set for the ray tracer")[0];
 
+    // TODO: Reduce the number of `allocate_descriptor_sets` calls.
     // To avoid updating the output image descriptor set for each frame, we allocate one per frame.
-    let storage_descriptor_info = ash::vk::DescriptorSetAllocateInfo::default()
+    let image_descriptor_info = ash::vk::DescriptorSetAllocateInfo::default()
         .descriptor_pool(descriptor_pool)
         .set_layouts(std::slice::from_ref(&descriptor_set_layouts.output_image));
     let image_sets = output_images
         .iter()
         .map(|_| {
-            // Create a descriptor set for the acceleration and image data.
-            unsafe { device.allocate_descriptor_sets(&storage_descriptor_info) }
+            // Create a descriptor set for the acceleration structure.
+            unsafe { device.allocate_descriptor_sets(&image_descriptor_info) }
                 .expect("Failed to allocate image descriptor sets for the ray tracer")[0]
         })
         .collect::<Vec<_>>();
 
-    // Update the binding for the top-level acceleration structure.
+    // Allocate the camera lens descriptor set.
+    let camera_lens_descriptor_info = ash::vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(descriptor_pool)
+        .set_layouts(std::slice::from_ref(&descriptor_set_layouts.camera_lens));
+    let camera_lens_set = unsafe { device.allocate_descriptor_sets(&camera_lens_descriptor_info) }
+        .expect("Failed to allocate camera lens descriptor set for the ray tracer")[0];
+
+    // Set the update data for the top-level acceleration structure.
     let acceleration_handles = [top_acceleration.handle()];
     let mut update_acceleration_info =
         ash::vk::WriteDescriptorSetAccelerationStructureKHR::default()
@@ -951,6 +1113,17 @@ fn create_descriptor_sets(
         .descriptor_type(ash::vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
         .push_next(&mut update_acceleration_info);
 
+    // Set the update data for the camera lens uniform.
+    let camera_info = [ash::vk::DescriptorBufferInfo::default()
+        .buffer(camera_lens_buffer.buffer)
+        .range(std::mem::size_of::<CameraLens>() as u64)];
+    let camera_lens_write = ash::vk::WriteDescriptorSet::default()
+        .dst_set(camera_lens_set)
+        .dst_binding(0)
+        .descriptor_type(ash::vk::DescriptorType::UNIFORM_BUFFER)
+        .buffer_info(&camera_info);
+
+    // Set the update data for each output image.
     let image_info = output_images
         .iter()
         .map(|image_view| {
@@ -960,6 +1133,7 @@ fn create_descriptor_sets(
         })
         .collect::<Vec<_>>();
     let descriptor_set_writes = std::iter::once(acceleration_write)
+        .chain(std::iter::once(camera_lens_write))
         .chain(
             image_info
                 .iter()
@@ -984,14 +1158,15 @@ fn create_descriptor_sets(
         descriptor_pool,
         acceleration_set,
         image_sets,
+        camera_lens_set,
+        camera_lens_buffer,
     }
 }
 
 /// An example demonstrating the use of ray tracing.
 pub struct ExampleRayTracing {
-    mesh: MeshData,
+    mesh: MeshGpuData,
     bottom_acceleration: utils::ray_tracing::AccelerationStructure,
-    mesh_instance: MeshInstance,
     top_acceleration: utils::ray_tracing::AccelerationStructure,
     pipeline: Pipeline,
     shader_binding_tables: ShaderBindingTables,
@@ -1008,6 +1183,7 @@ impl ExampleRayTracing {
         command_pool: ash::vk::CommandPool,
         queue: ash::vk::Queue,
         output_images: &[ash::vk::ImageView],
+        extent: ash::vk::Extent2D,
         properties: &ash::vk::PhysicalDeviceRayTracingPipelinePropertiesKHR,
     ) -> Self {
         let mesh = create_mesh_data(
@@ -1030,10 +1206,21 @@ impl ExampleRayTracing {
         );
 
         let mesh_instance = create_mesh_instance(
-            &mesh,
             bottom_acceleration.device_address(),
             ash::vk::TransformMatrixKHR {
                 matrix: [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0.],
+            },
+        );
+        let mesh_instance_1 = create_mesh_instance(
+            bottom_acceleration.device_address(),
+            ash::vk::TransformMatrixKHR {
+                matrix: [0., 0.2, 0., 60., -0.2, 0., 0., -60., 0., 0., 0.2, 60.],
+            },
+        );
+        let mesh_instance_2 = create_mesh_instance(
+            bottom_acceleration.device_address(),
+            ash::vk::TransformMatrixKHR {
+                matrix: [0., 0., 0.2, -60., 0., 0.2, 0., -60., -0.2, 0., 0., -60.],
             },
         );
 
@@ -1044,7 +1231,7 @@ impl ExampleRayTracing {
             allocator,
             command_pool,
             queue,
-            &[mesh_instance],
+            &[mesh_instance, mesh_instance_1, mesh_instance_2],
         );
 
         // Create the ray tracing pipeline.
@@ -1064,28 +1251,26 @@ impl ExampleRayTracing {
             queue,
         );
 
+        let camera_lens = create_lens_buffer(
+            device,
+            pageable_device_local_memory,
+            allocator,
+            command_pool,
+            queue,
+            extent,
+        );
+
         let descriptors = create_descriptor_sets(
             device,
             output_images,
             &pipeline.descriptor_set_layouts,
             &top_acceleration,
+            camera_lens,
         );
-
-        // build_command_buffer(
-        //     device,
-        //     ray_device,
-        //     command_buffer,
-        //     properties,
-        //     &shader_binding_tables,
-        //     &descriptors,
-        //     &pipeline,
-        //     image_index,
-        // );
 
         Self {
             mesh,
             bottom_acceleration,
-            mesh_instance,
             top_acceleration,
             pipeline,
             shader_binding_tables,
@@ -1100,7 +1285,7 @@ impl ExampleRayTracing {
         acceleration_device: &ash::khr::acceleration_structure::Device,
         allocator: &mut gpu_allocator::vulkan::Allocator,
     ) {
-        self.descriptors.destroy(device);
+        self.descriptors.destroy(device, allocator);
         self.shader_binding_tables.destroy(device, allocator);
         self.pipeline.destroy(device);
         self.top_acceleration
@@ -1127,16 +1312,18 @@ impl ExampleRayTracing {
             .level_count(1)
             .layer_count(1);
 
+        // TODO: Use `Descriptors` to generate this array.
         let descriptor_sets = [
             self.descriptors.acceleration_set,
             self.descriptors.image_sets[image_index as usize],
+            self.descriptors.camera_lens_set,
         ];
 
         // Describe to the command buffer how to access the shader binding tables.
-        let handle_aligned_size = utils::aligned_size(
+        let handle_aligned_size = u64::from(utils::aligned_size(
             pipeline_properties.shader_group_handle_size,
             pipeline_properties.shader_group_handle_alignment,
-        ) as u64;
+        ));
 
         let raygen_sbt = ash::vk::StridedDeviceAddressRegionKHR::default()
             .device_address(self.shader_binding_tables.raygen_address)
@@ -1164,6 +1351,8 @@ impl ExampleRayTracing {
                 .dst_access_mask(ash::vk::AccessFlags2::SHADER_WRITE)
                 .old_layout(ash::vk::ImageLayout::UNDEFINED)
                 .new_layout(ash::vk::ImageLayout::GENERAL)
+                .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
                 .image(output_image)
                 .subresource_range(image_range);
             device.cmd_pipeline_barrier2(
@@ -1227,11 +1416,16 @@ impl ExampleRayTracing {
         }
     }
 
-    /// Recreate the descriptor sets for the output images when they are recreated.
-    pub fn recreate_descriptor_sets(
+    /// Recreate the descriptor sets for the output images and camera perspective when they are recreated.
+    pub fn recreate_view_sets(
         &mut self,
         device: &ash::Device,
+        pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
+        allocator: &mut gpu_allocator::vulkan::Allocator,
+        command_pool: ash::vk::CommandPool,
+        queue: ash::vk::Queue,
         output_images: &[ash::vk::ImageView],
+        extent: ash::vk::Extent2D,
     ) {
         // Describe the new image views to write to our descriptor sets.
         let image_info = output_images
@@ -1242,6 +1436,41 @@ impl ExampleRayTracing {
                     .image_layout(ash::vk::ImageLayout::GENERAL)
             })
             .collect::<Vec<_>>();
+
+        // Update the projection matrix in the camera lens buffer.
+        let projection_inverse = create_projection_matrix(extent)
+            .try_inverse()
+            .unwrap_or_else(glm::Mat4::identity);
+        let mut staging = utils::buffers::StagingBuffer::new(
+            device,
+            pageable_device_local_memory,
+            allocator,
+            std::mem::size_of::<glm::Mat4>() as u64,
+        )
+        .expect("Failed to create staging buffer for camera lens data");
+        let camera_update_fence = utils::buffers::update_device_local(
+            device,
+            allocator,
+            command_pool,
+            queue,
+            &self.descriptors.camera_lens_buffer,
+            utils::data_byte_slice(&projection_inverse),
+            &mut staging,
+            None,
+        )
+        .expect("Failed to update camera lens buffer for the ray tracing demo");
+
+        // Wait for the fence to signal that the buffer is ready, then delete the fence.
+        unsafe {
+            device
+                .wait_for_fences(&[camera_update_fence], true, FIVE_SECONDS_IN_NANOSECONDS)
+                .expect("Failed to wait for camera lens buffer update fence");
+            device.destroy_fence(camera_update_fence, None);
+        }
+
+        // TODO: Figure out how to have this passed back to the caller for destruction, along with
+        //       the fence. It's not necessary to wait for the copy to complete now.
+        staging.destroy(device, allocator);
 
         // Create the descriptor write objects.
         let descriptor_set_writes = image_info

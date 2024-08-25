@@ -9,6 +9,7 @@ ash = "0.38"
 ash-window = "0.13"
 bytemuck = { version = "1.16", features = ["derive"] }
 clap = { version = "4.5", features = ["derive"] }
+gltf = "1.4"
 gpu-allocator = "0.27"
 inline-spirv = "0.2"
 nalgebra-glm = { version = "0.19", features = ["convert-bytemuck"] }

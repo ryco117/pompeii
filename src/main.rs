@@ -170,16 +170,8 @@ impl PompeiiApp {
 
             engine::DemoPipeline::RayTracing(_) => {
                 engine::DemoPushConstants::RayTracing(engine::example_ray_tracing::PushConstants {
-                    view_inverse: glm::Mat4::new_rotation(glm::Vec3::new(0., time, 0.))
-                        * glm::Mat4::new_translation(&glm::Vec3::new(0., 0., 2.5)),
-                    proj_inverse: glm::Mat4::new_perspective(
-                        extent.width as f32 / extent.height as f32,
-                        std::f32::consts::FRAC_PI_2 * (8. / 9.), // 80 degrees.
-                        0.1,
-                        512.,
-                    )
-                    .try_inverse()
-                    .unwrap_or_else(glm::Mat4::identity),
+                    view_inverse: glm::Mat4::new_rotation(glm::Vec3::new(0., -0.4 * time, 0.))
+                        * glm::Mat4::new_translation(&glm::Vec3::new(0., -80., 220.)),
                     time,
                 })
             }
@@ -444,7 +436,6 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
                         height: window_size.height,
                     };
                     if window_size != extent {
-                        #[cfg(debug_assertions)]
                         eprintln!(
                             "ERROR: Swapchain is out of date at window-size check, needs to be recreated."
                         );
