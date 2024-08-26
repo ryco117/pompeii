@@ -8,7 +8,7 @@ use nalgebra_glm as glm;
 const MAX_RAY_RECURSION_DEPTH: u32 = 10;
 
 /// The maximum number of textures that can be used in the ray tracing pipeline.
-const MAX_TEXTURES: u32 = 1024;
+// const MAX_TEXTURES: u32 = 1024;
 
 /// The push constants to be used with the ray tracing pipeline.
 #[repr(C)]
@@ -1214,13 +1214,13 @@ impl ExampleRayTracing {
         let mesh_instance_1 = create_mesh_instance(
             bottom_acceleration.device_address(),
             ash::vk::TransformMatrixKHR {
-                matrix: [0., 0.2, 0., 60., -0.2, 0., 0., -60., 0., 0., 0.2, 60.],
+                matrix: [0., 0.2, 0., 80., -0.2, 0., 0., -60., 0., 0., 0.2, 80.],
             },
         );
         let mesh_instance_2 = create_mesh_instance(
             bottom_acceleration.device_address(),
             ash::vk::TransformMatrixKHR {
-                matrix: [0., 0., 0.2, -60., 0., 0.2, 0., -60., -0.2, 0., 0., -60.],
+                matrix: [0., 0., 0.2, -80., 0., 0.2, 0., -60., -0.2, 0., 0., -60.],
             },
         );
 
@@ -1450,7 +1450,6 @@ impl ExampleRayTracing {
         .expect("Failed to create staging buffer for camera lens data");
         let camera_update_fence = utils::buffers::update_device_local(
             device,
-            allocator,
             command_pool,
             queue,
             &self.descriptors.camera_lens_buffer,

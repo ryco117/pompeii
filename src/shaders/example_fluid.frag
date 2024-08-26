@@ -3,33 +3,16 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_scalar_block_layout : require
 
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer VelocityTexture {
-  vec2 v[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer DyeTexture {
-  vec4 colors[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer PressureTexture {
-  float pressure[];
-};
+layout(set = 0, binding = 0, rg32f) readonly uniform image2D velocity;
+layout(set = 0, binding = 1, rgba32f) readonly uniform image2D dye;
+layout(set = 0, binding = 2, r32f) readonly uniform image2D pressure_texture;
 
 layout(scalar, push_constant) uniform PushConstants {
-  // GPU buffer references.
-  VelocityTexture velocity;
-  DyeTexture dye;
-  PressureTexture pressure;
-
   ivec2 screen_size;
   uint display_texture;
 } push_constants;
 
 layout(location = 0) out vec4 out_color;
-
-// Always ensure that the texture index is within bounds.
-int texture_index(ivec2 uv) {
-  uv = clamp(uv, ivec2(0), push_constants.screen_size - ivec2(1));
-  return uv.y * push_constants.screen_size.x + uv.x;
-}
 
 vec3 color_wheel(float t) {
   return vec3(
@@ -45,28 +28,27 @@ void main() {
     out_color = vec4(1, 0.2, 1, 1);
     return;
   }
-  const int pixel_index = pixel_coord.y * push_constants.screen_size.x + pixel_coord.x;
 
   if(push_constants.display_texture == 0) {
     // Dye color.
-    out_color = pow(push_constants.dye.colors[pixel_index], vec4(0.55));
+    out_color = pow(imageLoad(dye, pixel_coord), vec4(vec3(0.55), 1));
   } else if(push_constants.display_texture == 1) {
     // Velocity magnitudes.
-    out_color = vec4(abs(push_constants.velocity.v[pixel_index]) / 1200.0, 0, 1);
+    out_color = vec4(abs(imageLoad(velocity, pixel_coord).xy) / 1200.0, 0, 1);
   } else if(push_constants.display_texture == 2) {
     // Pressure.
-    float p = clamp(push_constants.pressure.pressure[pixel_index] / 220.0, -1, 1);
+    float p = clamp(imageLoad(pressure_texture, pixel_coord).x / 220.0, -1, 1);
     out_color = vec4(vec3(pow(max(p, 0), 0.75)) + vec3(0, 0, pow(-min(p, 0), 0.75)), 1);
   } else {
     // Velocity direction.
     const float SIZE = 32;
     const vec2 SHIFT = vec2(0.5);
-    const vec2 pixel_velocity = push_constants.velocity.v[pixel_index];
+    const vec2 pixel_velocity = imageLoad(velocity, pixel_coord).xy;
     const vec2 ij = gl_FragCoord.xy / SIZE - SHIFT;
     const vec2 ij_center = round(ij);
 
     // Normalize the velocity at the center of the grid-cell this pixel belongs to.
-    vec2 v = push_constants.velocity.v[texture_index(ivec2((ij_center + SHIFT) * SIZE))];
+    vec2 v = imageLoad(velocity, ivec2((ij_center + SHIFT) * SIZE)).xy;
     v = v / (length(v) + 0.0001);
 
     // Velocity cone.

@@ -9,21 +9,9 @@ layout(constant_id = 0) const bool read_from_alpha = false;
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer VelocityTexture {
-  vec2 v[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer CurlTexture {
-  float c[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer DivergenceTexture {
-  float d[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) buffer PressureTexture {
-  float p[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer DyeTexture {
-  vec4 c[];
-};
+layout(set = 0, binding = 2, r32f) readonly uniform image2D divergence_texture;
+layout(set = 0, binding = 3, r32f) uniform image2D alpha_pressure;
+layout(set = 0, binding = 4, r32f) uniform image2D beta_pressure;
 
 #include "shared.glsl"
 
@@ -33,29 +21,28 @@ void main() {
   if(coords.x >= push_constants.screen_size.x || coords.y >= push_constants.screen_size.y) {
     return;
   }
-  const int index = texture_index(coords);
 
-  const float divergence = push_constants.divergence.d[index];
+  const float divergence = imageLoad(divergence_texture, coords).x;
 
   // Use a compile-time specialization constant to determine which buffer to read from and which to write to.
   // The remaining logic is the same for both cases.
   if(read_from_alpha) {
-    const float pressure_left = push_constants.alpha_pressure.p[texture_index(coords - ivec2(1, 0))];
-    const float pressure_right = push_constants.alpha_pressure.p[texture_index(coords + ivec2(1, 0))];
-    const float pressure_top = push_constants.alpha_pressure.p[texture_index(coords + ivec2(0, 1))];
-    const float pressure_bottom = push_constants.alpha_pressure.p[texture_index(coords - ivec2(0, 1))];
-    const float pressure_center = push_constants.alpha_pressure.p[index];
+    const float pressure_left = imageLoad(alpha_pressure, coords - ivec2(1, 0)).x;
+    const float pressure_right = imageLoad(alpha_pressure, coords + ivec2(1, 0)).x;
+    const float pressure_top = imageLoad(alpha_pressure, coords + ivec2(0, 1)).x;
+    const float pressure_bottom = imageLoad(alpha_pressure, coords - ivec2(0, 1)).x;
+    const float pressure_center = imageLoad(alpha_pressure, coords).x;
 
     const float new_pressure = (pressure_left + pressure_right + pressure_top + pressure_bottom - divergence) * 0.25;
-    push_constants.beta_pressure.p[index] = new_pressure;
+    imageStore(beta_pressure, coords, vec4(new_pressure, 0, 0, 0));
   } else {
-    const float pressure_left = push_constants.beta_pressure.p[texture_index(coords - ivec2(1, 0))];
-    const float pressure_right = push_constants.beta_pressure.p[texture_index(coords + ivec2(1, 0))];
-    const float pressure_top = push_constants.beta_pressure.p[texture_index(coords + ivec2(0, 1))];
-    const float pressure_bottom = push_constants.beta_pressure.p[texture_index(coords - ivec2(0, 1))];
-    const float pressure_center = push_constants.beta_pressure.p[index];
+    const float pressure_left = imageLoad(beta_pressure, coords - ivec2(1, 0)).x;
+    const float pressure_right = imageLoad(beta_pressure, coords + ivec2(1, 0)).x;
+    const float pressure_top = imageLoad(beta_pressure, coords + ivec2(0, 1)).x;
+    const float pressure_bottom = imageLoad(beta_pressure, coords - ivec2(0, 1)).x;
+    const float pressure_center = imageLoad(beta_pressure, coords).x;
 
     const float new_pressure = (pressure_left + pressure_right + pressure_top + pressure_bottom - divergence) * 0.25;
-    push_constants.alpha_pressure.p[index] = new_pressure;
+    imageStore(alpha_pressure, coords, vec4(new_pressure, 0, 0, 0));
   }
 }

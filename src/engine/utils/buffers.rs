@@ -247,7 +247,6 @@ pub fn new_data_buffer(
 /// If a `pageable_device_local_memory` is provided, the `f32` value must be in the range [0, 1] representing a priority with `1` being the greatest.
 pub fn update_device_local(
     device: &ash::Device,
-    allocator: &mut gpu_allocator::vulkan::Allocator,
     command_pool: ash::vk::CommandPool,
     queue: ash::vk::Queue,
     buffer: &BufferAllocation,

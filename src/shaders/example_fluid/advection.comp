@@ -6,21 +6,10 @@
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(scalar, buffer_reference, buffer_reference_align = 16) buffer VelocityTexture {
-  vec2 v[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer CurlTexture {
-  float c[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer DivergenceTexture {
-  float d[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer PressureTexture {
-  float p[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) buffer DyeTexture {
-  vec4 c[];
-};
+layout(set = 0, binding = 0, rg32f) readonly uniform image2D input_velocity;
+layout(set = 0, binding = 5, rg32f) writeonly uniform image2D output_velocity;
+layout(set = 0, binding = 6, rgba32f) readonly uniform image2D input_dye;
+layout(set = 0, binding = 7, rgba32f) writeonly uniform image2D output_dye;
 
 #include "shared.glsl"
 
@@ -29,10 +18,10 @@ vec2 bilerp_velocity(vec2 uv) {
   vec2 iuv = floor(st);
   vec2 fuv = fract(st);
 
-  vec2 a = push_constants.input_velocity.v[texture_index(ivec2(iuv + vec2(0.5, 0.5)))];
-  vec2 b = push_constants.input_velocity.v[texture_index(ivec2(iuv + vec2(1.5, 0.5)))];
-  vec2 c = push_constants.input_velocity.v[texture_index(ivec2(iuv + vec2(0.5, 1.5)))];
-  vec2 d = push_constants.input_velocity.v[texture_index(ivec2(iuv + vec2(1.5, 1.5)))];
+  vec2 a = imageLoad(input_velocity, ivec2(iuv + vec2(0.5, 0.5))).xy;
+  vec2 b = imageLoad(input_velocity, ivec2(iuv + vec2(1.5, 0.5))).xy;
+  vec2 c = imageLoad(input_velocity, ivec2(iuv + vec2(0.5, 1.5))).xy;
+  vec2 d = imageLoad(input_velocity, ivec2(iuv + vec2(1.5, 1.5))).xy;
 
   return mix(mix(a, b, fuv.x), mix(c, d, fuv.x), fuv.y);
 }
@@ -42,10 +31,10 @@ vec4 bilerp_dye(vec2 uv) {
   vec2 iuv = floor(st);
   vec2 fuv = fract(st);
 
-  vec4 a = push_constants.input_dye.c[texture_index(ivec2(iuv + vec2(0.5, 0.5)))];
-  vec4 b = push_constants.input_dye.c[texture_index(ivec2(iuv + vec2(1.5, 0.5)))];
-  vec4 c = push_constants.input_dye.c[texture_index(ivec2(iuv + vec2(0.5, 1.5)))];
-  vec4 d = push_constants.input_dye.c[texture_index(ivec2(iuv + vec2(1.5, 1.5)))];
+  vec4 a = imageLoad(input_dye, ivec2(iuv + vec2(0.5, 0.5)));
+  vec4 b = imageLoad(input_dye, ivec2(iuv + vec2(1.5, 0.5)));
+  vec4 c = imageLoad(input_dye, ivec2(iuv + vec2(0.5, 1.5)));
+  vec4 d = imageLoad(input_dye, ivec2(iuv + vec2(1.5, 1.5)));
 
   return mix(mix(a, b, fuv.x), mix(c, d, fuv.x), fuv.y);
 }
@@ -53,12 +42,11 @@ vec4 bilerp_dye(vec2 uv) {
 // Perform the main advection step of the fluid simulation along the velocity and dye fields.
 void main() {
   const ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+  // TODO: Consider using `imageSize(..)` to get the texture size.
   if(coords.x >= push_constants.screen_size.x || coords.y >= push_constants.screen_size.y) {
     return;
   }
-  const int index = texture_index(coords);
 
-  // const vec2 velocity = push_constants.input_velocity.v[index];
   const vec2 velocity = bilerp_velocity(coords);
 
   // Move the field texture coordinates backwards along the velocity vector to get a reference coordinate for advection.
@@ -77,6 +65,6 @@ void main() {
   new_velocity = mix(new_velocity, push_constants.cursor_velocity, cursor_effect);
   new_dye = mix(new_dye, push_constants.cursor_dye.rgb, cursor_effect);
 
-  push_constants.output_velocity.v[index] = new_velocity;
-  push_constants.output_dye.c[index] = vec4(new_dye, 1.0);
+  imageStore(output_velocity, coords, vec4(new_velocity, 0, 0));
+  imageStore(output_dye, coords, vec4(new_dye, 1));
 }

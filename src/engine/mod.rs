@@ -19,7 +19,7 @@ pub enum DemoPipeline {
 /// Each demo needs a unique set of information to render each frame.
 pub enum DemoPushConstants {
     Triangle(example_triangle::PushConstants),
-    Fluid(example_fluid::PushConstants),
+    Fluid(example_fluid::ComputePushConstants),
     RayTracing(example_ray_tracing::PushConstants),
 }
 
@@ -418,7 +418,7 @@ impl Renderer {
                     ash::vk::ImageLayout::PRESENT_SRC_KHR,
                     swapchain.image_views(),
                     compute_queue_extra.map_or(command_pool, |(pool, _)| pool),
-                    pageable_device_local_memory.as_ref(),
+                    compute_queue.queue,
                 );
                 DemoPipeline::Fluid(demo)
             }
@@ -630,9 +630,11 @@ impl Renderer {
                     simulation.recreate_framebuffers(
                         &self.logical_device,
                         &mut self.memory_allocator,
+                        self.compute_command_pool
+                            .map_or(self.command_pool, |(pool, _)| pool),
+                        self.compute_queue.queue,
                         extent,
                         self.swapchain.image_views(),
-                        self.pageable_device_local_memory.as_ref(),
                     );
                 }
                 DemoPipeline::RayTracing(tracer) => tracer.recreate_view_sets(
@@ -678,7 +680,7 @@ impl Renderer {
                         self.swapchain.image_views(),
                         self.compute_command_pool
                             .map_or(self.command_pool, |(pool, _)| pool),
-                        self.pageable_device_local_memory.as_ref(),
+                        self.compute_queue.queue,
                     );
                     simulation.destroy(&self.logical_device, &mut self.memory_allocator);
                     *simulation = new_sim;
@@ -788,7 +790,6 @@ impl Renderer {
                 )
                 .expect("Unable to begin command buffer");
         }
-
         let extent = self.swapchain.extent();
 
         // Draw the active demo pipeline.
@@ -1034,7 +1035,7 @@ impl Renderer {
                     self.swapchain.image_views(),
                     self.compute_command_pool
                         .map_or(self.command_pool, |(pool, _)| pool),
-                    self.pageable_device_local_memory.as_ref(),
+                    self.compute_queue.queue,
                 ))
             }
             NewDemo::RayTracing => {

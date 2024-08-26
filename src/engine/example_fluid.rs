@@ -32,17 +32,7 @@ const MAX_PRESSURE_SMOOTHING_ITERATIONS: u32 = 16;
 /// Define the shared push constants for each compute stage of this minimal fluid simulation.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::NoUninit)]
-pub struct PushConstants {
-    // GPU device addresses.
-    pub input_velocity_buffer: ash::vk::DeviceAddress,
-    pub curl_buffer: ash::vk::DeviceAddress,
-    pub divergence_buffer: ash::vk::DeviceAddress,
-    pub alpha_pressure_buffer: ash::vk::DeviceAddress,
-    pub beta_pressure_buffer: ash::vk::DeviceAddress,
-    pub output_velocity_buffer: ash::vk::DeviceAddress,
-    pub input_dye_buffer: ash::vk::DeviceAddress,
-    pub output_dye_buffer: ash::vk::DeviceAddress,
-
+pub struct ComputePushConstants {
     // Fluid simulation parameters.
     pub cursor_dye: [f32; 4],
     pub cursor_position: [f32; 2],
@@ -81,19 +71,11 @@ impl FluidDisplayTexture {
 
 /// Use a separate set of push constants to choose how to render the output of the fluid simulation.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, bytemuck::NoUninit)]
+#[derive(Clone, Copy, Debug, Default)]
 struct FragmentPushConstants {
-    // GPU device addresses.
-    pub velocity_buffer: ash::vk::DeviceAddress,
-    pub dye_buffer: ash::vk::DeviceAddress,
-    pub pressure_buffer: ash::vk::DeviceAddress,
-
     // Fluid simulation parameters.
     pub screen_size: [u32; 2],
     pub display_texture: FluidDisplayTexture,
-
-    #[allow(dead_code)]
-    _padding: u32,
 }
 
 /// Create the render pass capable of orchestrating the rendering of framebuffers for this application.
@@ -169,137 +151,213 @@ fn create_render_pass(
 }
 
 /// Helper type for managing the resources for an allocated image.
-pub struct AllocatedBuffer {
-    pub buffer: utils::buffers::BufferAllocation,
-    pub device_address: ash::vk::DeviceAddress,
+struct ComputeImage {
+    pub image: ash::vk::Image,
+    allocation: gpu_allocator::vulkan::Allocation,
+    pub image_view: ash::vk::ImageView,
 }
-impl AllocatedBuffer {
+impl ComputeImage {
     /// Create a new image with the given information.
     pub fn new(
         device: &ash::Device,
-        pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
         memory_allocator: &mut gpu_allocator::vulkan::Allocator,
-        buffer_info: &ash::vk::BufferCreateInfo,
-        image_debug_name: &str,
+        image_info: ash::vk::ImageCreateInfo,
+        image_name: &str,
     ) -> Self {
-        // Ensure that the buffer is aligned to 16 bytes.
-        // The shaders are each expecting the storage buffers to be aligned to 16 bytes.
-        let buffer = utils::buffers::new_device_local(
-            device,
-            pageable_device_local_memory.map(|d| (d, 1.)),
-            memory_allocator,
-            buffer_info,
-            Some(16),
-            image_debug_name,
-        )
-        .expect("Unable to create fluid simulation buffer");
-
-        let device_address = unsafe {
-            device.get_buffer_device_address(
-                &ash::vk::BufferDeviceAddressInfo::default().buffer(buffer.buffer),
-            )
-        };
-        #[cfg(debug_assertions)]
-        assert_ne!(
-            device_address, 0,
-            "The device address of the buffer is zero"
-        );
+        let (image, allocation) =
+            utils::create_image(device, memory_allocator, &image_info, image_name);
+        let image_view = utils::create_image_view(device, image, image_info.format, 1);
 
         Self {
-            buffer,
-            device_address,
+            image,
+            allocation,
+            image_view,
         }
     }
 
-    /// Destroy the buffer and its memory.
+    /// Destroy the device image.
     pub fn destroy(
         self,
         device: &ash::Device,
         memory_allocator: &mut gpu_allocator::vulkan::Allocator,
     ) {
-        self.buffer.destroy(device, memory_allocator);
+        unsafe {
+            device.destroy_image_view(self.image_view, None);
+            memory_allocator
+                .free(self.allocation)
+                .expect("Failed to free the image allocation");
+            device.destroy_image(self.image, None);
+        }
+    }
+}
+
+fn initialize_image_layouts(
+    device: &ash::Device,
+    command_pool: ash::vk::CommandPool,
+    queue: ash::vk::Queue,
+    images: &[ComputeImage],
+    layout: ash::vk::ImageLayout,
+) -> ash::vk::Fence {
+    let command_buffer = unsafe {
+        device.allocate_command_buffers(
+            &ash::vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(ash::vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1),
+        )
+    }
+    .expect("Failed to allocate command buffer for image layout initialization")[0];
+
+    unsafe {
+        device.begin_command_buffer(
+            command_buffer,
+            &ash::vk::CommandBufferBeginInfo::default()
+                .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )
+    }
+    .expect("Failed to begin command buffer for image layout initialization");
+
+    for image in images {
+        let image_memory_barrier = ash::vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(ash::vk::PipelineStageFlags2::NONE)
+            .src_access_mask(ash::vk::AccessFlags2::NONE)
+            .dst_stage_mask(
+                ash::vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+                    | ash::vk::PipelineStageFlags2::COMPUTE_SHADER,
+            )
+            .dst_access_mask(
+                ash::vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | ash::vk::AccessFlags2::SHADER_WRITE,
+            )
+            .old_layout(ash::vk::ImageLayout::UNDEFINED)
+            .new_layout(layout)
+            .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+            .image(image.image)
+            .subresource_range(ash::vk::ImageSubresourceRange {
+                aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        unsafe {
+            device.cmd_pipeline_barrier2(
+                command_buffer,
+                &ash::vk::DependencyInfo::default().image_memory_barriers(&[image_memory_barrier]),
+            );
+        }
+    }
+
+    unsafe { device.end_command_buffer(command_buffer) }
+        .expect("Failed to end command buffer for image layout initialization");
+
+    unsafe {
+        let fence = device
+            .create_fence(&ash::vk::FenceCreateInfo::default(), None)
+            .expect("Failed to create fence for image layout initialization");
+
+        device
+            .queue_submit(
+                queue,
+                &[ash::vk::SubmitInfo::default().command_buffers(&[command_buffer])],
+                fence,
+            )
+            .expect("Failed to submit command buffer for image layout initialization");
+
+        fence
     }
 }
 
 /// Create a framebuffer that can be used with this render pass.
-pub fn create_framebuffers(
+fn create_framebuffers(
     device: &ash::Device,
     memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+    command_pool: ash::vk::CommandPool,
+    queue: ash::vk::Queue,
     extent: ash::vk::Extent2D,
     destination_views: &[ash::vk::ImageView],
     render_pass: ash::vk::RenderPass,
-    pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
-) -> (Vec<ash::vk::Framebuffer>, [AllocatedBuffer; 8]) {
+) -> (Vec<ash::vk::Framebuffer>, [ComputeImage; 8]) {
     // Create several images for storing the partial results of the fluid simulation each frame.
     // These images are not strictly part of the framebuffers, but are used in the fluid simulation and dependent on the size of the surface.
-    let mut buffer_info = ash::vk::BufferCreateInfo::default().usage(
-        ash::vk::BufferUsageFlags::STORAGE_BUFFER
-            | ash::vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-    );
-    let pixel_count = u64::from(extent.width) * u64::from(extent.height);
+    let image_info = ash::vk::ImageCreateInfo::default()
+        .image_type(ash::vk::ImageType::TYPE_2D)
+        .extent(ash::vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(ash::vk::SampleCountFlags::TYPE_1)
+        .usage(ash::vk::ImageUsageFlags::STORAGE);
 
-    buffer_info.size = pixel_count * std::mem::size_of::<[f32; 2]>() as u64;
-    let input_velocity_image = AllocatedBuffer::new(
+    let input_velocity_image = ComputeImage::new(
         device,
-        pageable_device_local_memory,
         memory_allocator,
-        &buffer_info,
+        image_info.format(ash::vk::Format::R32G32_SFLOAT),
         "Fluid Sim input velocity buffer",
     );
-
-    buffer_info.size = pixel_count * std::mem::size_of::<f32>() as u64;
-    let curl_image = AllocatedBuffer::new(
+    let curl_image = ComputeImage::new(
         device,
-        pageable_device_local_memory,
         memory_allocator,
-        &buffer_info,
+        image_info.format(ash::vk::Format::R32_SFLOAT),
         "Fluid Sim curl buffer",
     );
-    let divergence_image = AllocatedBuffer::new(
+    let divergence_image = ComputeImage::new(
         device,
-        pageable_device_local_memory,
         memory_allocator,
-        &buffer_info,
+        image_info.format(ash::vk::Format::R32_SFLOAT),
         "Fluid Sim divergence buffer",
     );
-    let alpha_pressure_image = AllocatedBuffer::new(
+    let alpha_pressure_image = ComputeImage::new(
         device,
-        pageable_device_local_memory,
         memory_allocator,
-        &buffer_info,
+        image_info.format(ash::vk::Format::R32_SFLOAT),
         "Fluid Sim alpha pressure buffer",
     );
-    let beta_pressure_image = AllocatedBuffer::new(
+    let beta_pressure_image = ComputeImage::new(
         device,
-        pageable_device_local_memory,
         memory_allocator,
-        &buffer_info,
+        image_info.format(ash::vk::Format::R32_SFLOAT),
         "Fluid Sim beta pressure buffer",
     );
-
-    buffer_info.size = pixel_count * std::mem::size_of::<[f32; 2]>() as u64;
-    let output_velocity_image = AllocatedBuffer::new(
+    let output_velocity_image = ComputeImage::new(
         device,
-        pageable_device_local_memory,
         memory_allocator,
-        &buffer_info,
+        image_info.format(ash::vk::Format::R32G32_SFLOAT),
         "Fluid Sim output velocity buffer",
     );
-
-    buffer_info.size = pixel_count * std::mem::size_of::<[f32; 4]>() as u64;
-    let input_dye_image = AllocatedBuffer::new(
+    let input_dye_image = ComputeImage::new(
         device,
-        pageable_device_local_memory,
         memory_allocator,
-        &buffer_info,
+        image_info.format(ash::vk::Format::R32G32B32A32_SFLOAT),
         "Fluid Sim input dye buffer",
     );
-    let output_dye_image = AllocatedBuffer::new(
+    let output_dye_image = ComputeImage::new(
         device,
-        pageable_device_local_memory,
         memory_allocator,
-        &buffer_info,
+        image_info.format(ash::vk::Format::R32G32B32A32_SFLOAT),
         "Fluid Sim output dye buffer",
+    );
+
+    let images = [
+        input_velocity_image,
+        curl_image,
+        divergence_image,
+        alpha_pressure_image,
+        beta_pressure_image,
+        output_velocity_image,
+        input_dye_image,
+        output_dye_image,
+    ];
+
+    let fence = initialize_image_layouts(
+        device,
+        command_pool,
+        queue,
+        &images,
+        ash::vk::ImageLayout::GENERAL,
     );
 
     // The actual render pass framebuffers simply draw to the destination views as color attachments.
@@ -320,34 +378,89 @@ pub fn create_framebuffers(
         })
         .collect();
 
-    (
-        framebuffers,
-        [
-            input_velocity_image,
-            curl_image,
-            divergence_image,
-            alpha_pressure_image,
-            beta_pressure_image,
-            output_velocity_image,
-            input_dye_image,
-            output_dye_image,
-        ],
-    )
+    unsafe {
+        device
+            .wait_for_fences(&[fence], true, FIVE_SECONDS_IN_NANOSECONDS)
+            .expect("Failed to wait for fence to signal for image layout initialization");
+        device.destroy_fence(fence, None);
+    }
+
+    (framebuffers, images)
+}
+
+fn create_descriptor_set_layouts(device: &ash::Device) -> [ash::vk::DescriptorSetLayout; 2] {
+    let storage_binding_base = ash::vk::DescriptorSetLayoutBinding::default()
+        .descriptor_type(ash::vk::DescriptorType::STORAGE_IMAGE)
+        .descriptor_count(1)
+        .stage_flags(ash::vk::ShaderStageFlags::COMPUTE);
+    let input_velocity = storage_binding_base.binding(0);
+    let curl_texture = storage_binding_base.binding(1);
+    let divergence_texture = storage_binding_base.binding(2);
+    let alpha_pressure_texture = storage_binding_base.binding(3);
+    let beta_pressure_texture = storage_binding_base.binding(4);
+    let output_velocity = storage_binding_base.binding(5);
+    let input_dye = storage_binding_base.binding(6);
+    let output_dye = storage_binding_base.binding(7);
+
+    let compute = unsafe {
+        device.create_descriptor_set_layout(
+            &ash::vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
+                input_velocity,
+                curl_texture,
+                divergence_texture,
+                alpha_pressure_texture,
+                beta_pressure_texture,
+                output_velocity,
+                input_dye,
+                output_dye,
+            ]),
+            None,
+        )
+    }
+    .expect("Unable to create the compute descriptor set layout for the fluid simulation");
+
+    let input_velocity = storage_binding_base
+        .binding(0)
+        .stage_flags(ash::vk::ShaderStageFlags::FRAGMENT);
+    let input_dye = storage_binding_base
+        .binding(1)
+        .stage_flags(ash::vk::ShaderStageFlags::FRAGMENT);
+    let pressure_texture = storage_binding_base
+        .binding(2)
+        .stage_flags(ash::vk::ShaderStageFlags::FRAGMENT);
+    let graphics = unsafe {
+        device.create_descriptor_set_layout(
+            &ash::vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
+                input_velocity,
+                input_dye,
+                pressure_texture,
+            ]),
+            None,
+        )
+    }
+    .expect("Unable to create the graphics descriptor set layout for the fluid simulation");
+
+    [compute, graphics]
 }
 
 /// Create the compute and graphics pipeline layouts.
-fn create_pipeline_layout(device: &ash::Device) -> [ash::vk::PipelineLayout; 2] {
+fn create_pipeline_layout(
+    device: &ash::Device,
+    compute_descriptor_set_layout: ash::vk::DescriptorSetLayout,
+    graphics_descriptor_set_layout: ash::vk::DescriptorSetLayout,
+) -> [ash::vk::PipelineLayout; 2] {
     // Create the push constant specification for the fluid simulation. The same data is used for both the compute and fragment shaders.
     let compute_push_constant_range = ash::vk::PushConstantRange {
         stage_flags: ash::vk::ShaderStageFlags::COMPUTE,
         offset: 0,
-        size: std::mem::size_of::<PushConstants>() as u32,
+        size: std::mem::size_of::<ComputePushConstants>() as u32,
     };
 
     // Create the pipeline layout for the fluid simulation.
     let compute_pipeline_layout = unsafe {
         device.create_pipeline_layout(
             &ash::vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&[compute_descriptor_set_layout])
                 .push_constant_ranges(&[compute_push_constant_range]),
             None,
         )
@@ -362,6 +475,7 @@ fn create_pipeline_layout(device: &ash::Device) -> [ash::vk::PipelineLayout; 2] 
     let graphics_pipeline_layout = unsafe {
         device.create_pipeline_layout(
             &ash::vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&[graphics_descriptor_set_layout])
                 .push_constant_ranges(&[graphics_push_constant_range]),
             None,
         )
@@ -585,19 +699,101 @@ fn create_graphics_pipeline(
         .into_iter().next().expect("vkCreateGraphicsPipelines returned an empty list of pipelines but provided a successful result")
 }
 
+fn update_descriptor_sets(
+    device: &ash::Device,
+    descriptor_sets: &[ash::vk::DescriptorSet],
+    images: &[ComputeImage],
+) {
+    let image_infos = images
+        .iter()
+        .map(|img| {
+            ash::vk::DescriptorImageInfo::default()
+                .image_view(img.image_view)
+                .image_layout(ash::vk::ImageLayout::GENERAL)
+        })
+        .collect::<Vec<_>>();
+    let compute_writes = image_infos.iter().enumerate().map(|img| {
+        ash::vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_sets[0])
+            .dst_binding(img.0 as u32)
+            .descriptor_count(1)
+            .descriptor_type(ash::vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(std::slice::from_ref(img.1))
+    });
+
+    let graphics_writes = [
+        ash::vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_sets[1])
+            .dst_binding(0)
+            .descriptor_count(1)
+            .descriptor_type(ash::vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(std::slice::from_ref(image_infos.get(5).unwrap())),
+        ash::vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_sets[1])
+            .dst_binding(1)
+            .descriptor_count(1)
+            .descriptor_type(ash::vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(std::slice::from_ref(image_infos.get(7).unwrap())),
+        ash::vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_sets[1])
+            .dst_binding(2)
+            .descriptor_count(1)
+            .descriptor_type(ash::vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(std::slice::from_ref(image_infos.get(3).unwrap())),
+    ];
+
+    let writes = compute_writes
+        .chain(graphics_writes.into_iter())
+        .collect::<Vec<_>>();
+
+    unsafe {
+        device.update_descriptor_sets(&writes, &[]);
+    }
+}
+
+fn allocate_descriptor_sets(
+    device: &ash::Device,
+    descriptor_set_layouts: &[ash::vk::DescriptorSetLayout],
+) -> (ash::vk::DescriptorPool, Vec<ash::vk::DescriptorSet>) {
+    // NOTE: There are 8 storage images in the compute pipelines, and 3 in the graphics pipeline.
+    let descriptor_pool = unsafe {
+        device.create_descriptor_pool(
+            &ash::vk::DescriptorPoolCreateInfo::default()
+                .max_sets(2)
+                .pool_sizes(&[ash::vk::DescriptorPoolSize::default()
+                    .ty(ash::vk::DescriptorType::STORAGE_IMAGE)
+                    .descriptor_count(11)]),
+            None,
+        )
+    }
+    .expect("Unable to create the descriptor pool for the fluid simulation");
+
+    let allocate_info = ash::vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(descriptor_pool)
+        .set_layouts(descriptor_set_layouts);
+    let descriptor_sets = unsafe { device.allocate_descriptor_sets(&allocate_info) }
+        .expect("Unable to allocate descriptor sets for the fluid simulation");
+
+    (descriptor_pool, descriptor_sets)
+}
+
 /// The fluid simulation renderer and resources.
 pub struct FluidSimulation {
     shaders: FluidShaders,
+    compute_descriptor_set_layout: ash::vk::DescriptorSetLayout,
+    graphics_descriptor_set_layout: ash::vk::DescriptorSetLayout,
     compute_pipeline_layout: ash::vk::PipelineLayout,
     graphics_pipeline_layout: ash::vk::PipelineLayout,
     render_pass: ash::vk::RenderPass,
     compute_pipelines: FluidComputeStages,
     graphics_pipeline: ash::vk::Pipeline,
     framebuffers: Vec<ash::vk::Framebuffer>,
-    allocated_images: Vec<AllocatedBuffer>,
+    allocated_images: Vec<ComputeImage>,
     compute_fence: ash::vk::Fence,
     graphics_fence: Option<ash::vk::Fence>,
     compute_command_buffer: ash::vk::CommandBuffer,
+    descriptor_pool: ash::vk::DescriptorPool,
+    descriptor_sets: Vec<ash::vk::DescriptorSet>,
     current_display_texture: FluidDisplayTexture,
 }
 impl FluidSimulation {
@@ -610,10 +806,16 @@ impl FluidSimulation {
         destination_layout: ash::vk::ImageLayout,
         destination_views: &[ash::vk::ImageView],
         compute_command_pool: ash::vk::CommandPool,
-        pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
+        compute_queue: ash::vk::Queue,
     ) -> Self {
         let shaders = FluidShaders::new(device);
-        let [compute_pipeline_layout, graphics_pipeline_layout] = create_pipeline_layout(device);
+        let [compute_descriptor_set_layout, graphics_descriptor_set_layout] =
+            create_descriptor_set_layouts(device);
+        let [compute_pipeline_layout, graphics_pipeline_layout] = create_pipeline_layout(
+            device,
+            compute_descriptor_set_layout,
+            graphics_descriptor_set_layout,
+        );
 
         let render_pass = create_render_pass(device, image_format, destination_layout);
 
@@ -624,10 +826,11 @@ impl FluidSimulation {
         let (framebuffers, allocated_images) = create_framebuffers(
             device,
             memory_allocator,
+            compute_command_pool,
+            compute_queue,
             extent,
             destination_views,
             render_pass,
-            pageable_device_local_memory,
         );
 
         // Create the compute fence to ensure that compute resources can be accessed by the CPU after queue submission.
@@ -651,8 +854,20 @@ impl FluidSimulation {
                 .first()
                 .expect("vkAllocateCommandBuffers returned an empty list of command buffers but provided a successful result");
 
+        let (descriptor_pool, descriptor_sets) = allocate_descriptor_sets(
+            device,
+            &[
+                compute_descriptor_set_layout,
+                graphics_descriptor_set_layout,
+            ],
+        );
+
+        update_descriptor_sets(device, &descriptor_sets, &allocated_images);
+
         Self {
             shaders,
+            compute_descriptor_set_layout,
+            graphics_descriptor_set_layout,
             compute_pipeline_layout,
             graphics_pipeline_layout,
             render_pass,
@@ -663,6 +878,8 @@ impl FluidSimulation {
             compute_fence,
             graphics_fence: None,
             compute_command_buffer,
+            descriptor_pool,
+            descriptor_sets,
             current_display_texture: FluidDisplayTexture::default(),
         }
     }
@@ -674,6 +891,8 @@ impl FluidSimulation {
         memory_allocator: &mut gpu_allocator::vulkan::Allocator,
     ) {
         unsafe {
+            device.destroy_descriptor_pool(self.descriptor_pool, None);
+
             device
                 .wait_for_fences(&[self.compute_fence], true, FIVE_SECONDS_IN_NANOSECONDS)
                 .expect("Unable to wait for the compute fence to signal");
@@ -693,8 +912,102 @@ impl FluidSimulation {
 
             device.destroy_pipeline_layout(self.compute_pipeline_layout, None);
             device.destroy_pipeline_layout(self.graphics_pipeline_layout, None);
+
+            device.destroy_descriptor_set_layout(self.compute_descriptor_set_layout, None);
+            device.destroy_descriptor_set_layout(self.graphics_descriptor_set_layout, None);
         }
         self.shaders.destroy(device);
+    }
+
+    /// Update device addresses by switching input and output (alpha/beta) buffers.
+    fn swap_descriptor_sets(&mut self, device: &ash::Device) {
+        self.allocated_images.swap(0, 5);
+        self.allocated_images.swap(3, 4);
+        self.allocated_images.swap(6, 7);
+
+        let image_infos = [
+            ash::vk::DescriptorImageInfo::default()
+                .image_view(self.allocated_images[0].image_view)
+                .image_layout(ash::vk::ImageLayout::GENERAL),
+            ash::vk::DescriptorImageInfo::default()
+                .image_view(self.allocated_images[3].image_view)
+                .image_layout(ash::vk::ImageLayout::GENERAL),
+            ash::vk::DescriptorImageInfo::default()
+                .image_view(self.allocated_images[4].image_view)
+                .image_layout(ash::vk::ImageLayout::GENERAL),
+            ash::vk::DescriptorImageInfo::default()
+                .image_view(self.allocated_images[5].image_view)
+                .image_layout(ash::vk::ImageLayout::GENERAL),
+            ash::vk::DescriptorImageInfo::default()
+                .image_view(self.allocated_images[6].image_view)
+                .image_layout(ash::vk::ImageLayout::GENERAL),
+            ash::vk::DescriptorImageInfo::default()
+                .image_view(self.allocated_images[7].image_view)
+                .image_layout(ash::vk::ImageLayout::GENERAL),
+        ];
+
+        let writes = [
+            // Compute descriptor set.
+            ash::vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_sets[0])
+                .dst_binding(0)
+                .descriptor_count(1)
+                .descriptor_type(ash::vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&image_infos[0])),
+            ash::vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_sets[0])
+                .dst_binding(3)
+                .descriptor_count(1)
+                .descriptor_type(ash::vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&image_infos[1])),
+            ash::vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_sets[0])
+                .dst_binding(4)
+                .descriptor_count(1)
+                .descriptor_type(ash::vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&image_infos[2])),
+            ash::vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_sets[0])
+                .dst_binding(5)
+                .descriptor_count(1)
+                .descriptor_type(ash::vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&image_infos[3])),
+            ash::vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_sets[0])
+                .dst_binding(6)
+                .descriptor_count(1)
+                .descriptor_type(ash::vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&image_infos[4])),
+            ash::vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_sets[0])
+                .dst_binding(7)
+                .descriptor_count(1)
+                .descriptor_type(ash::vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&image_infos[5])),
+            // Graphics descriptor set.
+            ash::vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_sets[1])
+                .dst_binding(0)
+                .descriptor_count(1)
+                .descriptor_type(ash::vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&image_infos[3])),
+            ash::vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_sets[1])
+                .dst_binding(1)
+                .descriptor_count(1)
+                .descriptor_type(ash::vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&image_infos[5])),
+            ash::vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_sets[1])
+                .dst_binding(2)
+                .descriptor_count(1)
+                .descriptor_type(ash::vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&image_infos[1])),
+        ];
+
+        unsafe {
+            device.update_descriptor_sets(&writes, &[]);
+        }
     }
 
     /// Create the framebuffers, likely after a swapchain recreation.
@@ -704,9 +1017,10 @@ impl FluidSimulation {
         &mut self,
         device: &ash::Device,
         memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+        compute_command_pool: ash::vk::CommandPool,
+        compute_queue: ash::vk::Queue,
         extent: ash::vk::Extent2D,
         destination_views: &[ash::vk::ImageView],
-        pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
     ) {
         // Wait for the compute fence to ensure all resources are available.
         unsafe {
@@ -750,11 +1064,15 @@ impl FluidSimulation {
         let (framebuffers, allocated_images) = create_framebuffers(
             device,
             memory_allocator,
+            compute_command_pool,
+            compute_queue,
             extent,
             destination_views,
             self.render_pass,
-            pageable_device_local_memory,
         );
+
+        update_descriptor_sets(device, &self.descriptor_sets, &allocated_images);
+
         self.framebuffers = framebuffers;
         self.allocated_images = allocated_images.into();
     }
@@ -766,7 +1084,7 @@ impl FluidSimulation {
         &mut self,
         device: &ash::Device,
         extent: ash::vk::Extent2D,
-        push_constants: &PushConstants,
+        push_constants: &ComputePushConstants,
     ) {
         // Ensure that the command buffer is in the recording state.
         unsafe {
@@ -805,6 +1123,16 @@ impl FluidSimulation {
                 ash::vk::ShaderStageFlags::COMPUTE,
                 0,
                 bytemuck::bytes_of(push_constants),
+            );
+
+            // Bind the compute descriptor sets.
+            device.cmd_bind_descriptor_sets(
+                self.compute_command_buffer,
+                ash::vk::PipelineBindPoint::COMPUTE,
+                self.compute_pipeline_layout,
+                0,
+                &[self.descriptor_sets[0]],
+                &[],
             );
 
             // NOTE: The use of `8` here is directly related to the local group size in the compute shaders.
@@ -947,7 +1275,7 @@ impl FluidSimulation {
         graphics_command_buffer: ash::vk::CommandBuffer,
         extent: ash::vk::Extent2D,
         image_index: usize,
-        push_constants: &PushConstants,
+        push_constants: &ComputePushConstants,
         current_graphics_fence: ash::vk::Fence,
     ) {
         // Wait for the compute fence to ensure all resources are available.
@@ -968,6 +1296,9 @@ impl FluidSimulation {
                 );
             self.graphics_fence = Some(current_graphics_fence);
         }
+
+        // Swap the descriptor set input and output images.
+        self.swap_descriptor_sets(device);
 
         // Record the compute commands for the fluid simulation to the desired command buffer.
         self.create_compute_command_buffer(device, extent, push_constants);
@@ -993,12 +1324,9 @@ impl FluidSimulation {
                 .expect("Failed to submit the compute command buffer for the fluid simulation");
         }
 
-        // Ensure that the graphics command buffer has the proper push constants bound.
+        // Ensure that the graphics command buffer has the proper push constants and descriptor sets bound.
         unsafe {
             let push_constants = FragmentPushConstants {
-                velocity_buffer: self.allocated_images[5].device_address,
-                dye_buffer: self.allocated_images[7].device_address,
-                pressure_buffer: self.allocated_images[3].device_address,
                 screen_size: [extent.width, extent.height],
                 display_texture: self.current_display_texture,
                 ..Default::default()
@@ -1008,7 +1336,17 @@ impl FluidSimulation {
                 self.graphics_pipeline_layout,
                 ash::vk::ShaderStageFlags::FRAGMENT,
                 0,
-                bytemuck::bytes_of(&push_constants),
+                utils::data_byte_slice(&push_constants),
+            );
+
+            // Bind the compute descriptor sets.
+            device.cmd_bind_descriptor_sets(
+                graphics_command_buffer,
+                ash::vk::PipelineBindPoint::GRAPHICS,
+                self.graphics_pipeline_layout,
+                0,
+                &[self.descriptor_sets[1]],
+                &[],
             );
         }
 
@@ -1065,11 +1403,6 @@ impl FluidSimulation {
 
         // End the render pass.
         unsafe { device.cmd_end_render_pass(graphics_command_buffer) };
-
-        // Update device addresses by switching input and output (alpha/beta) buffers.
-        self.allocated_images.swap(0, 5);
-        self.allocated_images.swap(3, 4);
-        self.allocated_images.swap(6, 7);
     }
 
     /// Helper for creating new push constants with the given information and buffer addresses.
@@ -1080,18 +1413,9 @@ impl FluidSimulation {
         cursor_velocity: [f32; 2],
         cursor_dye: [f32; 4],
         delta_time: f32,
-    ) -> PushConstants {
+    ) -> ComputePushConstants {
         // Create a new set of push constants for the fluid simulation.
-        PushConstants {
-            input_velocity_buffer: self.allocated_images[0].device_address,
-            curl_buffer: self.allocated_images[1].device_address,
-            divergence_buffer: self.allocated_images[2].device_address,
-            alpha_pressure_buffer: self.allocated_images[3].device_address,
-            beta_pressure_buffer: self.allocated_images[4].device_address,
-            output_velocity_buffer: self.allocated_images[5].device_address,
-            input_dye_buffer: self.allocated_images[6].device_address,
-            output_dye_buffer: self.allocated_images[7].device_address,
-
+        ComputePushConstants {
             cursor_dye,
             cursor_position,
             cursor_velocity,

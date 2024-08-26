@@ -6,21 +6,8 @@
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(scalar, buffer_reference, buffer_reference_align = 16) buffer VelocityTexture {
-  vec2 v[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer CurlTexture {
-  float c[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer DivergenceTexture {
-  float d[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer PressureTexture {
-  float p[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer DyeTexture {
-  vec4 c[];
-};
+layout(set = 0, binding = 0, rg32f) uniform image2D input_velocity;
+layout(set = 0, binding = 3, r32f) uniform image2D alpha_pressure;
 
 #include "shared.glsl"
 
@@ -30,14 +17,13 @@ void main() {
   if(coords.x >= push_constants.screen_size.x || coords.y >= push_constants.screen_size.y) {
     return;
   }
-  const int index = texture_index(coords);
-  vec2 velocity = push_constants.input_velocity.v[index];
+  vec2 velocity = imageLoad(input_velocity, coords).xy;
 
-  const float pressure_left = push_constants.alpha_pressure.p[texture_index(coords - ivec2(1, 0))];
-  const float pressure_right = push_constants.alpha_pressure.p[texture_index(coords + ivec2(1, 0))];
-  const float pressure_top = push_constants.alpha_pressure.p[texture_index(coords + ivec2(0, 1))];
-  const float pressure_bottom = push_constants.alpha_pressure.p[texture_index(coords - ivec2(0, 1))];
+  const float pressure_left = imageLoad(alpha_pressure, coords - ivec2(1, 0)).x;
+  const float pressure_right = imageLoad(alpha_pressure, coords + ivec2(1, 0)).x;
+  const float pressure_top = imageLoad(alpha_pressure, coords + ivec2(0, 1)).x;
+  const float pressure_bottom = imageLoad(alpha_pressure, coords - ivec2(0, 1)).x;
 
   velocity -= vec2(pressure_right - pressure_left, pressure_top - pressure_bottom);
-  push_constants.input_velocity.v[index] = velocity;
+  imageStore(input_velocity, coords, vec4(velocity, 0, 0));
 }

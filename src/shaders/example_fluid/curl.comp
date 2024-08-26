@@ -6,21 +6,8 @@
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer VelocityTexture {
-  vec2 v[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) writeonly buffer CurlTexture {
-  float c[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer DivergenceTexture {
-  float d[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer PressureTexture {
-  float p[];
-};
-layout(scalar, buffer_reference, buffer_reference_align = 16) readonly buffer DyeTexture {
-  vec4 c[];
-};
+layout(set = 0, binding = 0, rg32f) readonly uniform image2D input_velocity;
+layout(set = 0, binding = 1, r32f) writeonly uniform image2D curl_texture;
 
 #include "shared.glsl"
 
@@ -30,13 +17,14 @@ void main() {
   if(coords.x >= push_constants.screen_size.x || coords.y >= push_constants.screen_size.y) {
     return;
   }
-  const int index = texture_index(coords);
 
-  const float velocity_left = push_constants.input_velocity.v[texture_index(coords - ivec2(1, 0))].y;
-  const float velocity_right = push_constants.input_velocity.v[texture_index(coords + ivec2(1, 0))].y;
-  const float velocity_top = push_constants.input_velocity.v[texture_index(coords + ivec2(0, 1))].x;
-  const float velocity_bottom = push_constants.input_velocity.v[texture_index(coords - ivec2(0, 1))].x;
+  const float velocity_left = imageLoad(input_velocity, coords - ivec2(1, 0)).y;
+  const float velocity_right = imageLoad(input_velocity, coords + ivec2(1, 0)).y;
+  const float velocity_top = imageLoad(input_velocity, coords + ivec2(0, 1)).x;
+  const float velocity_bottom = imageLoad(input_velocity, coords - ivec2(0, 1)).x;
+
+  const float new_curl = 0.5 * (velocity_right - velocity_left - velocity_top + velocity_bottom);
 
   // Calculate the curl and apply it to the storage buffer.
-  push_constants.curl.c[index] = 0.5 * (velocity_right - velocity_left - velocity_top + velocity_bottom);
+  imageStore(curl_texture, coords, vec4(new_curl, 0, 0, 0));
 }
