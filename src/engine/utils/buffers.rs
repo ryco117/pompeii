@@ -168,7 +168,7 @@ pub fn new_data_buffer(
     name: &str,
     staging_buffer: &mut StagingBuffer,
     staging_offset: Option<usize>,
-) -> Result<(BufferAllocation, ash::vk::Fence), ash::vk::Result> {
+) -> Result<(BufferAllocation, super::CleanableFence), ash::vk::Result> {
     // Copy the data into the staging buffer.
     let staging_slice = staging_buffer
         .allocation_mut()
@@ -227,6 +227,12 @@ pub fn new_data_buffer(
 
     // Create a fence so that the caller can wait for the copy operation to finish.
     let fence = unsafe { device.create_fence(&ash::vk::FenceCreateInfo::default(), None)? };
+    let cleanable_fence = super::CleanableFence::new(
+        fence,
+        Some(Box::new(move |device, _| unsafe {
+            device.free_command_buffers(command_pool, &[command_buffer]);
+        })),
+    );
 
     // Submit the copy command buffer.
     unsafe {
@@ -237,7 +243,7 @@ pub fn new_data_buffer(
         )?;
     }
 
-    Ok((device_buffer, fence))
+    Ok((device_buffer, cleanable_fence))
 }
 
 /// Update the contents of a device-local buffer with the given data.
@@ -253,7 +259,7 @@ pub fn update_device_local(
     data: &[u8],
     staging_buffer: &mut StagingBuffer,
     staging_offset: Option<usize>,
-) -> Result<ash::vk::Fence, ash::vk::Result> {
+) -> Result<super::CleanableFence, ash::vk::Result> {
     // Copy the data into the staging buffer.
     let staging_slice = staging_buffer
         .allocation_mut()
@@ -300,6 +306,12 @@ pub fn update_device_local(
 
     // Create a fence so that the caller can wait for the copy operation to finish.
     let fence = unsafe { device.create_fence(&ash::vk::FenceCreateInfo::default(), None)? };
+    let cleanable_fence = super::CleanableFence::new(
+        fence,
+        Some(Box::new(move |device, _| unsafe {
+            device.free_command_buffers(command_pool, &[command_buffer]);
+        })),
+    );
 
     // Submit the copy command buffer.
     unsafe {
@@ -310,5 +322,5 @@ pub fn update_device_local(
         )?;
     }
 
-    Ok(fence)
+    Ok(cleanable_fence)
 }

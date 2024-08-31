@@ -15,6 +15,13 @@ pub const SPECIAL_SURFACE_EXTENT: ash::vk::Extent2D = ash::vk::Extent2D {
     height: u32::MAX,
 };
 
+/// The default extent to use when the surface `current_extent` is `SPECIAL_SURFACE_EXTENT` and no
+/// preferred extent is available.
+pub const DEFAULT_SURFACE_EXTENT: ash::vk::Extent2D = ash::vk::Extent2D {
+    width: 800,
+    height: 600,
+};
+
 /// Preferences for the image and behavior used with a new swapchain.
 #[derive(Clone, Copy, Default)]
 pub struct SwapchainPreferences {
@@ -67,6 +74,7 @@ impl Swapchain {
         logical_device: &ash::Device,
         surface: ash::vk::SurfaceKHR,
         memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+        image_usage: Option<ash::vk::ImageUsageFlags>,
         preferences: SwapchainPreferences,
         enabled_swapchain_maintenance1: bool,
         old_swapchain: Option<ash::vk::SwapchainKHR>,
@@ -136,35 +144,20 @@ impl Swapchain {
             ash::vk::CompositeAlphaFlagsKHR::OPAQUE
         };
 
-        // In practice, window managers may set the surface to a zero extent when minimized.
-        if surface_capabilities.max_image_extent.width == 0
-            || surface_capabilities.max_image_extent.height == 0
-        {
-            panic!(
-                "Surface capabilities have not been initialized or window has launched minimized"
-            );
-        }
-
-        let preferred_extent = if surface_capabilities.current_extent == SPECIAL_SURFACE_EXTENT {
-            // The current extent is the special value indicating that the caller must set a desired extent.
-            // Use the preferred extent if it is set, otherwise use the minimum extent. The maximum image size is sometimes larger than the memory available.
+        let extent = if surface_capabilities.current_extent == SPECIAL_SURFACE_EXTENT {
             preferences
                 .preferred_extent
-                .unwrap_or(surface_capabilities.min_image_extent)
+                .unwrap_or(DEFAULT_SURFACE_EXTENT)
         } else {
+            // In practice, window managers may set the surface to a zero extent when minimized.
+            if surface_capabilities.max_image_extent.width == 0
+                || surface_capabilities.max_image_extent.height == 0
+            {
+                panic!(
+                    "Surface capabilities have not been initialized or window has launched minimized"
+                );
+            }
             surface_capabilities.current_extent
-        };
-
-        // Clamp the extent to ensure it is within the bounds of the surface.
-        let extent = ash::vk::Extent2D {
-            width: preferred_extent.width.clamp(
-                surface_capabilities.min_image_extent.width,
-                surface_capabilities.max_image_extent.width,
-            ),
-            height: preferred_extent.height.clamp(
-                surface_capabilities.min_image_extent.height,
-                surface_capabilities.max_image_extent.height,
-            ),
         };
 
         #[cfg(debug_assertions)]
@@ -189,8 +182,7 @@ impl Swapchain {
             image_color_space,
             image_extent: extent,
             image_array_layers: 1, // Always 1 unless stereoscopic-3D / XR is used.
-            image_usage: ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
-                | ash::vk::ImageUsageFlags::STORAGE, // TODO: Allow callers to define the swapchain image usage.
+            image_usage: image_usage.unwrap_or(ash::vk::ImageUsageFlags::COLOR_ATTACHMENT),
             image_sharing_mode: ash::vk::SharingMode::EXCLUSIVE, // Only one queue family will access the images.
             pre_transform: surface_capabilities.current_transform, // Do not apply additional transformation to the surface.
             composite_alpha,
@@ -461,6 +453,7 @@ impl Swapchain {
         logical_device: &ash::Device,
         surface: ash::vk::SurfaceKHR,
         memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+        image_usage: Option<ash::vk::ImageUsageFlags>,
         preferences: SwapchainPreferences,
     ) {
         let mut stack_var_swapchain = Self::new(
@@ -469,6 +462,7 @@ impl Swapchain {
             logical_device,
             surface,
             memory_allocator,
+            image_usage,
             preferences,
             self.enabled_swapchain_maintenance1,
             Some(self.handle),
@@ -575,6 +569,9 @@ impl Swapchain {
     }
 
     // Swapchain getters.
+    pub fn color_space(&self) -> ash::vk::ColorSpaceKHR {
+        self.color_space
+    }
     pub fn current_frame(&self) -> usize {
         self.current_frame
     }

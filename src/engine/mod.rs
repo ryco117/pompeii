@@ -29,6 +29,9 @@ enum ResizeSwapchainState {
     Resized,
 }
 
+/// The expected maximum number of additional fences that may need to be waited on before the next frame can be rendered.
+const EXPECTED_MAX_FENCES_IN_FLIGHT: usize = 2;
+
 /// Define which rendering objects are necessary for this application.
 pub struct Renderer {
     physical_device: ash::vk::PhysicalDevice,
@@ -62,10 +65,7 @@ pub struct Renderer {
 
     /// Fences that must be waited on before the next frame can be rendered.
     /// Fences will be added and removed as dependencies are created and resolved.
-    /// NOTE: This memory will also be used to wait on the current frame's graphics fence.
-    ///       To be specific, the fence for the current frame is pushed and popped from this list
-    ///       at the beginning of the frame to wait for all the relevant fences at once.
-    blocking_fences: SmallVec<[ash::vk::Fence; 3]>,
+    blocking_fences: SmallVec<[utils::CleanableFence; EXPECTED_MAX_FENCES_IN_FLIGHT]>,
 
     fxaa_pass: Option<FxaaPass>,
     pub swapchain_preferences: utils::SwapchainPreferences,
@@ -164,7 +164,7 @@ impl Renderer {
         );
 
         // Determine if the physical device supports ray tracing.
-        let ray_tracing = if enabled_ray_tracing_device_extension {
+        let mut ray_tracing = if enabled_ray_tracing_device_extension {
             utils::ray_tracing::physical_supports_ray_tracing(&vulkan.instance, physical_device)
         } else {
             None
@@ -199,6 +199,21 @@ impl Renderer {
             #[cfg(debug_assertions)]
             println!("INFO: Enabling VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT");
             features = features.push_next(&mut device_features.pageable_device_local_memory);
+        }
+        if device_features
+            .descriptor_indexing
+            .shader_sampled_image_array_non_uniform_indexing
+            == ash::vk::TRUE
+            && device_features.descriptor_indexing.runtime_descriptor_array == ash::vk::TRUE
+        {
+            #[cfg(debug_assertions)]
+            println!("INFO: Enabling VkPhysicalDeviceDescriptorIndexingFeatures");
+            features = features.push_next(&mut device_features.descriptor_indexing);
+        } else {
+            eprintln!("ERROR: Unable to enable descriptor indexing features");
+
+            // Disable ray tracing if descriptor indexing is not available.
+            ray_tracing = None;
         }
         if ray_tracing.is_some() {
             #[cfg(debug_assertions)]
@@ -318,6 +333,7 @@ impl Renderer {
             &logical_device,
             surface,
             &mut memory_allocator,
+            Some(ash::vk::ImageUsageFlags::COLOR_ATTACHMENT | ash::vk::ImageUsageFlags::STORAGE),
             swapchain_preferences,
             enabled_swapchain_maintenance,
             None,
@@ -582,6 +598,7 @@ impl Renderer {
             &self.logical_device,
             self.surface,
             &mut self.memory_allocator,
+            Some(ash::vk::ImageUsageFlags::COLOR_ATTACHMENT | ash::vk::ImageUsageFlags::STORAGE),
             self.swapchain_preferences,
         );
 
@@ -637,15 +654,17 @@ impl Renderer {
                         self.swapchain.image_views(),
                     );
                 }
-                DemoPipeline::RayTracing(tracer) => tracer.recreate_view_sets(
-                    &self.logical_device,
-                    self.pageable_device_local_memory.as_ref(),
-                    &mut self.memory_allocator,
-                    self.compute_command_pool
-                        .map_or(self.command_pool, |(pool, _)| pool),
-                    self.compute_queue.queue,
-                    self.swapchain.image_views(),
-                    extent,
+                DemoPipeline::RayTracing(tracer) => self.blocking_fences.push(
+                    tracer.recreate_view_sets(
+                        &self.logical_device,
+                        self.pageable_device_local_memory.as_ref(),
+                        &mut self.memory_allocator,
+                        self.compute_command_pool
+                            .map_or(self.command_pool, |(pool, _)| pool),
+                        self.compute_queue.queue,
+                        self.swapchain.image_views(),
+                        extent,
+                    ),
                 ),
             }
         } else {
@@ -685,15 +704,17 @@ impl Renderer {
                     simulation.destroy(&self.logical_device, &mut self.memory_allocator);
                     *simulation = new_sim;
                 }
-                DemoPipeline::RayTracing(tracer) => tracer.recreate_view_sets(
-                    &self.logical_device,
-                    self.pageable_device_local_memory.as_ref(),
-                    &mut self.memory_allocator,
-                    self.compute_command_pool
-                        .map_or(self.command_pool, |(pool, _)| pool),
-                    self.compute_queue.queue,
-                    self.swapchain.image_views(),
-                    extent,
+                DemoPipeline::RayTracing(tracer) => self.blocking_fences.push(
+                    tracer.recreate_view_sets(
+                        &self.logical_device,
+                        self.pageable_device_local_memory.as_ref(),
+                        &mut self.memory_allocator,
+                        self.compute_command_pool
+                            .map_or(self.command_pool, |(pool, _)| pool),
+                        self.compute_queue.queue,
+                        self.swapchain.image_views(),
+                        extent,
+                    ),
                 ),
             }
         }
@@ -712,17 +733,28 @@ impl Renderer {
         let frame_graphics_fence = self.frame_fences[current_frame];
         let presentation_fence = self.swapchain.present_complete();
         unsafe {
-            self.blocking_fences.push(frame_graphics_fence);
+            let (blocking_fences, blocking_fence_cleanup): (Vec<_>, Vec<_>) = self
+                .blocking_fences
+                .drain(..)
+                .map(|utils::CleanableFence { fence, cleanup }| (fence, cleanup))
+                .unzip();
+            let blocking_fences: SmallVec<[_; EXPECTED_MAX_FENCES_IN_FLIGHT + 1]> =
+                std::iter::once(frame_graphics_fence)
+                    .chain(blocking_fences.into_iter())
+                    .collect();
             self.logical_device
-                .wait_for_fences(&self.blocking_fences, true, FIVE_SECONDS_IN_NANOSECONDS)
+                .wait_for_fences(&blocking_fences, true, FIVE_SECONDS_IN_NANOSECONDS)
                 .expect("Unable to wait for fence to begin frame");
 
-            // Pop the per-frame graphics fence.
-            self.blocking_fences.pop();
-
-            // Destroy the one-time fences.
-            for fence in self.blocking_fences.drain(..) {
-                self.logical_device.destroy_fence(fence, None);
+            // Destroy the one-time fences and any resources they have.
+            for fence in &blocking_fences[1..] {
+                self.logical_device.destroy_fence(*fence, None);
+            }
+            for cleanup in blocking_fence_cleanup
+                .into_iter()
+                .filter_map(std::convert::identity)
+            {
+                cleanup(&self.logical_device, &mut self.memory_allocator);
             }
         }
 

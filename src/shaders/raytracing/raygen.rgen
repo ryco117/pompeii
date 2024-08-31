@@ -50,8 +50,8 @@ void main() {
     ray_payload.throughput = vec3(1);
     ray_payload.radiance = vec3(0);
 
-    // Ray tracing loop.
-    for(uint i = 0; i < MAX_BOUNCES; ++i) {
+    // Ray tracing loop. We cast `MAX_BOUNCES + 1` rays to account for the initial ray.
+    for(uint i = 0; i <= MAX_BOUNCES; ++i) {
       ray_payload.bounce_count = i;
 
       // The index of the miss shader to execute.

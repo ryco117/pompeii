@@ -10,6 +10,7 @@ pub mod buffers;
 pub mod fxaa_pass;
 pub mod ray_tracing;
 pub mod swapchain;
+pub mod textures;
 
 // Expose the `swapchain` module for simplicity.
 pub use swapchain::*;
@@ -52,6 +53,34 @@ pub fn extensions_list_contains(list: &[ash::vk::ExtensionProperties], ext: &CSt
             .expect("Extension name received from Vulkan is not a valid C-string")
             == ext
     })
+}
+
+/// Helper for returning a fence with the necessary cleanup.
+pub struct CleanableFence {
+    pub fence: ash::vk::Fence,
+    pub cleanup: Option<Box<dyn FnOnce(&ash::Device, &mut gpu_allocator::vulkan::Allocator)>>,
+}
+impl CleanableFence {
+    /// Create a new `CleanableFence` with the specified fence and cleanup function.
+    /// # Safety
+    /// Do not destroy the fence from within the `cleanup` function. This will be done automatically.
+    pub fn new(
+        fence: ash::vk::Fence,
+        cleanup: Option<Box<dyn FnOnce(&ash::Device, &mut gpu_allocator::vulkan::Allocator)>>,
+    ) -> Self {
+        Self { fence, cleanup }
+    }
+
+    /// Destroy the fence and invoke the `cleanup` function before dropping the instance.
+    pub fn cleanup(self, device: &ash::Device, allocator: &mut gpu_allocator::vulkan::Allocator) {
+        unsafe {
+            device.destroy_fence(self.fence, None);
+        }
+
+        if let Some(cleanup) = self.cleanup {
+            cleanup(device, allocator);
+        }
+    }
 }
 
 /// A minimal helper for converting a Rust slice `&[T]` to a byte slice over the same memory.
@@ -460,11 +489,6 @@ impl EnginePhysicalDeviceFeatures {
         self.ray_query.ray_query = enable;
         self.ray_tracing.ray_tracing_pipeline = enable;
         self.ray_tracing_maintenance.ray_tracing_maintenance1 = enable;
-    }
-
-    /// Return whether the required toggles are set to enable, or have enabled, Vulkan ray-tracing (RTX).
-    pub fn is_ray_tracing_set(&self) -> bool {
-        self.acceleration_structure() && self.ray_tracing() && self.ray_query()
     }
 
     // Getters for features with a single state representing their support.

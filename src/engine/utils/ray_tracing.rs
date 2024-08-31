@@ -287,9 +287,13 @@ impl AccelerationStructure {
         .expect("Failed to submit acceleration structure build command buffer");
 
         // Wait for the build to complete.
+        // TODO: Allow the caller to wait for the build to complete as needed.
         unsafe { device.wait_for_fences(&[fence], true, FIVE_SECONDS_IN_NANOSECONDS) }
             .expect("Failed to wait for acceleration structure build fence");
-        unsafe { device.destroy_fence(fence, None) };
+        unsafe {
+            device.destroy_fence(fence, None);
+            device.free_command_buffers(command_pool, &[command_buffer]);
+        };
 
         Self {
             handle: acceleration_structure,
@@ -301,6 +305,10 @@ impl AccelerationStructure {
     /// Create a new top-level acceleration structure.
     /// # Safety
     /// The `queue` must support compute operations.
+    /// # Notes
+    /// * The function takes a single `AccelerationStructureGeometryKHR` for instance data, and a single `instance_count` describing it
+    ///   because the specification requires that the top-level acceleration structure have exactly a single geometry of type `INSTANCES`.
+    ///   See <https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkAccelerationStructureBuildGeometryInfoKHR.html#VUID-VkAccelerationStructureBuildGeometryInfoKHR-type-03790>.
     pub fn new_top_level(
         device: &ash::Device,
         acceleration_device: &ash::khr::acceleration_structure::Device,
@@ -308,7 +316,8 @@ impl AccelerationStructure {
         allocator: &mut gpu_allocator::vulkan::Allocator,
         build_size: &ash::vk::AccelerationStructureBuildSizesInfoKHR,
         scratch_buffer: &ScratchBuffer,
-        geometry: &InstancedGeometries,
+        instance_geometry: &ash::vk::AccelerationStructureGeometryKHR,
+        instance_count: u32,
         command_pool: ash::vk::CommandPool,
         queue: ash::vk::Queue,
     ) -> Self {
@@ -344,20 +353,16 @@ impl AccelerationStructure {
             .flags(ash::vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
             .mode(ash::vk::BuildAccelerationStructureModeKHR::BUILD)
             .dst_acceleration_structure(acceleration_structure)
-            .geometries(geometry.geometries())
+            .geometries(std::slice::from_ref(instance_geometry))
             .scratch_data(ash::vk::DeviceOrHostAddressKHR {
                 device_address: scratch_buffer.device_address(),
             });
 
         // Describe the range of geometries to build, per geometry type.
-        let build_range_infos = geometry
-            .geometry_counts()
-            .iter()
-            .map(|&count| {
-                // NOTE: The `primitive_count` here is the number of instances in this top-level geometry type.
-                ash::vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(count)
-            })
-            .collect::<Vec<_>>();
+        // NOTE: The `primitive_count` here is the number of instances in the top-level geometry because
+        //       that is the primitive from the perspective of the top-level acceleration structure.
+        let build_range_info = ash::vk::AccelerationStructureBuildRangeInfoKHR::default()
+            .primitive_count(instance_count);
 
         // Create a one-time command buffer to build the acceleration structure.
         // TODO: Create a utils function or type for single-shot command buffers.
@@ -387,7 +392,7 @@ impl AccelerationStructure {
             acceleration_device.cmd_build_acceleration_structures(
                 command_buffer,
                 &[build_geometry_info],
-                &[&build_range_infos],
+                &[std::slice::from_ref(&build_range_info)],
             );
             device.end_command_buffer(command_buffer).expect(
                 "Failed to end command buffer for building top-level acceleration structure",
@@ -405,9 +410,13 @@ impl AccelerationStructure {
         .expect("Failed to submit acceleration structure build command buffer");
 
         // Wait for the build to complete.
+        // TODO: Allow the caller to wait for the build to complete as needed.
         unsafe { device.wait_for_fences(&[fence], true, FIVE_SECONDS_IN_NANOSECONDS) }
             .expect("Failed to wait for acceleration structure build fence");
-        unsafe { device.destroy_fence(fence, None) };
+        unsafe {
+            device.destroy_fence(fence, None);
+            device.free_command_buffers(command_pool, &[command_buffer]);
+        };
 
         Self {
             handle: acceleration_structure,

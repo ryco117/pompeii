@@ -12,6 +12,7 @@ clap = { version = "4.5", features = ["derive"] }
 gltf = "1.4"
 gpu-allocator = "0.27"
 inline-spirv = "0.2"
+itertools = "0.13"
 nalgebra-glm = { version = "0.19", features = ["convert-bytemuck"] }
 num-traits = "0.2"
 smallvec = "1.13"

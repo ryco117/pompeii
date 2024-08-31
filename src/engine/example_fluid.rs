@@ -1,6 +1,7 @@
 use crate::engine::utils::{
     self,
     shaders::{ENTRY_POINT_MAIN, FULLSCREEN_VERTEX},
+    textures::AllocatedImage,
     FIVE_SECONDS_IN_NANOSECONDS,
 };
 
@@ -150,52 +151,11 @@ fn create_render_pass(
     .expect("Unable to create the application render pass")
 }
 
-/// Helper type for managing the resources for an allocated image.
-struct ComputeImage {
-    pub image: ash::vk::Image,
-    allocation: gpu_allocator::vulkan::Allocation,
-    pub image_view: ash::vk::ImageView,
-}
-impl ComputeImage {
-    /// Create a new image with the given information.
-    pub fn new(
-        device: &ash::Device,
-        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
-        image_info: ash::vk::ImageCreateInfo,
-        image_name: &str,
-    ) -> Self {
-        let (image, allocation) =
-            utils::create_image(device, memory_allocator, &image_info, image_name);
-        let image_view = utils::create_image_view(device, image, image_info.format, 1);
-
-        Self {
-            image,
-            allocation,
-            image_view,
-        }
-    }
-
-    /// Destroy the device image.
-    pub fn destroy(
-        self,
-        device: &ash::Device,
-        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
-    ) {
-        unsafe {
-            device.destroy_image_view(self.image_view, None);
-            memory_allocator
-                .free(self.allocation)
-                .expect("Failed to free the image allocation");
-            device.destroy_image(self.image, None);
-        }
-    }
-}
-
 fn initialize_image_layouts(
     device: &ash::Device,
     command_pool: ash::vk::CommandPool,
     queue: ash::vk::Queue,
-    images: &[ComputeImage],
+    images: &[AllocatedImage],
     layout: ash::vk::ImageLayout,
 ) -> ash::vk::Fence {
     let command_buffer = unsafe {
@@ -217,35 +177,39 @@ fn initialize_image_layouts(
     }
     .expect("Failed to begin command buffer for image layout initialization");
 
-    for image in images {
-        let image_memory_barrier = ash::vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(ash::vk::PipelineStageFlags2::NONE)
-            .src_access_mask(ash::vk::AccessFlags2::NONE)
-            .dst_stage_mask(
-                ash::vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
-                    | ash::vk::PipelineStageFlags2::COMPUTE_SHADER,
-            )
-            .dst_access_mask(
-                ash::vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | ash::vk::AccessFlags2::SHADER_WRITE,
-            )
-            .old_layout(ash::vk::ImageLayout::UNDEFINED)
-            .new_layout(layout)
-            .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
-            .image(image.image)
-            .subresource_range(ash::vk::ImageSubresourceRange {
-                aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-        unsafe {
-            device.cmd_pipeline_barrier2(
-                command_buffer,
-                &ash::vk::DependencyInfo::default().image_memory_barriers(&[image_memory_barrier]),
-            );
-        }
+    let image_barriers = images
+        .iter()
+        .map(|image| {
+            ash::vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(ash::vk::PipelineStageFlags2::NONE)
+                .src_access_mask(ash::vk::AccessFlags2::NONE)
+                .dst_stage_mask(
+                    ash::vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+                        | ash::vk::PipelineStageFlags2::COMPUTE_SHADER,
+                )
+                .dst_access_mask(
+                    ash::vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+                        | ash::vk::AccessFlags2::SHADER_WRITE,
+                )
+                .old_layout(ash::vk::ImageLayout::UNDEFINED)
+                .new_layout(layout)
+                .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+                .image(image.image)
+                .subresource_range(ash::vk::ImageSubresourceRange {
+                    aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+        })
+        .collect::<Vec<_>>();
+    unsafe {
+        device.cmd_pipeline_barrier2(
+            command_buffer,
+            &ash::vk::DependencyInfo::default().image_memory_barriers(&image_barriers),
+        );
     }
 
     unsafe { device.end_command_buffer(command_buffer) }
@@ -277,7 +241,7 @@ fn create_framebuffers(
     extent: ash::vk::Extent2D,
     destination_views: &[ash::vk::ImageView],
     render_pass: ash::vk::RenderPass,
-) -> (Vec<ash::vk::Framebuffer>, [ComputeImage; 8]) {
+) -> (Vec<ash::vk::Framebuffer>, [AllocatedImage; 8]) {
     // Create several images for storing the partial results of the fluid simulation each frame.
     // These images are not strictly part of the framebuffers, but are used in the fluid simulation and dependent on the size of the surface.
     let image_info = ash::vk::ImageCreateInfo::default()
@@ -292,52 +256,60 @@ fn create_framebuffers(
         .samples(ash::vk::SampleCountFlags::TYPE_1)
         .usage(ash::vk::ImageUsageFlags::STORAGE);
 
-    let input_velocity_image = ComputeImage::new(
+    let input_velocity_image = AllocatedImage::new(
         device,
         memory_allocator,
         image_info.format(ash::vk::Format::R32G32_SFLOAT),
+        None,
         "Fluid Sim input velocity buffer",
     );
-    let curl_image = ComputeImage::new(
+    let curl_image = AllocatedImage::new(
         device,
         memory_allocator,
         image_info.format(ash::vk::Format::R32_SFLOAT),
+        None,
         "Fluid Sim curl buffer",
     );
-    let divergence_image = ComputeImage::new(
+    let divergence_image = AllocatedImage::new(
         device,
         memory_allocator,
         image_info.format(ash::vk::Format::R32_SFLOAT),
+        None,
         "Fluid Sim divergence buffer",
     );
-    let alpha_pressure_image = ComputeImage::new(
+    let alpha_pressure_image = AllocatedImage::new(
         device,
         memory_allocator,
         image_info.format(ash::vk::Format::R32_SFLOAT),
+        None,
         "Fluid Sim alpha pressure buffer",
     );
-    let beta_pressure_image = ComputeImage::new(
+    let beta_pressure_image = AllocatedImage::new(
         device,
         memory_allocator,
         image_info.format(ash::vk::Format::R32_SFLOAT),
+        None,
         "Fluid Sim beta pressure buffer",
     );
-    let output_velocity_image = ComputeImage::new(
+    let output_velocity_image = AllocatedImage::new(
         device,
         memory_allocator,
         image_info.format(ash::vk::Format::R32G32_SFLOAT),
+        None,
         "Fluid Sim output velocity buffer",
     );
-    let input_dye_image = ComputeImage::new(
+    let input_dye_image = AllocatedImage::new(
         device,
         memory_allocator,
         image_info.format(ash::vk::Format::R32G32B32A32_SFLOAT),
+        None,
         "Fluid Sim input dye buffer",
     );
-    let output_dye_image = ComputeImage::new(
+    let output_dye_image = AllocatedImage::new(
         device,
         memory_allocator,
         image_info.format(ash::vk::Format::R32G32B32A32_SFLOAT),
+        None,
         "Fluid Sim output dye buffer",
     );
 
@@ -702,7 +674,7 @@ fn create_graphics_pipeline(
 fn update_descriptor_sets(
     device: &ash::Device,
     descriptor_sets: &[ash::vk::DescriptorSet],
-    images: &[ComputeImage],
+    images: &[AllocatedImage],
 ) {
     let image_infos = images
         .iter()
@@ -788,7 +760,7 @@ pub struct FluidSimulation {
     compute_pipelines: FluidComputeStages,
     graphics_pipeline: ash::vk::Pipeline,
     framebuffers: Vec<ash::vk::Framebuffer>,
-    allocated_images: Vec<ComputeImage>,
+    allocated_images: Vec<AllocatedImage>,
     compute_fence: ash::vk::Fence,
     graphics_fence: Option<ash::vk::Fence>,
     compute_command_buffer: ash::vk::CommandBuffer,
@@ -1110,7 +1082,7 @@ impl FluidSimulation {
             unsafe {
                 device.cmd_pipeline_barrier2(
                     self.compute_command_buffer,
-                    &ash::vk::DependencyInfoKHR::default().memory_barriers(&[memory_barrier]),
+                    &ash::vk::DependencyInfo::default().memory_barriers(&[memory_barrier]),
                 );
             }
         };
