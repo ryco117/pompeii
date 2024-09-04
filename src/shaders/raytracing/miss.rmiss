@@ -10,6 +10,6 @@ layout(location = 0) rayPayloadInEXT RayPayload ray_payload;
 // It simply returns the background color based on the direction of the ray.
 void main() {
   // TODO: Use a texture to allow the caller to specify the background color.
-  ray_payload.radiance = abs(gl_WorldRayDirectionEXT);
+  ray_payload.radiance.rgb += abs(ray_payload.direction) * ray_payload.throughput;
   ray_payload.exit = true;
 }

@@ -36,7 +36,7 @@ struct GeometryNode {
 
   uint texture_normal;
   uint texture_metallic;
-  uint _padding;
+  float alpha_cutoff;
 };
 
 // An instance of a glTF model including its vertices and geometry nodes.
@@ -72,7 +72,8 @@ void main() {
     triangle[i] = gltf_instance.vertex_buffer.v[vertex_index];
   }
 
-  // Interpolate the normal and UV coordinates of the intersection point.
+  // Interpolate the intersection point values according to the barycentric coordinate.
+  vec3 position = triangle[0].position_n.xyz*barycentric_coords.x + triangle[1].position_n.xyz*barycentric_coords.y + triangle[2].position_n.xyz*barycentric_coords.z;
   vec2 uv = triangle[0].uv*barycentric_coords.x + triangle[1].uv*barycentric_coords.y + triangle[2].uv*barycentric_coords.z;
   vec3 normal = normalize(
     vec3(triangle[0].position_n.w, triangle[0].ormal)*barycentric_coords.x +
@@ -80,21 +81,35 @@ void main() {
     vec3(triangle[2].position_n.w, triangle[2].ormal)*barycentric_coords.z);
   vec4 tangent = triangle[0].tangent*barycentric_coords.x + triangle[1].tangent*barycentric_coords.y + triangle[2].tangent*barycentric_coords.z;
 
-  // Determine the normal in world space.
-  const vec3 world_normal = normalize(vec3(normal*gl_WorldToObjectEXT));
+  // Convert relevant vectors to world-space.
+  const vec3 world_position = vec3(gl_ObjectToWorldEXT * vec4(position, 1));
+  const vec3 world_normal = normalize(vec3(gl_ObjectToWorldEXT * vec4(normal, 0)));
+  const vec4 world_tangent = vec4(vec3(gl_ObjectToWorldEXT * vec4(tangent.xyz, 0)), tangent.w);
 
   // Calculate the base color of the intersection point.
-  vec3 color = geometry_node.base_color.rgb;
+  vec4 color = vec4(geometry_node.base_color.rgb, 1);
   if (geometry_node.texture_color != MISSING_INDEX) {
-    vec3 c = texture(nonuniformEXT(sampler2D(
+    vec4 c = texture(nonuniformEXT(sampler2D(
           textures[geometry_node.texture_color],
-          samplers[geometry_node.color_sampler])), uv).rgb;
-    color *= srgb_to_linear(c);
+          samplers[geometry_node.color_sampler])), uv);
+    color = vec4(color.rgb * srgb_to_linear(c.rgb), c.a);
   }
 
+  // Determine the normal associated the the intersection point (given the vertex data).
+  const vec3 point_tangent = normalize(world_tangent.xyz);
+  const vec3 bitangent = world_tangent.w * cross(world_normal, point_tangent);
+  const mat3 tangent_space = mat3(point_tangent, bitangent, world_normal);
+
+  // Update normal based on an optional normal map.
   vec3 point_normal;
   if (geometry_node.texture_normal == MISSING_INDEX) {
-
+    point_normal = world_normal;
+  } else {
+    vec4 normal_map = texture(nonuniformEXT(sampler2D(
+          textures[geometry_node.texture_normal],
+          samplers[geometry_node.color_sampler])), uv);
+    vec3 tangent_normal = normal_map.xyz * 2.0 - 1.0;
+    point_normal = normalize(tangent_space * tangent_normal);
   }
 
   // Determine the metallic-roughness color to use.
@@ -110,6 +125,7 @@ void main() {
 
   // Avoid artifacts with a sufficiently non-zero roughness.
   roughness = max(roughness, 0.001);
+  const float roughness_sqr = roughness * roughness;
 
   // TODO: Understand what this is for and how it should be populated.
   const float material_ior = 1.5;
@@ -117,38 +133,101 @@ void main() {
   // Allow for material refraction.
   float eta = material_ior;
 
+  // Determine the effect of the material's specular component.
   float dielectric_specular = (material_ior - 1.0) / (material_ior + 1.0);
   dielectric_specular *= dielectric_specular;
+  const vec3 specular_color = mix(vec3(dielectric_specular), color.rgb, metallic);
 
-  vec3 specular_color = mix(vec3(dielectric_specular), color, metallic);
-  vec3 direct_lighting_color = vec3(0.0);
-  vec3 environment_lighting_color = vec3(0.0);
+  vec3 direct_lighting_color = vec3(1.0);
 
   // TODO: Use environment mapping when available
-  vec3 light_direction = normalize(vec3(1));
+  vec3 light_direction = normalize(vec3(-1, 1, -1));
   float light_intensity = 1.0;
 
-  // Apply the lighting to the intersection point.
-  if (false) {
-    float pdf;
-    vec3 f = PbrEval(eta, metallic, roughness, color, specular_color,
-      -gl_WorldRayDirectionEXT, point_normal, light_direction, pdf);
+  // Trace a ray to determine if this point is in the direct light's shadow.
+  in_shadow = true; // Set to true because the miss shader wil set it to `false` if the ray hits the direct light source.
+  uint trace_flags = gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT;
+  const uint miss_shader_index = 1;
+  const int payload_index = 1;
+  traceRayEXT(
+    top_level_accel_struct,
+    trace_flags,
+    0xFF, 0, 0,
+    miss_shader_index,
+    world_position,
+    RAY_MIN_DISTANCE,
+    light_direction,
+    RAY_MAX_DISTANCE,
+    payload_index);
 
-    float cos_theta = abs(dot(light_direction, point_normal));
+  // Apply basic lighting to the intersection point.
+  const float AMBIENT_INTENSITY = 0.3;
+  if (in_shadow) {
+    color.rgb *= AMBIENT_INTENSITY;
+  } else {
+    color.rgb *= AMBIENT_INTENSITY + (1.0 - AMBIENT_INTENSITY) * max(dot(world_normal, light_direction), 0.0);
+  }
 
-    float weight = max(0.0, power_heuristic(light_intensity, pdf));
-    if (weight > 0.0) {
-      direct_lighting_color += weight * f * cos_theta * environment_lighting_color / (light_intensity + 0.001);
+  // Sample the hemisphere tangent to this point to apply ambient occlusion.
+  float ambient_occlusion = 1.0;
+  if (ray_payload.bounce_count == 0) {
+    const uint AMBIENT_OCCLUSION_SAMPLES = 12;
+
+    // A uniform distribution of points using an icosahedron.
+    vec3 hemisphere_samples[AMBIENT_OCCLUSION_SAMPLES] = vec3[](
+      vec3(0.0, 0.0, 1.0),
+      vec3(0.7236, 0.5257, 0.4472),
+      vec3(-0.2764, 0.8506, 0.4472),
+      vec3(-0.8944, 0.0, 0.4472),
+      vec3(-0.2764, -0.8506, 0.4472),
+      vec3(0.7236, -0.5257, 0.4472),
+      vec3(0.2764, 0.8506, -0.4472),
+      vec3(-0.7236, 0.5257, -0.4472),
+      vec3(-0.7236, -0.5257, -0.4472),
+      vec3(0.2764, -0.8506, -0.4472),
+      vec3(0.8944, 0.0, -0.4472),
+      vec3(0.0, 0.0, -1.0));
+
+    const float INV_OCCLUSION_SAMPLES = 2.0 / float(AMBIENT_OCCLUSION_SAMPLES);
+    for (uint i = 0; i < AMBIENT_OCCLUSION_SAMPLES; ++i) {
+      const vec3 sample_direction = hemisphere_samples[i];
+      if (dot(sample_direction, world_normal) <= 0.0) {
+	continue;
+      }
+
+      // Trace a ray to determine if this direction is occluded.
+      in_shadow = true;
+      traceRayEXT(
+        top_level_accel_struct,
+        trace_flags,
+        0xFF, 0, 0,
+        miss_shader_index,
+        world_position,
+        RAY_MIN_DISTANCE,
+        sample_direction,
+        0.5, // TODO: Determine a reasonable max distance for ambient occlusion.
+        payload_index);
+
+      if (in_shadow) {
+        ambient_occlusion -= INV_OCCLUSION_SAMPLES;
+      }
     }
   }
 
+  // TODO: Determine proper usage of metallic and roughness values.
+  vec3 throughput = ray_payload.throughput;
+  if (metallic > 0.75 || roughness_sqr < 0.2) {
+    // Reflect the ray off the surface.
+    ray_payload.origin = world_position;
+    ray_payload.direction = reflect(ray_payload.direction, point_normal);
+    throughput = ray_payload.throughput * clamp(sqrt(roughness) * (1.0 - metallic*0.25), 0, 1);
+  }
+
   // Apply this triangle's color to the ray payload.
-  ray_payload.radiance += color * ray_payload.throughput;
-  ray_payload.radiance = clamp(ray_payload.radiance, vec3(0), vec3(1));
+  ray_payload.radiance.rgb += color.rgb * throughput * (0.2 + 0.8 * ambient_occlusion);
 
-  // TODO: Implement shadow rays.
-  in_shadow = false;
-
-  // Determine if more rays should be traced.
-  ray_payload.exit = true;
+  ray_payload.throughput -= throughput;
+  if (dot(ray_payload.throughput, ray_payload.throughput) < 0.1) {
+    ray_payload.exit = true;
+  }
 }

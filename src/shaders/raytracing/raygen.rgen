@@ -3,6 +3,7 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_GOOGLE_include_directive : require
 
+#include "random.glsl"
 #include "shared.glsl"
 
 layout(location = 0) rayPayloadEXT RayPayload ray_payload;
@@ -26,46 +27,62 @@ const float INV_MAX_SAMPLES = 1.0 / float(MAX_SAMPLES);
 const uint MAX_BOUNCES = 1;
 
 void main() {
-  // TODO: Vary the seed over time as well as pixel index.
-  const uint seed_index = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
+  // uint seed_index = tea(gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x, uint(push_constants.time * 1024.0));
+  // uint seed_index = tea(gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x, 0);
+  uint seed_index = 0;
 
   // The final color of the pixel accumulated across all samples.
   vec3 final_color = vec3(0);
 
   for(int j = 0; j < MAX_SAMPLES; ++j) {
-    // TODO: Random per-sample jittering to help achieve a more uniform distribution of samples.
-    const vec2 pixel_center = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
+    // Random per-sample jittering to help achieve a more uniform distribution of samples.
+    const vec2 jitter = vec2(0.1) + 0.8*vec2(rand(seed_index), rand(seed_index));
+    const vec2 pixel_center = vec2(gl_LaunchIDEXT.xy) + jitter;
     const vec2 uv_coord = pixel_center / vec2(gl_LaunchSizeEXT.xy);
     const vec2 ndc = 2.0 * uv_coord - 1.0;
 
     const vec4 origin = push_constants.view_inverse * vec4(0, 0, 0, 1);
-    const vec4 target = camera_lens.proj_inverse * vec4(ndc, 1, 1);
+    const vec4 target = camera_lens.proj_inverse * vec4(ndc.x, -ndc.y, 1, 1); // Flip the Y-axis when transforming to world-space.
     const vec4 direction = push_constants.view_inverse * vec4(normalize(target.xyz), 0);
 
     // Initialize the ray payload parameters.
+    ray_payload.origin = origin.xyz;
+    ray_payload.direction = direction.xyz;
     ray_payload.seed = seed_index;
     ray_payload.exit = false;
 
     // Set the initial ray lighting values.
     ray_payload.throughput = vec3(1);
-    ray_payload.radiance = vec3(0);
+    ray_payload.radiance = vec4(0, 0, 0, 1);
 
     // Ray tracing loop. We cast `MAX_BOUNCES + 1` rays to account for the initial ray.
     for(uint i = 0; i <= MAX_BOUNCES; ++i) {
       ray_payload.bounce_count = i;
 
       // The index of the miss shader to execute.
-      uint miss_shader_index = 0;
+      const uint miss_shader_index = 0;
+      const int payload_index = 0;
 
       // TODO: Enable greater flexibility than strictly opaque intersections.
-      traceRayEXT(top_level_accel_struct, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, miss_shader_index, origin.xyz, 0.001, direction.xyz, 10000.0, 0);
+      // Use the origin and direction of the payload to allow hit shaders to setup for the next ray.
+      traceRayEXT(
+        top_level_accel_struct,
+        gl_RayFlagsNoneEXT,
+        0xFF, 0, 0,
+        miss_shader_index,
+        ray_payload.origin,
+        RAY_MIN_DISTANCE,
+        ray_payload.direction,
+        RAY_MAX_DISTANCE,
+        payload_index);
+
       if(ray_payload.exit) {
         break;
       }
     }
 
     // The color accumulated for the current sample ray.
-    vec3 ray_color = ray_payload.radiance / MAX_SAMPLES;
+    vec3 ray_color = clamp(ray_payload.radiance.rgb, vec3(0), vec3(1));
 
     // Helper to reduce "fireflies" in the ray traced image.
     float luminance = dot(ray_color, vec3(0.212671, 0.715160, 0.072169));
@@ -73,7 +90,8 @@ void main() {
       ray_color *= 45.7 / luminance;
     }
 
-    final_color += ray_color;
+    // Apply the accumulated color, modified by the ambient occlusion factor.
+    final_color += ray_color; 
   }
 
   // Normalize the final color by the number of samples.

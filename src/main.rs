@@ -171,7 +171,7 @@ impl PompeiiApp {
             engine::DemoPipeline::RayTracing(_) => {
                 engine::DemoPushConstants::RayTracing(engine::example_ray_tracing::PushConstants {
                     view_inverse: glm::Mat4::new_rotation(glm::Vec3::new(0., -0.25 * time, 0.))
-                        * glm::Mat4::new_translation(&glm::Vec3::new(0., -1., 10.)),
+                        * glm::Mat4::new_translation(&glm::Vec3::new(0., 1., 10.)),
                     time,
                 })
             }

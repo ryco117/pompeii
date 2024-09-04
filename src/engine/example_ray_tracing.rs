@@ -30,14 +30,13 @@ pub struct CameraLens {
 
 /// The various shader resources needed for ray tracing.
 struct RayTracingShaders {
-    modules: [ash::vk::ShaderModule; 4],
+    ray_gen: ash::vk::ShaderModule,
+    miss: ash::vk::ShaderModule,
+    shadow_miss: ash::vk::ShaderModule,
+    closest_hit: ash::vk::ShaderModule,
+    any_hit: ash::vk::ShaderModule,
 }
 impl RayTracingShaders {
-    pub const RAY_GEN: u32 = 0;
-    pub const MISS: u32 = 1;
-    pub const SHADOW_MISS: u32 = 2;
-    pub const CLOSEST_HIT: u32 = 3;
-
     /// Create a new instance of `RayTracingShaders`.
     pub fn new(device: &ash::Device) -> Self {
         let ray_gen = create_shader_module(
@@ -76,31 +75,32 @@ impl RayTracingShaders {
                 vulkan1_2
             ),
         );
+        let any_hit = create_shader_module(
+            device,
+            inline_spirv::include_spirv!(
+                "src/shaders/raytracing/transparency.rahit",
+                rahit,
+                glsl,
+                vulkan1_2
+            ),
+        );
 
         Self {
-            modules: [ray_gen, miss, shadow_miss, closest_hit],
+            ray_gen,
+            miss,
+            shadow_miss,
+            closest_hit,
+            any_hit,
         }
     }
 
     /// Destroy the shader modules.
     pub fn destroy(&self, device: &ash::Device) {
-        for module in self.modules {
-            unsafe { device.destroy_shader_module(module, None) };
-        }
-    }
-
-    // Getters.
-    pub fn ray_gen(&self) -> ash::vk::ShaderModule {
-        self.modules[Self::RAY_GEN as usize]
-    }
-    pub fn miss(&self) -> ash::vk::ShaderModule {
-        self.modules[Self::MISS as usize]
-    }
-    pub fn shadow_miss(&self) -> ash::vk::ShaderModule {
-        self.modules[Self::SHADOW_MISS as usize]
-    }
-    pub fn closest_hit(&self) -> ash::vk::ShaderModule {
-        self.modules[Self::CLOSEST_HIT as usize]
+        unsafe { device.destroy_shader_module(self.ray_gen, None) };
+        unsafe { device.destroy_shader_module(self.miss, None) };
+        unsafe { device.destroy_shader_module(self.shadow_miss, None) };
+        unsafe { device.destroy_shader_module(self.closest_hit, None) };
+        unsafe { device.destroy_shader_module(self.any_hit, None) };
     }
 }
 
@@ -395,8 +395,8 @@ struct GeometryNode {
     /// The index of the metallic-roughness texture of the material.
     pub texture_metallic_roughness_index: u32,
 
-    /// Padding to ensure that the structure is a multiple of 16 bytes.
-    _padding: [u32; 1],
+    /// Is the material opaque or can it be transparent.
+    pub alpha_cutoff: f32,
 }
 
 /// Simple helper for managing the data for a mesh.
@@ -462,26 +462,19 @@ fn traverse_scene_nodes(
     samplers: &mut Vec<ash::vk::Sampler>,
 ) {
     // Determine the transformation matrix for this node.
-    let t = match node.transform() {
-        gltf::scene::Transform::Matrix { matrix } => glm::Mat4::from(matrix),
-        gltf::scene::Transform::Decomposed {
-            translation,
-            rotation,
-            scale,
-        } => {
-            let translation = glm::Vec3::new(translation[0], translation[1], translation[2]);
-            let rotation = glm::quat(rotation[0], rotation[1], rotation[2], rotation[3]);
-            let scale = glm::Vec3::new(scale[0], scale[1], scale[2]);
-
-            glm::translation(&translation) * glm::quat_to_mat4(&rotation) * glm::scaling(&scale)
-        }
-    } * parent_transform;
-    let t_inv_transpose = glm::Mat4::try_inverse(t)
-        .map(|mut m| {
-            m.transpose_mut();
-            m
-        })
-        .unwrap_or_else(glm::Mat4::identity);
+    let t = parent_transform
+        * match node.transform() {
+            gltf::scene::Transform::Matrix { matrix } => glm::Mat4::from(matrix),
+            gltf::scene::Transform::Decomposed {
+                translation,
+                rotation,
+                scale,
+            } => {
+                glm::translation(&translation.into())
+                    * glm::quat_to_mat4(&rotation.into())
+                    * glm::scaling(&scale.into())
+            }
+        };
 
     // Traverse the children of this node, using the current transform as their parent.
     node.children().for_each(|n| {
@@ -521,6 +514,16 @@ fn traverse_scene_nodes(
                 samplers.push(create_sampler_from_glft(device, sampler));
                 index
             }) as u32
+        };
+
+        // Determine if the material is guaranteed opaque.
+        let alpha_cutoff = match material.alpha_mode() {
+            gltf::material::AlphaMode::Opaque => 0.,
+            gltf::material::AlphaMode::Mask => material.alpha_cutoff().unwrap_or(0.5),
+            gltf::material::AlphaMode::Blend => {
+                println!("WARN: Unable to properly handle alpha-blended materials");
+                0.5
+            }
         };
 
         // Determine the texture indices for this primitive.
@@ -563,7 +566,7 @@ fn traverse_scene_nodes(
             roughness_factor,
             texture_normal_index,
             texture_metallic_roughness_index,
-            _padding: [0; 1],
+            alpha_cutoff,
         });
 
         // Read the data for this primitive.
@@ -583,9 +586,11 @@ fn traverse_scene_nodes(
 
             // Apply the node transformation to each vertex.
             let position = (t * glm::Vec4::new(pos[0], pos[1], pos[2], 1.)).xyz();
-            let normal = (t_inv_transpose * glm::Vec4::new(norm[0], norm[1], norm[2], 0.)).xyz();
+            let normal = (t * glm::Vec4::new(norm[0], norm[1], norm[2], 0.))
+                .xyz()
+                .normalize();
             let tangent = if let Some(tans) = tangents.as_mut().and_then(|t| t.next()) {
-                t_inv_transpose * glm::Vec4::new(tans[0], tans[1], tans[2], tans[3])
+                t * glm::Vec4::new(tans[0], tans[1], tans[2], tans[3])
             } else {
                 glm::Vec4::zeros()
             };
@@ -669,16 +674,13 @@ fn create_mesh_data(
             .expect("Failed to find a default scene")
     });
 
-    // Flip the Y-axis of glTF models to align with Vulkan coordinates.
-    let root_transform = glm::scaling(&glm::Vec3::new(1., -1., 1.));
-
     // Traverse the scene graph to build the geometry nodes.
     scene.nodes().for_each(|node| {
         traverse_scene_nodes(
             device,
             &gltf_buffers,
             &node,
-            &root_transform,
+            &glm::Mat4::identity(),
             &mut vertices,
             &mut indices,
             &mut geometry_nodes,
@@ -870,7 +872,7 @@ fn create_bottom_level_acceleration_structure(
         .zip(mesh.geometry_node_lengths.iter())
         .map(|(node, index_length)| {
             // Ensure that each geometry node is in a different geometry index in the acceleration structure.
-            // This is required to allow a single BLAS to constain multiple materials and textures.
+            // This is required to allow a single BLAS to contain multiple materials and textures.
             let triangle_geometry_data = ash::vk::AccelerationStructureGeometryDataKHR {
                 triangles: ash::vk::AccelerationStructureGeometryTrianglesDataKHR::default()
                     .vertex_format(ash::vk::Format::R32G32B32_SFLOAT)
@@ -888,7 +890,11 @@ fn create_bottom_level_acceleration_structure(
             let node_geometry = ash::vk::AccelerationStructureGeometryKHR::default()
                 .geometry_type(ash::vk::GeometryTypeKHR::TRIANGLES)
                 .geometry(triangle_geometry_data)
-                .flags(ash::vk::GeometryFlagsKHR::OPAQUE);
+                .flags(if node.alpha_cutoff == 0. {
+                    ash::vk::GeometryFlagsKHR::OPAQUE
+                } else {
+                    ash::vk::GeometryFlagsKHR::empty()
+                });
 
             (node_geometry, (index_length / 3) as u32)
         })
@@ -1039,7 +1045,6 @@ fn create_top_level_acceleration_structure(
         ash::vk::AccelerationStructureGeometryKHR::default()
             .geometry_type(ash::vk::GeometryTypeKHR::INSTANCES)
             .geometry(ash::vk::AccelerationStructureGeometryDataKHR { instances })
-            .flags(ash::vk::GeometryFlagsKHR::OPAQUE)
     };
 
     // Describe the total geometry of the acceleration structure to be built.
@@ -1091,6 +1096,85 @@ fn create_top_level_acceleration_structure(
 
     acceleration
 }
+/// Create a bottom-level acceleration structure for a procedural geometry.
+// fn create_procedural_bottom_acceleration_structure(
+//     device: &ash::Device,
+//     acceleration_device: &ash::khr::acceleration_structure::Device,
+//     pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
+//     allocator: &mut gpu_allocator::vulkan::Allocator,
+//     command_pool: ash::vk::CommandPool,
+//     queue: ash::vk::Queue,
+// ) -> utils::ray_tracing::AccelerationStructure {
+//     // Define the position data of our axis-aligned bounding box.
+//     let positions = [ash::vk::AabbPositionsKHR {
+//         min_x: -1.0,
+//         min_y: -1.0,
+//         min_z: -1.0,
+//         max_x: 1.0,
+//         max_y: 1.0,
+//         max_z: 1.0,
+//     }];
+//
+//     // Create a buffer to hold the position data.
+//     let (position_buffer, position_fence) = utils::buffers::new_data_buffer(
+//         device,
+//         pageable_device_local_memory.map(|d| (d, 1.)),
+//         allocator,
+//         command_pool,
+//         queue,
+//         utils::data_slice_byte_slice(&positions),
+//         ash::vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+//             | ash::vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+//         "Procedural Position Buffer",
+//         None,
+//         None,
+//     );
+//
+//     let build_info = ash::vk::AccelerationStructureBuildGeometryInfoKHR::default()
+//         .ty(ash::vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+//         .flags(ash::vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+//         .mode(ash::vk::BuildAccelerationStructureModeKHR::BUILD)
+//         .geometries(&[ash::vk::AccelerationStructureGeometryKHR::default()
+//             .geometry_type(ash::vk::GeometryTypeKHR::AABBS)
+//             .geometry(ash::vk::AccelerationStructureGeometryDataKHR {
+//                 aabbs: ash::vk::AccelerationStructureGeometryAabbsDataKHR::default()
+//                     .data()
+//                     .stride(std::mem::size_of::<ash::vk::AabbPositionsKHR>() as u64),
+//             })
+//             .flags(ash::vk::GeometryFlagsKHR::OPAQUE)]);
+//
+//     acceleration_device
+//         .get_acceleration_structure_build_sizes(ash::vk::AccelerationStructureBuildTypeKHR::DEVICE);
+//
+//     // Create a buffer that can be used as the scratch buffer for building the acceleration structure.
+//     let scratch_buffer =
+//         utils::ray_tracing::ScratchBuffer::new(device, pageable_device_local_memory, allocator);
+//
+//     // Create the acceleration structure.
+//     let acceleration = utils::ray_tracing::AccelerationStructure::new_bottom_level(
+//         device,
+//         acceleration_device,
+//         pageable_device_local_memory,
+//         allocator,
+//         &scratch_buffer.build_sizes,
+//         &scratch_buffer,
+//         utils::ray_tracing::InstancedGeometries::new(
+//             &[ash::vk::AccelerationStructureGeometryKHR::default()
+//                 .geometry_type(ash::vk::GeometryTypeKHR::AABBS)
+//                 .geometry(ash::vk::AccelerationStructureGeometryDataKHR::default())
+//                 .flags(ash::vk::GeometryFlagsKHR::OPAQUE)],
+//             &[1],
+//         )
+//         .unwrap(),
+//         command_pool,
+//         queue,
+//     );
+//
+//     // Clean up the acceleration scratch buffer.
+//     scratch_buffer.destroy(device, allocator);
+//
+//     acceleration
+// }
 
 /// The descriptor set layouts for the ray tracing pipeline.
 #[repr(C)]
@@ -1152,17 +1236,23 @@ impl DescriptorSetLayouts {
             .binding(0)
             .descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(1)
-            .stage_flags(ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR);
+            .stage_flags(
+                ash::vk::ShaderStageFlags::ANY_HIT_KHR | ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+            );
         let textures_binding = ash::vk::DescriptorSetLayoutBinding::default()
             .binding(1)
             .descriptor_type(ash::vk::DescriptorType::SAMPLED_IMAGE)
             .descriptor_count(MAX_TEXTURES)
-            .stage_flags(ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR);
+            .stage_flags(
+                ash::vk::ShaderStageFlags::ANY_HIT_KHR | ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+            );
         let samplers_binding = ash::vk::DescriptorSetLayoutBinding::default()
             .binding(2)
             .descriptor_type(ash::vk::DescriptorType::SAMPLER)
             .descriptor_count(MAX_TEXTURES)
-            .stage_flags(ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR);
+            .stage_flags(
+                ash::vk::ShaderStageFlags::ANY_HIT_KHR | ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+            );
         let model_data = unsafe {
             device.create_descriptor_set_layout(
                 &ash::vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
@@ -1252,7 +1342,7 @@ impl ShaderBindingTables {
         // Round up the size of the group handle to the nearest multiple of the alignment.
         let group_handle_size_aligned =
             utils::aligned_size(group_handle_size, shader_group_handle_alignment);
-        let total_bytes = shader_group_count as usize * group_handle_size_aligned;
+        let total_bytes = shader_group_count as usize * group_handle_size;
 
         // Create a `Vec<u8>` to hold the shader group handles in host memory.
         let shader_group_data = unsafe {
@@ -1264,6 +1354,9 @@ impl ShaderBindingTables {
             )
         }
         .expect("Failed to get ray tracing shader group handles");
+
+        // Turn the `Vec` into an iterator over chunks of the correct shader group size.
+        let mut shader_group_iter = shader_group_data.chunks_exact(group_handle_size);
 
         // Create a staging buffer for copying our shader group handles into device-local memory.
         let mut staging_buffer = utils::buffers::StagingBuffer::new(
@@ -1283,7 +1376,7 @@ impl ShaderBindingTables {
             allocator,
             command_pool,
             queue,
-            &shader_group_data[..group_handle_size],
+            shader_group_iter.next().unwrap(),
             buffer_usage,
             "Raygen Binding Table",
             &mut staging_buffer,
@@ -1291,14 +1384,18 @@ impl ShaderBindingTables {
         )
         .expect("Failed to create raygen binding table");
 
-        let mut offset = group_handle_size_aligned;
+        let mut offset = group_handle_size;
+        let mut miss_bytes = Vec::with_capacity(group_handle_size_aligned + group_handle_size);
+        miss_bytes.extend_from_slice(shader_group_iter.next().unwrap());
+        miss_bytes.extend(std::iter::repeat(0).take(group_handle_size_aligned - group_handle_size));
+        miss_bytes.extend_from_slice(shader_group_iter.next().unwrap());
         let (miss_binding_table, miss_fence) = utils::buffers::new_data_buffer(
             device,
             pageable_device_local_memory.map(|d| (d, 1.)),
             allocator,
             command_pool,
             queue,
-            &shader_group_data[offset..(offset + 2 * group_handle_size_aligned)],
+            &miss_bytes,
             buffer_usage,
             "Miss Binding Table",
             &mut staging_buffer,
@@ -1306,14 +1403,14 @@ impl ShaderBindingTables {
         )
         .expect("Failed to create miss binding table");
 
-        offset = 3 * group_handle_size_aligned;
+        offset += miss_bytes.len();
         let (hit_binding_table, hit_fence) = utils::buffers::new_data_buffer(
             device,
             pageable_device_local_memory.map(|d| (d, 1.)),
             allocator,
             command_pool,
             queue,
-            &shader_group_data[offset..(offset + group_handle_size)],
+            shader_group_iter.next().unwrap(),
             buffer_usage,
             "Hit Binding Table",
             &mut staging_buffer,
@@ -1388,60 +1485,64 @@ impl Pipeline {
 
         let ray_gen_shader_info = ash::vk::PipelineShaderStageCreateInfo::default()
             .stage(ash::vk::ShaderStageFlags::RAYGEN_KHR)
-            .module(shaders.ray_gen())
+            .module(shaders.ray_gen)
             .name(ENTRY_POINT_MAIN);
         let ray_gen_shader_group = ash::vk::RayTracingShaderGroupCreateInfoKHR::default()
             .ty(ash::vk::RayTracingShaderGroupTypeKHR::GENERAL)
-            .general_shader(RayTracingShaders::RAY_GEN) // Index of the ray-gen shader.
+            .general_shader(0) // Index of the ray-gen shader.
             .closest_hit_shader(ash::vk::SHADER_UNUSED_KHR)
             .any_hit_shader(ash::vk::SHADER_UNUSED_KHR)
             .intersection_shader(ash::vk::SHADER_UNUSED_KHR);
 
         let miss_shader_info = ash::vk::PipelineShaderStageCreateInfo::default()
             .stage(ash::vk::ShaderStageFlags::MISS_KHR)
-            .module(shaders.miss())
+            .module(shaders.miss)
             .name(ENTRY_POINT_MAIN);
         let miss_shader_group = ash::vk::RayTracingShaderGroupCreateInfoKHR::default()
             .ty(ash::vk::RayTracingShaderGroupTypeKHR::GENERAL)
-            .general_shader(RayTracingShaders::MISS) // Index of the miss shader.
+            .general_shader(1) // Index of the miss shader.
             .closest_hit_shader(ash::vk::SHADER_UNUSED_KHR)
             .any_hit_shader(ash::vk::SHADER_UNUSED_KHR)
             .intersection_shader(ash::vk::SHADER_UNUSED_KHR);
 
         let shadow_miss_shader_info = ash::vk::PipelineShaderStageCreateInfo::default()
             .stage(ash::vk::ShaderStageFlags::MISS_KHR)
-            .module(shaders.shadow_miss())
+            .module(shaders.shadow_miss)
             .name(ENTRY_POINT_MAIN);
         let shadow_miss_shader_group = ash::vk::RayTracingShaderGroupCreateInfoKHR::default()
             .ty(ash::vk::RayTracingShaderGroupTypeKHR::GENERAL)
-            .general_shader(RayTracingShaders::SHADOW_MISS) // Index of the shadow miss shader.
+            .general_shader(2) // Index of the shadow miss shader.
             .closest_hit_shader(ash::vk::SHADER_UNUSED_KHR)
             .any_hit_shader(ash::vk::SHADER_UNUSED_KHR)
             .intersection_shader(ash::vk::SHADER_UNUSED_KHR);
 
         let closest_hit_shader_info = ash::vk::PipelineShaderStageCreateInfo::default()
             .stage(ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR)
-            .module(shaders.closest_hit())
+            .module(shaders.closest_hit)
             .name(ENTRY_POINT_MAIN);
-        let closest_hit_shader_group = ash::vk::RayTracingShaderGroupCreateInfoKHR::default()
+        let any_hit_shader_info = ash::vk::PipelineShaderStageCreateInfo::default()
+            .stage(ash::vk::ShaderStageFlags::ANY_HIT_KHR)
+            .module(shaders.any_hit)
+            .name(ENTRY_POINT_MAIN);
+        let hit_shaders_group = ash::vk::RayTracingShaderGroupCreateInfoKHR::default()
             .ty(ash::vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
             .general_shader(ash::vk::SHADER_UNUSED_KHR)
-            .closest_hit_shader(RayTracingShaders::CLOSEST_HIT) // Index of the closest-hit shader.
-            .any_hit_shader(ash::vk::SHADER_UNUSED_KHR)
+            .closest_hit_shader(3) // Index of the closest-hit shader.
+            .any_hit_shader(4) // Index of the any-hit shader.
             .intersection_shader(ash::vk::SHADER_UNUSED_KHR);
 
-        // TODO: Use a function to ensure the correct order.
         let shader_stages = [
             ray_gen_shader_info,
             miss_shader_info,
             shadow_miss_shader_info,
             closest_hit_shader_info,
+            any_hit_shader_info,
         ];
         let shader_groups = [
             ray_gen_shader_group,
             miss_shader_group,
             shadow_miss_shader_group,
-            closest_hit_shader_group,
+            hit_shaders_group,
         ];
 
         // Describe the ray tracing pipeline to be created.
@@ -1991,23 +2092,25 @@ impl ExampleRayTracing {
         ];
 
         // Describe to the command buffer how to access the shader binding tables.
-        let handle_aligned_size = u64::from(utils::aligned_size(
+        let group_handle_size = pipeline_properties.shader_group_handle_size as u64;
+        let handle_aligned_size = u64::from(utils::aligned_size_po2(
             pipeline_properties.shader_group_handle_size,
             pipeline_properties.shader_group_handle_alignment,
         ));
 
         let raygen_sbt = ash::vk::StridedDeviceAddressRegionKHR::default()
             .device_address(self.shader_binding_tables.raygen_address)
-            .stride(handle_aligned_size)
-            .size(handle_aligned_size);
+            .stride(group_handle_size) // NOTE: Ray gen stride must equal its size,
+            // <https://vulkan.lunarg.com/doc/view/1.3.290.0/windows/1.3-extensions/vkspec.html#VUID-vkCmdTraceRaysKHR-size-04023>
+            .size(group_handle_size);
         let miss_sbt = ash::vk::StridedDeviceAddressRegionKHR::default()
             .device_address(self.shader_binding_tables.miss_address)
             .stride(handle_aligned_size)
-            .size(2 * handle_aligned_size); // TODO: Allow getting the shader group count programmatically.
+            .size(handle_aligned_size + group_handle_size); // TODO: Allow getting the shader group count programmatically.
         let hit_sbt = ash::vk::StridedDeviceAddressRegionKHR::default()
             .device_address(self.shader_binding_tables.hit_address)
-            .stride(handle_aligned_size)
-            .size(handle_aligned_size);
+            .stride(group_handle_size)
+            .size(group_handle_size);
 
         // Even though we are not using a callables shader, we need to give this struct to the
         // raytrace pipeline.

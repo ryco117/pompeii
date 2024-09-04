@@ -1,0 +1,79 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_ray_tracing : require
+
+// Geometry-dependent intersection attributes.
+hitAttributeEXT vec2 hit_attributes;
+
+// The format of vertex data used in this pipeline.
+struct Vertex {
+  vec4 position_n;
+  vec2 ormal;
+  vec2 uv;
+  vec4 tangent;
+};
+layout(buffer_reference, buffer_reference_align = 16, std430) readonly buffer Vertices { Vertex v[]; };
+layout(buffer_reference, buffer_reference_align = 4, std430) readonly buffer Indices { uint i[]; };
+
+// A single glTF node with its geometry and textures.
+struct GeometryNode {
+  vec4 base_color;
+  uint index_offset;
+  uint texture_color;
+  uint color_sampler;
+
+  float metallic_factor;
+  float roughness_factor;
+
+  uint texture_normal;
+  uint texture_metallic;
+  float alpha_cutoff;
+};
+
+// An instance of a glTF model including its vertices and geometry nodes.
+layout(buffer_reference, buffer_reference_align = 16, std430) readonly buffer GltfInstance {
+  Vertices vertex_buffer;
+  Indices index_buffer;
+  GeometryNode nodes[];
+};
+
+layout(set = 3, binding = 0, std430) readonly buffer InstanceBuffers { GltfInstance g[]; } instance_buffers;
+layout(set = 3, binding = 1) uniform texture2D textures[];
+layout(set = 3, binding = 2) uniform sampler samplers[];
+
+const uint MISSING_INDEX = 0xFFFFFFFFu;
+
+void main() {
+  const uint triangle_index_offset = 3 * gl_PrimitiveID;
+  const vec3 barycentric_coords = vec3(1.0 - hit_attributes.x - hit_attributes.y, hit_attributes.x, hit_attributes.y);
+
+  // Use the instance ID to determine which glTF model instance was hit.
+  GltfInstance gltf_instance = instance_buffers.g[gl_InstanceID];
+
+  // Each material in the instance is placed into a different geometry index in the bottom-level acceleration structure.
+  GeometryNode geometry_node = gltf_instance.nodes[gl_GeometryIndexEXT];
+
+  // Determine the properties of the vertices of this triangle.
+  Vertex triangle[3];
+  const uint index_offset = geometry_node.index_offset;
+  for (uint i = 0; i < 3; ++i) {
+    const uint vertex_index = gltf_instance.index_buffer.i[index_offset + triangle_index_offset + i];
+    triangle[i] = gltf_instance.vertex_buffer.v[vertex_index];
+  }
+
+  // Interpolate the intersection point values according to the barycentric coordinate.
+  vec2 uv = triangle[0].uv*barycentric_coords.x + triangle[1].uv*barycentric_coords.y + triangle[2].uv*barycentric_coords.z;
+
+  // Fetch the color texture.
+  if (geometry_node.texture_color != MISSING_INDEX) {
+    vec4 color = geometry_node.base_color * texture(nonuniformEXT(sampler2D(
+      textures[geometry_node.texture_color],
+      samplers[geometry_node.color_sampler])), uv);
+
+    // Apply the alpha cutoff.
+    if (color.a < geometry_node.alpha_cutoff) {
+      ignoreIntersectionEXT;
+    }
+  }
+}

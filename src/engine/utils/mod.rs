@@ -99,10 +99,10 @@ pub fn data_byte_slice<T>(data: &T) -> &[u8] {
     data_slice_byte_slice(std::slice::from_ref(data))
 }
 
-/// A helper to round up a size to the nearest multiple of an alignment.
+/// A helper to round up a size to the nearest multiple of a power-of-2 alignment.
 /// # Safety
 /// The alignment must be a power of two.
-pub fn aligned_size<T>(size: T, alignment: T) -> T
+pub fn aligned_size_po2<T>(size: T, alignment: T) -> T
 where
     T: num_traits::PrimInt + num_traits::Unsigned,
 {
@@ -122,6 +122,14 @@ where
     // 2 Bitwise AND with the negation of the alignment minus one.
     //  * This ensures that the bits less than our alignment are zero, enforcing alignment.
     (size + alignment - one) & !(alignment - one)
+}
+
+/// A helper to round up a size to the nearest multiple of an alignment.
+pub fn aligned_size<T>(size: T, alignment: T) -> T
+where
+    T: num_traits::PrimInt + num_traits::Unsigned,
+{
+    size + (alignment - size % alignment) % alignment
 }
 
 #[cfg(debug_assertions)]
