@@ -4,7 +4,7 @@
 // Define the ray payload structure used to track the state of an individual ray.
 struct RayPayload {
   // The color and ambient occlusion accumulated by the ray.
-  vec4 radiance;
+  vec3 radiance;
 
   // The amount of transmission energy left in the ray.
   vec3 throughput;

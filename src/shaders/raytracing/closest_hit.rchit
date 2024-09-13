@@ -40,7 +40,7 @@ struct GeometryNode {
 };
 
 // An instance of a glTF model including its vertices and geometry nodes.
-layout(buffer_reference, buffer_reference_align = 16, std430) readonly buffer GltfInstance {
+layout(buffer_reference, buffer_reference_align = 16, std430) readonly buffer GltfModel {
   Vertices vertex_buffer;
   Indices index_buffer;
   GeometryNode nodes[];
@@ -48,7 +48,7 @@ layout(buffer_reference, buffer_reference_align = 16, std430) readonly buffer Gl
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT top_level_accel_struct;
 
-layout(set = 3, binding = 0, std430) readonly buffer InstanceBuffers { GltfInstance g[]; } instance_buffers;
+layout(set = 3, binding = 0, std430) readonly buffer ModelBuffers { GltfModel g[]; } model_buffers;
 layout(set = 3, binding = 1) uniform texture2D textures[];
 layout(set = 3, binding = 2) uniform sampler samplers[];
 
@@ -58,8 +58,8 @@ void main() {
   const uint triangle_index_offset = 3 * gl_PrimitiveID;
   const vec3 barycentric_coords = vec3(1.0 - hit_attributes.x - hit_attributes.y, hit_attributes.x, hit_attributes.y);
 
-  // Use the instance ID to determine which glTF model instance was hit.
-  GltfInstance gltf_instance = instance_buffers.g[gl_InstanceID];
+  // Use the instance's custom index to determine which glTF model was hit.
+  GltfModel gltf_instance = model_buffers.g[gl_InstanceCustomIndexEXT];
 
   // Each material in the instance is placed into a different geometry index in the bottom-level acceleration structure.
   GeometryNode geometry_node = gltf_instance.nodes[gl_GeometryIndexEXT];
@@ -87,12 +87,12 @@ void main() {
   const vec4 world_tangent = vec4(vec3(gl_ObjectToWorldEXT * vec4(tangent.xyz, 0)), tangent.w);
 
   // Calculate the base color of the intersection point.
-  vec4 color = vec4(geometry_node.base_color.rgb, 1);
+  vec3 color = geometry_node.base_color.rgb;
   if (geometry_node.texture_color != MISSING_INDEX) {
-    vec4 c = texture(nonuniformEXT(sampler2D(
+    const vec3 c = texture(nonuniformEXT(sampler2D(
           textures[geometry_node.texture_color],
-          samplers[geometry_node.color_sampler])), uv);
-    color = vec4(color.rgb * srgb_to_linear(c.rgb), c.a);
+          samplers[geometry_node.color_sampler])), uv).rgb;
+    color *= srgb_to_linear(c);
   }
 
   // Determine the normal associated the the intersection point (given the vertex data).
@@ -136,12 +136,12 @@ void main() {
   // Determine the effect of the material's specular component.
   float dielectric_specular = (material_ior - 1.0) / (material_ior + 1.0);
   dielectric_specular *= dielectric_specular;
-  const vec3 specular_color = mix(vec3(dielectric_specular), color.rgb, metallic);
+  const vec3 specular_color = mix(vec3(dielectric_specular), color, metallic);
 
   vec3 direct_lighting_color = vec3(1.0);
 
   // TODO: Use environment mapping when available
-  vec3 light_direction = normalize(vec3(-1, 1, -1));
+  const vec3 light_direction = normalize(vec3(-1, 1, -1));
   float light_intensity = 1.0;
 
   // Trace a ray to determine if this point is in the direct light's shadow.
@@ -163,9 +163,9 @@ void main() {
   // Apply basic lighting to the intersection point.
   const float AMBIENT_INTENSITY = 0.3;
   if (in_shadow) {
-    color.rgb *= AMBIENT_INTENSITY;
+    color *= AMBIENT_INTENSITY;
   } else {
-    color.rgb *= AMBIENT_INTENSITY + (1.0 - AMBIENT_INTENSITY) * max(dot(world_normal, light_direction), 0.0);
+    color *= AMBIENT_INTENSITY + (1.0 - AMBIENT_INTENSITY) * max(dot(world_normal, light_direction), 0.0);
   }
 
   // Sample the hemisphere tangent to this point to apply ambient occlusion.
@@ -224,10 +224,7 @@ void main() {
   }
 
   // Apply this triangle's color to the ray payload.
-  ray_payload.radiance.rgb += color.rgb * throughput * (0.2 + 0.8 * ambient_occlusion);
+  ray_payload.radiance += color * throughput * (0.2 + 0.8 * ambient_occlusion);
 
   ray_payload.throughput -= throughput;
-  if (dot(ray_payload.throughput, ray_payload.throughput) < 0.1) {
-    ray_payload.exit = true;
-  }
 }

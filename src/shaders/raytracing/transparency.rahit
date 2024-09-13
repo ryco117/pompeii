@@ -32,13 +32,13 @@ struct GeometryNode {
 };
 
 // An instance of a glTF model including its vertices and geometry nodes.
-layout(buffer_reference, buffer_reference_align = 16, std430) readonly buffer GltfInstance {
+layout(buffer_reference, buffer_reference_align = 16, std430) readonly buffer GltfModel {
   Vertices vertex_buffer;
   Indices index_buffer;
   GeometryNode nodes[];
 };
 
-layout(set = 3, binding = 0, std430) readonly buffer InstanceBuffers { GltfInstance g[]; } instance_buffers;
+layout(set = 3, binding = 0, std430) readonly buffer ModelBuffers { GltfModel g[]; } model_buffers;
 layout(set = 3, binding = 1) uniform texture2D textures[];
 layout(set = 3, binding = 2) uniform sampler samplers[];
 
@@ -48,8 +48,8 @@ void main() {
   const uint triangle_index_offset = 3 * gl_PrimitiveID;
   const vec3 barycentric_coords = vec3(1.0 - hit_attributes.x - hit_attributes.y, hit_attributes.x, hit_attributes.y);
 
-  // Use the instance ID to determine which glTF model instance was hit.
-  GltfInstance gltf_instance = instance_buffers.g[gl_InstanceID];
+  // Use the instance's custom index to determine which glTF model as hit.
+  GltfModel gltf_instance = model_buffers.g[gl_InstanceCustomIndexEXT];
 
   // Each material in the instance is placed into a different geometry index in the bottom-level acceleration structure.
   GeometryNode geometry_node = gltf_instance.nodes[gl_GeometryIndexEXT];

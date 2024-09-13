@@ -1,0 +1,36 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_ray_tracing : require
+
+layout(buffer_reference, buffer_reference_align = 16, std430) readonly buffer Sphere {
+  vec4 center_radius;
+  vec4 color;
+};
+
+layout(set = 3, binding = 0, std430) readonly buffer Spheres { Sphere s[]; } spheres;
+
+// The world space position of the hit point.
+hitAttributeEXT vec3 world_normal;
+
+void main() {
+  Sphere sphere = spheres.s[gl_InstanceCustomIndexEXT];
+
+  // Apply ray-sphere intersection over the world-space coordinates.
+  const vec3 d = gl_WorldRayDirectionEXT;
+  const vec3 c = gl_WorldRayOriginEXT - (gl_ObjectToWorldEXT * vec4(sphere.center_radius.xyz, 1.0));
+  const float r = length(gl_ObjectToWorldEXT * vec4(sphere.center_radius.w * normalize(vec3(1)), 0.0));
+  const float c2 = dot(c, c);
+  const float cd = dot(c, d);
+  const float discriminant = cd*cd - (c2 - r*r);
+
+  // No intersection if the discriminant is negative.
+  if (discriminant < 0.0) {
+    return;
+  }
+  const float k = sqrt(discriminant);
+
+  // Use the closer intersection since the ray will be pointing towards the outside of the sphere.
+  const float t_minus = -cd - k;
+  world_normal = normalize(c + t_minus * d);
+  reportIntersectionEXT(t_minus, 0);
+}

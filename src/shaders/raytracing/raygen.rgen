@@ -53,7 +53,7 @@ void main() {
 
     // Set the initial ray lighting values.
     ray_payload.throughput = vec3(1);
-    ray_payload.radiance = vec4(0, 0, 0, 1);
+    ray_payload.radiance = vec3(0);
 
     // Ray tracing loop. We cast `MAX_BOUNCES + 1` rays to account for the initial ray.
     for(uint i = 0; i <= MAX_BOUNCES; ++i) {
@@ -76,7 +76,7 @@ void main() {
         RAY_MAX_DISTANCE,
         payload_index);
 
-      if(ray_payload.exit) {
+      if (ray_payload.exit || dot(ray_payload.throughput, ray_payload.throughput) < 0.1) {
         break;
       }
     }

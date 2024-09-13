@@ -5,7 +5,7 @@ use crate::engine::utils::{
 use nalgebra_glm as glm;
 
 /// The maximum number of traversal iterations to allow before a ray must terminate.
-const MAX_RAY_RECURSION_DEPTH: u32 = 10;
+const MAX_RAY_RECURSION_DEPTH: u32 = 2;
 
 /// The maximum number of textures that can be used in the ray tracing pipeline.
 const MAX_TEXTURES: u32 = 1024;
@@ -33,12 +33,15 @@ struct RayTracingShaders {
     ray_gen: ash::vk::ShaderModule,
     miss: ash::vk::ShaderModule,
     shadow_miss: ash::vk::ShaderModule,
-    closest_hit: ash::vk::ShaderModule,
-    any_hit: ash::vk::ShaderModule,
+    closest_hit_mesh: ash::vk::ShaderModule,
+    any_hit_mesh: ash::vk::ShaderModule,
+    intersection: ash::vk::ShaderModule,
+    closest_hit_procedural: ash::vk::ShaderModule,
 }
 impl RayTracingShaders {
     /// Create a new instance of `RayTracingShaders`.
     pub fn new(device: &ash::Device) -> Self {
+        // Only one ray generation shader is needed.
         let ray_gen = create_shader_module(
             device,
             inline_spirv::include_spirv!(
@@ -48,6 +51,8 @@ impl RayTracingShaders {
                 vulkan1_2
             ),
         );
+
+        // Two miss shaders are needed: one for the primary rays and one for shadow rays.
         let miss = create_shader_module(
             device,
             inline_spirv::include_spirv!(
@@ -66,7 +71,9 @@ impl RayTracingShaders {
                 vulkan1_2
             ),
         );
-        let closest_hit = create_shader_module(
+
+        // Two hit shaders are needed for mesh geometry: one for the closest hit and one for any hit (alpha filtering).
+        let closest_hit_mesh = create_shader_module(
             device,
             inline_spirv::include_spirv!(
                 "src/shaders/raytracing/closest_hit.rchit",
@@ -75,7 +82,7 @@ impl RayTracingShaders {
                 vulkan1_2
             ),
         );
-        let any_hit = create_shader_module(
+        let any_hit_mesh = create_shader_module(
             device,
             inline_spirv::include_spirv!(
                 "src/shaders/raytracing/transparency.rahit",
@@ -85,12 +92,35 @@ impl RayTracingShaders {
             ),
         );
 
+        // Two hit shaders are needed for procedural geometry: one for determining the intersection
+        // and one for the closest hit.
+        let intersection = create_shader_module(
+            device,
+            inline_spirv::include_spirv!(
+                "src/shaders/raytracing/intersection_sphere.rint",
+                rint,
+                glsl,
+                vulkan1_2
+            ),
+        );
+        let closest_hit_procedural = create_shader_module(
+            device,
+            inline_spirv::include_spirv!(
+                "src/shaders/raytracing/closest_hit_procedural.rchit",
+                rchit,
+                glsl,
+                vulkan1_2
+            ),
+        );
+
         Self {
             ray_gen,
             miss,
             shadow_miss,
-            closest_hit,
-            any_hit,
+            closest_hit_mesh,
+            any_hit_mesh,
+            intersection,
+            closest_hit_procedural,
         }
     }
 
@@ -99,8 +129,10 @@ impl RayTracingShaders {
         unsafe { device.destroy_shader_module(self.ray_gen, None) };
         unsafe { device.destroy_shader_module(self.miss, None) };
         unsafe { device.destroy_shader_module(self.shadow_miss, None) };
-        unsafe { device.destroy_shader_module(self.closest_hit, None) };
-        unsafe { device.destroy_shader_module(self.any_hit, None) };
+        unsafe { device.destroy_shader_module(self.closest_hit_mesh, None) };
+        unsafe { device.destroy_shader_module(self.any_hit_mesh, None) };
+        unsafe { device.destroy_shader_module(self.intersection, None) };
+        unsafe { device.destroy_shader_module(self.closest_hit_procedural, None) };
     }
 }
 
@@ -632,11 +664,11 @@ fn create_mesh_data(
     // Load the test model from memory.
     static DUCK_BYTES: &[u8] = include_bytes!("../../assets/Duck.glb");
     static PLANES_BYTES: &[u8] = include_bytes!("../../assets/Planes.glb");
-    let bistro_bytes = std::fs::read("assets/Bistro.glb").expect("Failed to read Bistro.glb");
+    // let bistro_bytes = std::fs::read("assets/Bistro.glb").expect("Failed to read Bistro.glb");
     let (test_gltf, gltf_buffers, gltf_images) = {
         // gltf::import_slice(DUCK_BYTES).expect("Failed to load test GLB model")
-        // gltf::import_slice(PLANES_BYTES).expect("Failed to load test GLB model")
-        gltf::import_slice(bistro_bytes).expect("Failed to load test GLB model")
+        gltf::import_slice(PLANES_BYTES).expect("Failed to load test GLB model")
+        // gltf::import_slice(bistro_bytes).expect("Failed to load test GLB model")
     };
 
     // Create a sampler for each sampler description in the model.
@@ -832,24 +864,24 @@ fn create_mesh_data(
     }
 }
 
-/// Helper for instancing a mesh which is managed elsewhere, `MeshData`.
-#[derive(Clone, Copy)]
-struct AcceleratedInstance {
-    /// A bottom-level acceleration structure for the mesh.
-    pub acceleration_address: ash::vk::DeviceAddress,
-
-    /// The global transformation to apply to this instance.
-    pub transform: ash::vk::TransformMatrixKHR,
-}
-
-/// Create a new instance of a mesh.
-fn create_mesh_instance(
+/// Create a new instance to be included in the top-level acceleration structure.
+fn create_acceleration_instance(
     acceleration_address: ash::vk::DeviceAddress,
     transform: ash::vk::TransformMatrixKHR,
-) -> AcceleratedInstance {
-    AcceleratedInstance {
-        acceleration_address,
+    custom_geometry_index: u32,
+    hit_group_index: u32,
+) -> ash::vk::AccelerationStructureInstanceKHR {
+    // Create an instance of this bottom-level acceleration structure.
+    ash::vk::AccelerationStructureInstanceKHR {
         transform,
+        instance_custom_index_and_mask: ash::vk::Packed24_8::new(custom_geometry_index, 0xFF),
+        instance_shader_binding_table_record_offset_and_flags: ash::vk::Packed24_8::new(
+            hit_group_index,
+            0,
+        ),
+        acceleration_structure_reference: ash::vk::AccelerationStructureReferenceKHR {
+            device_handle: acceleration_address,
+        },
     }
 }
 
@@ -963,45 +995,19 @@ fn create_top_level_acceleration_structure(
     allocator: &mut gpu_allocator::vulkan::Allocator,
     command_pool: ash::vk::CommandPool,
     queue: ash::vk::Queue,
-    mesh_instances: &[AcceleratedInstance],
+    instances: &[ash::vk::AccelerationStructureInstanceKHR],
 ) -> utils::ray_tracing::AccelerationStructure {
     // Determine the number of acceleration instances to create.
-    let instance_count = mesh_instances.len() as u32;
+    let instance_count = instances.len() as u32;
 
     // Create a staging buffer to upload the data for each instance.
     let mut staging_buffer = utils::buffers::StagingBuffer::new(
         device,
         pageable_device_local_memory,
         allocator,
-        std::mem::size_of::<ash::vk::AccelerationStructureInstanceKHR>() as u64
-            * instance_count as u64,
+        std::mem::size_of_val(instances) as u64,
     )
     .expect("Failed to create staging buffer for acceleration structure instances");
-
-    // The instance flags are used to control how the geometry is traversed.
-    // TODO: Determine if we want to cull using this step.
-    #[allow(clippy::cast_possible_truncation)]
-    let instance_flag_as_u8 =
-        ash::vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8;
-
-    // Create an instance for each bottom-level acceleration structure.
-    let instances = mesh_instances
-        .iter()
-        .map(|mesh_instance| {
-            // Create an instance of this bottom-level acceleration structure.
-            ash::vk::AccelerationStructureInstanceKHR {
-                transform: mesh_instance.transform,
-                instance_custom_index_and_mask: ash::vk::Packed24_8::new(0, 0xFF),
-                instance_shader_binding_table_record_offset_and_flags: ash::vk::Packed24_8::new(
-                    0,
-                    instance_flag_as_u8,
-                ),
-                acceleration_structure_reference: ash::vk::AccelerationStructureReferenceKHR {
-                    device_handle: mesh_instance.acceleration_address,
-                },
-            }
-        })
-        .collect::<Vec<_>>();
 
     // Create a device-local buffer for this instance.
     // TODO: Create a single buffer and index into it for each instance.
@@ -1096,85 +1102,168 @@ fn create_top_level_acceleration_structure(
 
     acceleration
 }
+
+/// The data for a single procedural geometry. Used for intersection and rendering in shaders.
+#[repr(C)]
+struct ProceduralGpuData {
+    pub center: glm::Vec3,
+    pub radius: f32,
+    pub color: glm::Vec4,
+}
+
 /// Create a bottom-level acceleration structure for a procedural geometry.
-// fn create_procedural_bottom_acceleration_structure(
-//     device: &ash::Device,
-//     acceleration_device: &ash::khr::acceleration_structure::Device,
-//     pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
-//     allocator: &mut gpu_allocator::vulkan::Allocator,
-//     command_pool: ash::vk::CommandPool,
-//     queue: ash::vk::Queue,
-// ) -> utils::ray_tracing::AccelerationStructure {
-//     // Define the position data of our axis-aligned bounding box.
-//     let positions = [ash::vk::AabbPositionsKHR {
-//         min_x: -1.0,
-//         min_y: -1.0,
-//         min_z: -1.0,
-//         max_x: 1.0,
-//         max_y: 1.0,
-//         max_z: 1.0,
-//     }];
-//
-//     // Create a buffer to hold the position data.
-//     let (position_buffer, position_fence) = utils::buffers::new_data_buffer(
-//         device,
-//         pageable_device_local_memory.map(|d| (d, 1.)),
-//         allocator,
-//         command_pool,
-//         queue,
-//         utils::data_slice_byte_slice(&positions),
-//         ash::vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
-//             | ash::vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-//         "Procedural Position Buffer",
-//         None,
-//         None,
-//     );
-//
-//     let build_info = ash::vk::AccelerationStructureBuildGeometryInfoKHR::default()
-//         .ty(ash::vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-//         .flags(ash::vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
-//         .mode(ash::vk::BuildAccelerationStructureModeKHR::BUILD)
-//         .geometries(&[ash::vk::AccelerationStructureGeometryKHR::default()
-//             .geometry_type(ash::vk::GeometryTypeKHR::AABBS)
-//             .geometry(ash::vk::AccelerationStructureGeometryDataKHR {
-//                 aabbs: ash::vk::AccelerationStructureGeometryAabbsDataKHR::default()
-//                     .data()
-//                     .stride(std::mem::size_of::<ash::vk::AabbPositionsKHR>() as u64),
-//             })
-//             .flags(ash::vk::GeometryFlagsKHR::OPAQUE)]);
-//
-//     acceleration_device
-//         .get_acceleration_structure_build_sizes(ash::vk::AccelerationStructureBuildTypeKHR::DEVICE);
-//
-//     // Create a buffer that can be used as the scratch buffer for building the acceleration structure.
-//     let scratch_buffer =
-//         utils::ray_tracing::ScratchBuffer::new(device, pageable_device_local_memory, allocator);
-//
-//     // Create the acceleration structure.
-//     let acceleration = utils::ray_tracing::AccelerationStructure::new_bottom_level(
-//         device,
-//         acceleration_device,
-//         pageable_device_local_memory,
-//         allocator,
-//         &scratch_buffer.build_sizes,
-//         &scratch_buffer,
-//         utils::ray_tracing::InstancedGeometries::new(
-//             &[ash::vk::AccelerationStructureGeometryKHR::default()
-//                 .geometry_type(ash::vk::GeometryTypeKHR::AABBS)
-//                 .geometry(ash::vk::AccelerationStructureGeometryDataKHR::default())
-//                 .flags(ash::vk::GeometryFlagsKHR::OPAQUE)],
-//             &[1],
-//         )
-//         .unwrap(),
-//         command_pool,
-//         queue,
-//     );
-//
-//     // Clean up the acceleration scratch buffer.
-//     scratch_buffer.destroy(device, allocator);
-//
-//     acceleration
-// }
+fn create_procedural_bottom_acceleration_structure(
+    device: &ash::Device,
+    acceleration_device: &ash::khr::acceleration_structure::Device,
+    pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
+    allocator: &mut gpu_allocator::vulkan::Allocator,
+    command_pool: ash::vk::CommandPool,
+    queue: ash::vk::Queue,
+) -> (
+    utils::ray_tracing::AccelerationStructure,
+    utils::buffers::BufferAllocation,
+) {
+    // Define the position data of our axis-aligned bounding box.
+    // TODO: Consider using stride to merge the procedural data buffer with this buffer.
+    let bounding_boxes = [ash::vk::AabbPositionsKHR {
+        min_x: -1.0,
+        min_y: -1.0,
+        min_z: -1.0,
+        max_x: 1.0,
+        max_y: 1.0,
+        max_z: 1.0,
+    }];
+    let spheres = [ProceduralGpuData {
+        center: glm::Vec3::new(0., 0., 0.),
+        radius: 1.,
+        color: glm::Vec4::new(1., 0., 0., 1.),
+    }];
+    let staging_size =
+        std::mem::size_of_val(&bounding_boxes) as u64 + std::mem::size_of_val(&spheres) as u64;
+
+    let mut staging_buffer = utils::buffers::StagingBuffer::new(
+        device,
+        pageable_device_local_memory,
+        allocator,
+        staging_size,
+    )
+    .expect("Failed to create staging buffer for procedural bottom-level acceleration structure");
+
+    // Create a buffer to hold the axis-align bounding boxes for each procedural geometry.
+    // This buffer is used to create the bottom-level acceleration structure, but then is unused.
+    let (position_buffer, position_fence) = utils::buffers::new_data_buffer(
+        device,
+        pageable_device_local_memory.map(|d| (d, 1.)),
+        allocator,
+        command_pool,
+        queue,
+        utils::data_slice_byte_slice(&bounding_boxes),
+        ash::vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+            | ash::vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        "Procedural Position Buffer",
+        &mut staging_buffer,
+        None,
+    )
+    .expect(
+        "Failed to create bounding box buffer for procedural bottom-level acceleration structure",
+    );
+    let position_address = unsafe {
+        device.get_buffer_device_address(
+            &ash::vk::BufferDeviceAddressInfo::default().buffer(position_buffer.buffer),
+        )
+    };
+
+    // Create a buffer to hold the custom geometry data for each procedural geometry.
+    let (procedural_data_buffer, procedural_fence) = utils::buffers::new_data_buffer(
+        device,
+        pageable_device_local_memory.map(|d| (d, 1.)),
+        allocator,
+        command_pool,
+        queue,
+        utils::data_slice_byte_slice(&spheres),
+        ash::vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+            | ash::vk::BufferUsageFlags::STORAGE_BUFFER,
+        "Procedural Position Buffer",
+        &mut staging_buffer,
+        Some(std::mem::size_of_val(&bounding_boxes)),
+    )
+    .expect("Failed to create sphere buffer for procedural bottom-level acceleration structure");
+
+    // Wait for the fence to signal that the buffer is ready, then delete the fence.
+    unsafe {
+        device.wait_for_fences(
+            &[position_fence.fence, procedural_fence.fence],
+            true,
+            FIVE_SECONDS_IN_NANOSECONDS,
+        )
+    }
+    .expect("Failed to wait for all position buffer creation fences");
+    position_fence.cleanup(device, allocator);
+    procedural_fence.cleanup(device, allocator);
+    staging_buffer.destroy(device, allocator);
+
+    // Use the position data to create the axis-aligned bounding box for procedural geometry.
+    let procedural_geometries = [ash::vk::AccelerationStructureGeometryKHR::default()
+        .geometry_type(ash::vk::GeometryTypeKHR::AABBS)
+        .geometry(ash::vk::AccelerationStructureGeometryDataKHR {
+            aabbs: ash::vk::AccelerationStructureGeometryAabbsDataKHR::default()
+                .data(ash::vk::DeviceOrHostAddressConstKHR {
+                    device_address: position_address,
+                })
+                .stride(std::mem::size_of::<ash::vk::AabbPositionsKHR>() as u64),
+        })
+        .flags(ash::vk::GeometryFlagsKHR::OPAQUE)];
+    let procedural_geometry_counts = [bounding_boxes.len() as u32];
+
+    let build_info = ash::vk::AccelerationStructureBuildGeometryInfoKHR::default()
+        .ty(ash::vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+        .flags(ash::vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+        .mode(ash::vk::BuildAccelerationStructureModeKHR::BUILD)
+        .geometries(&procedural_geometries);
+
+    // Get the build size of this bottom-level acceleration structure.
+    let build_sizes = unsafe {
+        let mut build_sizes = ash::vk::AccelerationStructureBuildSizesInfoKHR::default();
+        acceleration_device.get_acceleration_structure_build_sizes(
+            ash::vk::AccelerationStructureBuildTypeKHR::DEVICE,
+            &build_info,
+            &procedural_geometry_counts,
+            &mut build_sizes,
+        );
+        build_sizes
+    };
+
+    // Create a buffer that can be used as the scratch buffer for building the acceleration structure.
+    let scratch_buffer = utils::ray_tracing::ScratchBuffer::new(
+        device,
+        pageable_device_local_memory,
+        allocator,
+        build_sizes.build_scratch_size,
+    );
+
+    // Create the acceleration structure.
+    let acceleration = utils::ray_tracing::AccelerationStructure::new_bottom_level(
+        device,
+        acceleration_device,
+        pageable_device_local_memory,
+        allocator,
+        &build_sizes,
+        &scratch_buffer,
+        utils::ray_tracing::InstancedGeometries::new(
+            &procedural_geometries,
+            &procedural_geometry_counts,
+        )
+        .unwrap(),
+        command_pool,
+        queue,
+    );
+
+    // Clean up resources used for the build.
+    scratch_buffer.destroy(device, allocator);
+    position_buffer.destroy(device, allocator);
+
+    (acceleration, procedural_data_buffer)
+}
 
 /// The descriptor set layouts for the ray tracing pipeline.
 #[repr(C)]
@@ -1237,7 +1326,9 @@ impl DescriptorSetLayouts {
             .descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(1)
             .stage_flags(
-                ash::vk::ShaderStageFlags::ANY_HIT_KHR | ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+                ash::vk::ShaderStageFlags::ANY_HIT_KHR
+                    | ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR
+                    | ash::vk::ShaderStageFlags::INTERSECTION_KHR,
             );
         let textures_binding = ash::vk::DescriptorSetLayoutBinding::default()
             .binding(1)
@@ -1253,6 +1344,11 @@ impl DescriptorSetLayouts {
             .stage_flags(
                 ash::vk::ShaderStageFlags::ANY_HIT_KHR | ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR,
             );
+        // let sphere_binding = ash::vk::DescriptorSetLayoutBinding::default()
+        //     .binding(3)
+        //     .descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER)
+        //     .descriptor_count(1)
+        //     .stage_flags(ash::vk::ShaderStageFlags::INTERSECTION_KHR);
         let model_data = unsafe {
             device.create_descriptor_set_layout(
                 &ash::vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
@@ -1335,7 +1431,7 @@ impl ShaderBindingTables {
         command_pool: ash::vk::CommandPool,
         queue: ash::vk::Queue,
     ) -> Self {
-        let shader_group_count = 4; // TODO: Let the caller specify the layout and count of shader groups.
+        let shader_group_count = 5; // TODO: Let the caller specify the layout and count of shader groups.
         let group_handle_size = properties.shader_group_handle_size as usize;
         let shader_group_handle_alignment = properties.shader_group_handle_alignment as usize;
 
@@ -1404,13 +1500,17 @@ impl ShaderBindingTables {
         .expect("Failed to create miss binding table");
 
         offset += miss_bytes.len();
+        let mut hit_bytes = Vec::with_capacity(group_handle_size_aligned + group_handle_size);
+        hit_bytes.extend_from_slice(shader_group_iter.next().unwrap());
+        hit_bytes.extend(std::iter::repeat(0).take(group_handle_size_aligned - group_handle_size));
+        hit_bytes.extend_from_slice(shader_group_iter.next().unwrap());
         let (hit_binding_table, hit_fence) = utils::buffers::new_data_buffer(
             device,
             pageable_device_local_memory.map(|d| (d, 1.)),
             allocator,
             command_pool,
             queue,
-            shader_group_iter.next().unwrap(),
+            &hit_bytes,
             buffer_usage,
             "Hit Binding Table",
             &mut staging_buffer,
@@ -1483,6 +1583,7 @@ impl Pipeline {
         let descriptor_set_layouts = DescriptorSetLayouts::new(device);
         let layout = create_pipeline_layout(device, &descriptor_set_layouts);
 
+        // Create the single ray generation shader group.
         let ray_gen_shader_info = ash::vk::PipelineShaderStageCreateInfo::default()
             .stage(ash::vk::ShaderStageFlags::RAYGEN_KHR)
             .module(shaders.ray_gen)
@@ -1494,6 +1595,7 @@ impl Pipeline {
             .any_hit_shader(ash::vk::SHADER_UNUSED_KHR)
             .intersection_shader(ash::vk::SHADER_UNUSED_KHR);
 
+        // Create the miss shader for primary rays.
         let miss_shader_info = ash::vk::PipelineShaderStageCreateInfo::default()
             .stage(ash::vk::ShaderStageFlags::MISS_KHR)
             .module(shaders.miss)
@@ -1505,6 +1607,7 @@ impl Pipeline {
             .any_hit_shader(ash::vk::SHADER_UNUSED_KHR)
             .intersection_shader(ash::vk::SHADER_UNUSED_KHR);
 
+        // Create the miss shader for shadow rays.
         let shadow_miss_shader_info = ash::vk::PipelineShaderStageCreateInfo::default()
             .stage(ash::vk::ShaderStageFlags::MISS_KHR)
             .module(shaders.shadow_miss)
@@ -1516,33 +1619,53 @@ impl Pipeline {
             .any_hit_shader(ash::vk::SHADER_UNUSED_KHR)
             .intersection_shader(ash::vk::SHADER_UNUSED_KHR);
 
-        let closest_hit_shader_info = ash::vk::PipelineShaderStageCreateInfo::default()
+        // Create the hit group for mesh geometry.
+        let closest_hit_mesh_shader_info = ash::vk::PipelineShaderStageCreateInfo::default()
             .stage(ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR)
-            .module(shaders.closest_hit)
+            .module(shaders.closest_hit_mesh)
             .name(ENTRY_POINT_MAIN);
-        let any_hit_shader_info = ash::vk::PipelineShaderStageCreateInfo::default()
+        let any_hit_mesh_shader_info = ash::vk::PipelineShaderStageCreateInfo::default()
             .stage(ash::vk::ShaderStageFlags::ANY_HIT_KHR)
-            .module(shaders.any_hit)
+            .module(shaders.any_hit_mesh)
             .name(ENTRY_POINT_MAIN);
-        let hit_shaders_group = ash::vk::RayTracingShaderGroupCreateInfoKHR::default()
+        let hit_mesh_shader_group = ash::vk::RayTracingShaderGroupCreateInfoKHR::default()
             .ty(ash::vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
             .general_shader(ash::vk::SHADER_UNUSED_KHR)
             .closest_hit_shader(3) // Index of the closest-hit shader.
             .any_hit_shader(4) // Index of the any-hit shader.
             .intersection_shader(ash::vk::SHADER_UNUSED_KHR);
 
+        // Create the hit group for procedural geometry.
+        let intersection_sphere_shader_info = ash::vk::PipelineShaderStageCreateInfo::default()
+            .stage(ash::vk::ShaderStageFlags::INTERSECTION_KHR)
+            .module(shaders.intersection)
+            .name(ENTRY_POINT_MAIN);
+        let closest_hit_procedural_shader_info = ash::vk::PipelineShaderStageCreateInfo::default()
+            .stage(ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR)
+            .module(shaders.closest_hit_procedural)
+            .name(ENTRY_POINT_MAIN);
+        let hit_procedural_shader_group = ash::vk::RayTracingShaderGroupCreateInfoKHR::default()
+            .ty(ash::vk::RayTracingShaderGroupTypeKHR::PROCEDURAL_HIT_GROUP)
+            .general_shader(ash::vk::SHADER_UNUSED_KHR)
+            .closest_hit_shader(6) // Index of the closest-hit shader.
+            .any_hit_shader(ash::vk::SHADER_UNUSED_KHR)
+            .intersection_shader(5); // Index of the intersection shader.
+
         let shader_stages = [
             ray_gen_shader_info,
             miss_shader_info,
             shadow_miss_shader_info,
-            closest_hit_shader_info,
-            any_hit_shader_info,
+            closest_hit_mesh_shader_info,
+            any_hit_mesh_shader_info,
+            intersection_sphere_shader_info,
+            closest_hit_procedural_shader_info,
         ];
         let shader_groups = [
             ray_gen_shader_group,
             miss_shader_group,
             shadow_miss_shader_group,
-            hit_shaders_group,
+            hit_mesh_shader_group,
+            hit_procedural_shader_group,
         ];
 
         // Describe the ray tracing pipeline to be created.
@@ -1628,30 +1751,31 @@ fn create_lens_buffer(
     camera_lens_buffer
 }
 
-/// Create the storage buffer specifying the glTF model used for each instance.
+/// Create the instances buffer. It is to be indexed by `gl_InstanceCustomIndexEXT` to get geometry
+/// for an instance.
 fn create_instances_buffer(
     device: &ash::Device,
     pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
     allocator: &mut gpu_allocator::vulkan::Allocator,
     command_pool: ash::vk::CommandPool,
     queue: ash::vk::Queue,
-    mesh_instances: &[ash::vk::DeviceAddress],
+    instances: &[ash::vk::DeviceAddress],
 ) -> utils::buffers::BufferAllocation {
     let mut staging = utils::buffers::StagingBuffer::new(
         device,
         pageable_device_local_memory,
         allocator,
-        std::mem::size_of_val(mesh_instances) as u64,
+        std::mem::size_of_val(instances) as u64,
     )
     .expect("Failed to create staging buffer for instance data");
 
     let (instances_buffer, instances_fence) = utils::buffers::new_data_buffer(
         device,
-        pageable_device_local_memory.map(|d| (d, 0.8)), // The instances are used once per ray; they are high priority, but not maximally so.
+        pageable_device_local_memory.map(|d| (d, 0.9)), // The instances are used once per ray; they are high priority, but not maximally so.
         allocator,
         command_pool,
         queue,
-        utils::data_slice_byte_slice(mesh_instances),
+        utils::data_slice_byte_slice(instances),
         ash::vk::BufferUsageFlags::STORAGE_BUFFER
             | ash::vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
         "Instances Buffer",
@@ -1680,7 +1804,8 @@ struct Descriptors {
     pub camera_lens_set: ash::vk::DescriptorSet,
     pub camera_lens_buffer: utils::buffers::BufferAllocation,
     pub model_data_set: ash::vk::DescriptorSet,
-    pub instances_buffer: utils::buffers::BufferAllocation,
+    pub instance_geometries: utils::buffers::BufferAllocation,
+    // pub procedural_instances: utils::buffers::BufferAllocation,
 }
 impl Descriptors {
     /// Destroy the descriptor pool and descriptor sets.
@@ -1692,8 +1817,9 @@ impl Descriptors {
         // Destroy the camera lens uniform buffer.
         self.camera_lens_buffer.destroy(device, allocator);
 
-        // Destroy the instances buffer.
-        self.instances_buffer.destroy(device, allocator);
+        // Destroy the instances buffers.
+        self.instance_geometries.destroy(device, allocator);
+        // self.procedural_instances.destroy(device, allocator);
     }
 }
 
@@ -1714,8 +1840,8 @@ fn create_descriptor_sets<'a, I>(
     descriptor_set_layouts: &DescriptorSetLayouts,
     top_acceleration: &utils::ray_tracing::AccelerationStructure,
     camera_lens_buffer: utils::buffers::BufferAllocation,
-    instances_buffer: utils::buffers::BufferAllocation,
-    instance_count: usize,
+    instance_geometries: utils::buffers::BufferAllocation,
+    instance_geometry_count: usize,
     textures: I,
     samplers: &[ash::vk::Sampler],
 ) -> Descriptors
@@ -1825,13 +1951,16 @@ where
 
     // Set the update data for the instances buffer and the textures.
     let instances_info = [ash::vk::DescriptorBufferInfo::default()
-        .buffer(instances_buffer.buffer)
-        .range(std::mem::size_of::<ash::vk::DeviceAddress>() as u64 * instance_count as u64)];
+        .buffer(instance_geometries.buffer)
+        .range(
+            std::mem::size_of::<ash::vk::DeviceAddress>() as u64 * instance_geometry_count as u64,
+        )];
     let instances_write = ash::vk::WriteDescriptorSet::default()
         .dst_set(model_data_set)
         .dst_binding(0)
         .descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER)
         .buffer_info(&instances_info);
+
     let textures_info = textures
         .into_iter()
         .map(|texture| {
@@ -1845,6 +1974,7 @@ where
         .dst_binding(1)
         .descriptor_type(ash::vk::DescriptorType::SAMPLED_IMAGE)
         .image_info(&textures_info);
+
     let samplers_info = samplers
         .iter()
         .map(|sampler| ash::vk::DescriptorImageInfo::default().sampler(*sampler))
@@ -1854,6 +1984,15 @@ where
         .dst_binding(2)
         .descriptor_type(ash::vk::DescriptorType::SAMPLER)
         .image_info(&samplers_info);
+
+    // let procedural_instances_info = [ash::vk::DescriptorBufferInfo::default()
+    //     .buffer(procedural_instances.buffer)
+    //     .range(std::mem::size_of::<ProceduralGpuData>() as u64 * procedural_instance_count as u64)];
+    // let procedural_instances_write = ash::vk::WriteDescriptorSet::default()
+    //     .dst_set(model_data_set)
+    //     .dst_binding(3)
+    //     .descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER)
+    //     .buffer_info(&procedural_instances_info);
 
     // Set the update data for each output image.
     let image_info = output_images
@@ -1891,6 +2030,7 @@ where
         } else {
             Some(samplers_write)
         })
+        // .chain(std::iter::once(procedural_instances_write))
         .chain(image_writes)
         .collect::<Vec<_>>();
 
@@ -1906,14 +2046,17 @@ where
         camera_lens_set,
         camera_lens_buffer,
         model_data_set,
-        instances_buffer,
+        instance_geometries,
+        // procedural_instances,
     }
 }
 
 /// An example demonstrating the use of ray tracing.
 pub struct ExampleRayTracing {
     mesh: MeshGpuData,
-    bottom_acceleration: utils::ray_tracing::AccelerationStructure,
+    procedural_data_buffer: utils::buffers::BufferAllocation,
+    mesh_bottom_acceleration: utils::ray_tracing::AccelerationStructure,
+    procedural_bottom_acceleration: utils::ray_tracing::AccelerationStructure,
     top_acceleration: utils::ray_tracing::AccelerationStructure,
     pipeline: Pipeline,
     shader_binding_tables: ShaderBindingTables,
@@ -1941,8 +2084,8 @@ impl ExampleRayTracing {
             queue,
         );
 
-        // Create the acceleration structures for the geometry of this scene.
-        let bottom_acceleration = create_bottom_level_acceleration_structure(
+        // Create the bottom-level acceleration structure for the mesh-geometry of this scene.
+        let mesh_bottom_acceleration = create_bottom_level_acceleration_structure(
             device,
             acceleration_device,
             pageable_device_local_memory,
@@ -1952,39 +2095,79 @@ impl ExampleRayTracing {
             &mesh,
         );
 
-        let mesh_instance = create_mesh_instance(
-            bottom_acceleration.device_address(),
+        // Create the bottom-level acceleration structure for our procedural geometry.
+        let (procedural_bottom_acceleration, procedural_geometries) =
+            create_procedural_bottom_acceleration_structure(
+                device,
+                acceleration_device,
+                pageable_device_local_memory,
+                allocator,
+                command_pool,
+                queue,
+            );
+        let procedural_geometries_address = unsafe {
+            device.get_buffer_device_address(
+                &ash::vk::BufferDeviceAddressInfo::default().buffer(procedural_geometries.buffer),
+            )
+        };
+
+        let mesh_instance = create_acceleration_instance(
+            mesh_bottom_acceleration.device_address(),
             ash::vk::TransformMatrixKHR {
                 matrix: [1.2, 0., 0., 0., 0., 1.2, 0., 0., 0., 0., 1.2, 0.],
             },
+            0,
+            0,
         );
-        let mesh_instance_1 = create_mesh_instance(
-            bottom_acceleration.device_address(),
+        let mesh_instance_1 = create_acceleration_instance(
+            mesh_bottom_acceleration.device_address(),
             ash::vk::TransformMatrixKHR {
                 matrix: [0., 0.3, 0., 2., -0.3, 0., 0., 0., 0., 0., 0.3, 2.],
             },
+            0,
+            0,
         );
-        let mesh_instance_2 = create_mesh_instance(
-            bottom_acceleration.device_address(),
+        let mesh_instance_2 = create_acceleration_instance(
+            mesh_bottom_acceleration.device_address(),
             ash::vk::TransformMatrixKHR {
                 matrix: [0., 0., 0.4, -3., 0., 0.4, 0., 0., -0.4, 0., 0., -3.],
             },
+            0,
+            0,
         );
-        // let (mesh_instances, mesh_instance_geometries) = (
+        let procedural_instance = create_acceleration_instance(
+            procedural_bottom_acceleration.device_address(),
+            ash::vk::TransformMatrixKHR {
+                matrix: [0.6, 0., 0., -1.2, 0., 0.6, 0., -0.5, 0., 0., 0.6, -1.2],
+            },
+            1,
+            1,
+        );
+
+        let (acceleration_instances, instance_geometries) = (
+            [
+                mesh_instance,
+                mesh_instance_1,
+                mesh_instance_2,
+                procedural_instance,
+            ],
+            [mesh.geometry_node_address, procedural_geometries_address],
+        );
+        // let (acceleration_instances, instance_geometries) = (
         //     [mesh_instance, mesh_instance_1, mesh_instance_2],
-        //     [mesh.geometry_node_address; 3]
+        //     [mesh.geometry_node_address],
         // );
-        let (mesh_instances, mesh_instance_geometries) =
-            ([mesh_instance], [mesh.geometry_node_address]);
+        // let (acceleration_instances, instance_geometries) =
+        //     ([mesh_instance], [mesh.geometry_node_address]);
 
         // Create a buffer pointing to the geometry nodes of each instance in the top-level acceleration structure.
-        let instances_buffer = create_instances_buffer(
+        let mesh_instances_buffer = create_instances_buffer(
             device,
             pageable_device_local_memory,
             allocator,
             command_pool,
             queue,
-            &mesh_instance_geometries,
+            &instance_geometries,
         );
 
         // Create the top-level acceleration structure over the desired instances.
@@ -1995,7 +2178,7 @@ impl ExampleRayTracing {
             allocator,
             command_pool,
             queue,
-            &mesh_instances,
+            &acceleration_instances,
         );
 
         // Create the ray tracing pipeline.
@@ -2033,15 +2216,17 @@ impl ExampleRayTracing {
             &pipeline.descriptor_set_layouts,
             &top_acceleration,
             camera_lens,
-            instances_buffer,
-            mesh_instances.len(),
+            mesh_instances_buffer,
+            instance_geometries.len(),
             &mesh.textures,
             &mesh.samplers,
         );
 
         Self {
             mesh,
-            bottom_acceleration,
+            procedural_data_buffer: procedural_geometries,
+            mesh_bottom_acceleration,
+            procedural_bottom_acceleration,
             top_acceleration,
             pipeline,
             shader_binding_tables,
@@ -2056,13 +2241,21 @@ impl ExampleRayTracing {
         acceleration_device: &ash::khr::acceleration_structure::Device,
         allocator: &mut gpu_allocator::vulkan::Allocator,
     ) {
+        // Destroy the pipeline and its associated resources.
         self.descriptors.destroy(device, allocator);
         self.shader_binding_tables.destroy(device, allocator);
         self.pipeline.destroy(device);
+
+        // Destroy acceleration structures, top to bottom.
         self.top_acceleration
             .destroy(device, acceleration_device, allocator);
-        self.bottom_acceleration
+        self.mesh_bottom_acceleration
             .destroy(device, acceleration_device, allocator);
+        self.procedural_bottom_acceleration
+            .destroy(device, acceleration_device, allocator);
+
+        // Destroy geometry data.
+        self.procedural_data_buffer.destroy(device, allocator);
         self.mesh.destroy(device, allocator);
     }
 
@@ -2109,8 +2302,8 @@ impl ExampleRayTracing {
             .size(handle_aligned_size + group_handle_size); // TODO: Allow getting the shader group count programmatically.
         let hit_sbt = ash::vk::StridedDeviceAddressRegionKHR::default()
             .device_address(self.shader_binding_tables.hit_address)
-            .stride(group_handle_size)
-            .size(group_handle_size);
+            .stride(handle_aligned_size)
+            .size(handle_aligned_size + group_handle_size);
 
         // Even though we are not using a callables shader, we need to give this struct to the
         // raytrace pipeline.
