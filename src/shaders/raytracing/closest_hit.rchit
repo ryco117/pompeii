@@ -95,6 +95,12 @@ void main() {
     color *= srgb_to_linear(c);
   }
 
+  /*
+  // Test minimal texture mapping.
+  ray_payload.radiance = color;
+  ray_payload.exit = true;
+  return;/**/
+
   // Determine the normal associated the the intersection point (given the vertex data).
   const vec3 point_tangent = normalize(world_tangent.xyz);
   const vec3 bitangent = world_tangent.w * cross(world_normal, point_tangent);

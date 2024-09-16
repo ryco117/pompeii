@@ -10,7 +10,7 @@ layout(buffer_reference, buffer_reference_align = 16, std430) readonly buffer Sp
 layout(set = 3, binding = 0, std430) readonly buffer Spheres { Sphere s[]; } spheres;
 
 // The world space position of the hit point.
-hitAttributeEXT vec3 world_normal;
+hitAttributeEXT vec2 hit_attribute;
 
 void main() {
   Sphere sphere = spheres.s[gl_InstanceCustomIndexEXT];
@@ -31,6 +31,11 @@ void main() {
 
   // Use the closer intersection since the ray will be pointing towards the outside of the sphere.
   const float t_minus = -cd - k;
-  world_normal = normalize(c + t_minus * d);
-  reportIntersectionEXT(t_minus, 0);
+
+  // Convert the normal to spherical coordinates.
+  const vec3 normal = normalize(c + t_minus * d);
+  hit_attribute = vec2(atan(normal.y, normal.x), acos(normal.z));
+
+  uint custom_material = 80;
+  reportIntersectionEXT(t_minus, custom_material);
 }

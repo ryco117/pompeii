@@ -1,6 +1,5 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
-#extension GL_EXT_scalar_block_layout : require
 #extension GL_GOOGLE_include_directive : require
 
 #include "random.glsl"
@@ -14,7 +13,7 @@ layout(set = 2, binding = 0) uniform CameraLens {
   mat4 proj_inverse;
 } camera_lens;
 
-layout(scalar, push_constant) uniform PushConstants {
+layout(push_constant) uniform PushConstants {
   mat4 view_inverse;
   float time;
 } push_constants;

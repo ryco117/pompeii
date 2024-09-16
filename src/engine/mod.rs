@@ -445,17 +445,13 @@ impl Renderer {
         let command_buffer_info = ash::vk::CommandBufferAllocateInfo {
             command_pool,
             level: ash::vk::CommandBufferLevel::PRIMARY,
-            command_buffer_count: 1,
+            command_buffer_count: frames_in_flight as u32,
             ..Default::default()
         };
         let command_buffers = unsafe {
-            let mut c = Vec::new();
-            c.resize_with(frames_in_flight, || {
-                logical_device
-                    .allocate_command_buffers(&command_buffer_info)
-                    .expect("Unable to allocate command buffer")[0]
-            });
-            c
+            logical_device
+                .allocate_command_buffers(&command_buffer_info)
+                .expect("Unable to allocate command buffer")
         };
 
         // Create a fence for each image in the swapchain so the CPU can wait for the GPU to finish a given frame.
@@ -515,8 +511,7 @@ impl Renderer {
             }
 
             // Destroy all command buffers and the command pool.
-            self.logical_device
-                .free_command_buffers(self.command_pool, &self.command_buffers);
+            // NOTE: Destroying the pool frees all command buffers allocated from it.
             self.logical_device
                 .destroy_command_pool(self.command_pool, None);
 

@@ -1,0 +1,219 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_ray_tracing : require
+
+layout(push_constant) uniform PushConstants {
+  mat4 view_inverse;
+  float time;
+} push_constants;
+
+layout(buffer_reference, buffer_reference_align = 16, std430) readonly buffer Sphere {
+  vec4 center_radius;
+  vec4 color;
+};
+
+layout(set = 3, binding = 0, std430) readonly buffer Spheres { Sphere s[]; } spheres;
+
+// The world space position of the hit point.
+hitAttributeEXT vec2 hit_attribute;
+
+/*--------------------------------------------------------------------------------------
+License CC0 - http://creativecommons.org/publicdomain/zero/1.0/
+To the extent possible under law, the author(s) have dedicated all copyright and related and neighboring rights to this software to the public domain worldwide. This software is distributed without any warranty.
+----------------------------------------------------------------------------------------
+^This means do anything you want with this code. Because we are programmers, not lawyers.
+
+-Otavio Good
+
+<https://www.shadertoy.com/view/XljGDz>
+*/
+
+// Number of times the fractal repeats
+const uint RECURSION_LEVELS = 3;
+
+float localTime = 0.0;
+
+float PI=3.14159265;
+
+vec3 saturate(vec3 a) { return clamp(a, 0.0, 1.0); }
+vec2 saturate(vec2 a) { return clamp(a, 0.0, 1.0); }
+float saturate(float a) { return clamp(a, 0.0, 1.0); }
+
+vec3 RotateX(vec3 v, float rad)
+{
+  float cos = cos(rad);
+  float sin = sin(rad);
+  return vec3(v.x, cos * v.y + sin * v.z, -sin * v.y + cos * v.z);
+}
+vec3 RotateY(vec3 v, float rad)
+{
+  float cos = cos(rad);
+  float sin = sin(rad);
+  return vec3(cos * v.x - sin * v.z, v.y, sin * v.x + cos * v.z);
+}
+vec3 RotateZ(vec3 v, float rad)
+{
+  float cos = cos(rad);
+  float sin = sin(rad);
+  return vec3(cos * v.x + sin * v.y, -sin * v.x + cos * v.y, v.z);
+}
+
+// polynomial smooth min (k = 0.1);
+float smin( float a, float b, float k )
+{
+    float h = clamp( 0.5+0.5*(b-a)/k, 0.0, 1.0 );
+    return mix( b, a, h ) - k*h*(1.0-h);
+}
+
+vec2 matMin(vec2 a, vec2 b)
+{
+  if (a.x < b.x) return a;
+  else return b;
+}
+
+float spinTime;
+vec3 diagN = normalize(vec3(-1.0));
+float cut = 0.77;
+float inner = 0.333;
+float outness = 1.414;
+float finWidth;
+float teeth;
+float globalTeeth;
+
+vec2 sphereIter(vec3 p, float radius, float subA)
+{
+    finWidth = 0.1;
+    teeth = globalTeeth;
+    float blender = 0.25;
+    vec2 final = vec2(1000000.0, 0.0);
+    for (int i = 0; i < RECURSION_LEVELS; i++)
+    {
+        // main sphere
+        float d = length(p) - radius*outness;
+
+        // calc new position at 8 vertices of cube, scaled
+        vec3 corners = abs(p) + diagN * radius;
+        float lenCorners = length(corners);
+        // subtract out main sphere hole, mirrored on all axises
+        float subtracter = lenCorners - radius * subA;
+        // make mirrored fins that go through all vertices of the cube
+        vec3 ap = abs(-p) * 0.7071;	// 1/sqrt(2) to keep distance field normalized
+        subtracter = max(subtracter, -(abs(ap.x-ap.y) - finWidth));
+        subtracter = max(subtracter, -(abs(ap.y-ap.z) - finWidth));
+        subtracter = max(subtracter, -(abs(ap.z-ap.x) - finWidth));
+        // subtract sphere from fins so they don't intersect the inner spheres.
+        // also animate them so they are like teeth
+        subtracter = min(subtracter, lenCorners - radius * subA + teeth);
+        // smoothly subtract out that whole complex shape
+        d = -smin(-d, subtracter, blender);
+        //vec2 sphereDist = sphereB(abs(p) + diagN * radius, radius * inner, cut);	// recurse
+        // do a material-min with the last iteration
+        final = matMin(final, vec2(d, float(i)));
+
+        // Simple rotate 90 degrees on X axis to keep things fresh
+        p = vec3(corners.x, corners.z, -corners.y);
+        // Scale things for the next iteration / recursion-like-thing
+        radius *= inner;
+        teeth *= inner;
+        finWidth *= inner;
+        blender *= inner;
+    }
+    // Bring in the final smallest-sized sphere
+    float d = length(p) - radius*outness;
+    final = matMin(final, vec2(d, float(RECURSION_LEVELS)));
+    return final;
+}
+
+vec2 DistanceToObject(vec3 p)
+{
+    vec2 distMat = sphereIter(p, 5.2 / outness, cut);
+    return distMat;
+}
+
+// `dirVec` must be normalized first.
+float SphereIntersect(vec3 pos, vec3 dirVec, vec3 spherePos, float rad)
+{
+    vec3 radialVec = pos - spherePos;
+    float b = dot(radialVec, dirVec);
+    float c = dot(radialVec, radialVec) - rad * rad;
+    float h = b * b - c;
+    if (h < 0.0) {
+      return -1.0;
+    }
+    const float k = sqrt(h);
+
+    const float t_minus = -b - k;
+    if (t_minus > 0.0) {
+      return t_minus;
+    }
+    return -b + k;
+}
+
+void main() {
+  Sphere sphere = spheres.s[gl_InstanceCustomIndexEXT];
+
+  // Setup variables for ray-geometry intersection tests.
+  const vec3 d = gl_WorldRayDirectionEXT;
+  const vec3 p = gl_WorldRayOriginEXT;
+  const vec3 s = gl_ObjectToWorldEXT * vec4(sphere.center_radius.xyz, 1.0);
+  const float r = length(gl_ObjectToWorldEXT * vec4(sphere.center_radius.w * normalize(vec3(1)), 0.0));
+  const float instance_scale = r / 5.6;
+
+  // Remember the distance and material that is determined.
+  vec2 distAndMat = vec2(0.5, 0.0);
+  const int MAX_STEPS = 150;
+
+  // Intersect with sphere first as optimization so we don't ray march more than is needed.
+  float t = SphereIntersect(p, d, s, r);
+  if (t < 0.0) {
+    return;
+  }
+
+  // ----------------------------------- Animate ------------------------------------
+  float localTime = 0.5 * push_constants.time;
+  // This is a wave function like a triangle wave, but with flat tops and bottoms.
+  // period is 1.0
+  float rampStep = min(3.0,max(1.0, abs((fract(localTime)-0.5)*1.0)*8.0))*0.5-0.5;
+  rampStep = smoothstep(0.0, 1.0, rampStep);
+  // lopsided triangle wave - goes up for 3 time units, down for 1.
+  float step31 = (max(0.0, (fract(localTime+0.125)-0.25)) - min(0.0,(fract(localTime+0.125)-0.25))*3.0)*0.333;
+
+  spinTime = step31 + localTime;
+  globalTeeth = rampStep*0.99;
+  cut = max(0.48, min(0.77, localTime));
+  // --------------------------------------------------------------------------------
+
+  // Ray marching time.
+  vec3 c;
+  for (int i = 0; i < MAX_STEPS && abs(distAndMat.x) > 0.0075; i++) {
+    c = (p - s + t * d) / instance_scale;
+    if (length(c) > 8.0) {
+      return;
+    }
+
+    // *******************************************************
+    // This is _the_ function that defines the "distance field".
+    // It's really what makes the scene geometry.
+    // *******************************************************
+    distAndMat = DistanceToObject(c);
+    distAndMat.x *= instance_scale;
+
+    // Adjust by constant because deformations mess up distance function.
+    t += distAndMat.x * 0.5;
+  }
+  t -= distAndMat.x * 0.5;
+
+  // Use the gradient of the distance field to calculate the normal.
+  vec3 smallVec = vec3(0.002, 0, 0);
+  vec3 gradient = vec3(distAndMat.x - DistanceToObject(c - smallVec.xyy).x * instance_scale,
+                       distAndMat.x - DistanceToObject(c - smallVec.yxy).x * instance_scale,
+                       distAndMat.x - DistanceToObject(c - smallVec.yyx).x * instance_scale);
+  const vec3 normal = normalize(gradient);
+
+  // Convert the normal to spherical coordinates.
+  hit_attribute = vec2(atan(normal.y, normal.x), acos(normal.z));
+
+  // Report the intersection.
+  const uint material = uint(2*distAndMat.y);
+  reportIntersectionEXT(t, material*material*material);
+}

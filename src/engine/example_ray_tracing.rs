@@ -4,8 +4,9 @@ use crate::engine::utils::{
 
 use nalgebra_glm as glm;
 
-/// The maximum number of traversal iterations to allow before a ray must terminate.
-const MAX_RAY_RECURSION_DEPTH: u32 = 2;
+/// The maximum ray-recursion depth that the pipeline must support.
+/// Note that this is independent of the number of bounces in the ray-generation shader.
+const MAX_RAY_RECURSION_DEPTH: u32 = 3;
 
 /// The maximum number of textures that can be used in the ray tracing pipeline.
 const MAX_TEXTURES: u32 = 1024;
@@ -97,7 +98,7 @@ impl RayTracingShaders {
         let intersection = create_shader_module(
             device,
             inline_spirv::include_spirv!(
-                "src/shaders/raytracing/intersection_sphere.rint",
+                "src/shaders/raytracing/intersection_protophore.rint",
                 rint,
                 glsl,
                 vulkan1_2
@@ -662,13 +663,13 @@ fn create_mesh_data(
     queue: ash::vk::Queue,
 ) -> MeshGpuData {
     // Load the test model from memory.
-    static DUCK_BYTES: &[u8] = include_bytes!("../../assets/Duck.glb");
-    static PLANES_BYTES: &[u8] = include_bytes!("../../assets/Planes.glb");
-    // let bistro_bytes = std::fs::read("assets/Bistro.glb").expect("Failed to read Bistro.glb");
+    // static DUCK_BYTES: &[u8] = include_bytes!("../../assets/Duck.glb");
+    // static PLANES_BYTES: &[u8] = include_bytes!("../../assets/Planes.glb");
+    let bistro_bytes = std::fs::read("assets/Bistro.glb").expect("Failed to read Bistro.glb");
     let (test_gltf, gltf_buffers, gltf_images) = {
         // gltf::import_slice(DUCK_BYTES).expect("Failed to load test GLB model")
-        gltf::import_slice(PLANES_BYTES).expect("Failed to load test GLB model")
-        // gltf::import_slice(bistro_bytes).expect("Failed to load test GLB model")
+        // gltf::import_slice(PLANES_BYTES).expect("Failed to load test GLB model")
+        gltf::import_slice(bistro_bytes).expect("Failed to load test GLB model")
     };
 
     // Create a sampler for each sampler description in the model.
@@ -1126,17 +1127,17 @@ fn create_procedural_bottom_acceleration_structure(
     // Define the position data of our axis-aligned bounding box.
     // TODO: Consider using stride to merge the procedural data buffer with this buffer.
     let bounding_boxes = [ash::vk::AabbPositionsKHR {
-        min_x: -1.0,
-        min_y: -1.0,
-        min_z: -1.0,
-        max_x: 1.0,
-        max_y: 1.0,
-        max_z: 1.0,
+        min_x: -5.6,
+        min_y: -5.6,
+        min_z: -5.6,
+        max_x: 5.6,
+        max_y: 5.6,
+        max_z: 5.6,
     }];
     let spheres = [ProceduralGpuData {
         center: glm::Vec3::new(0., 0., 0.),
-        radius: 1.,
-        color: glm::Vec4::new(1., 0., 0., 1.),
+        radius: 5.6,
+        color: glm::Vec4::new(0.8, 0.1, 0.7, 1.),
     }];
     let staging_size =
         std::mem::size_of_val(&bounding_boxes) as u64 + std::mem::size_of_val(&spheres) as u64;
@@ -1344,11 +1345,6 @@ impl DescriptorSetLayouts {
             .stage_flags(
                 ash::vk::ShaderStageFlags::ANY_HIT_KHR | ash::vk::ShaderStageFlags::CLOSEST_HIT_KHR,
             );
-        // let sphere_binding = ash::vk::DescriptorSetLayoutBinding::default()
-        //     .binding(3)
-        //     .descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER)
-        //     .descriptor_count(1)
-        //     .stage_flags(ash::vk::ShaderStageFlags::INTERSECTION_KHR);
         let model_data = unsafe {
             device.create_descriptor_set_layout(
                 &ash::vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
@@ -1395,8 +1391,10 @@ fn create_pipeline_layout(
     device: &ash::Device,
     descriptor_set_layouts: &DescriptorSetLayouts,
 ) -> ash::vk::PipelineLayout {
+    let push_constant_stages =
+        ash::vk::ShaderStageFlags::RAYGEN_KHR | ash::vk::ShaderStageFlags::INTERSECTION_KHR;
     let push_constant_range = ash::vk::PushConstantRange::default()
-        .stage_flags(ash::vk::ShaderStageFlags::RAYGEN_KHR)
+        .stage_flags(push_constant_stages)
         .size(std::mem::size_of::<PushConstants>() as u32);
 
     unsafe {
@@ -1819,7 +1817,6 @@ impl Descriptors {
 
         // Destroy the instances buffers.
         self.instance_geometries.destroy(device, allocator);
-        // self.procedural_instances.destroy(device, allocator);
     }
 }
 
@@ -1985,15 +1982,6 @@ where
         .descriptor_type(ash::vk::DescriptorType::SAMPLER)
         .image_info(&samplers_info);
 
-    // let procedural_instances_info = [ash::vk::DescriptorBufferInfo::default()
-    //     .buffer(procedural_instances.buffer)
-    //     .range(std::mem::size_of::<ProceduralGpuData>() as u64 * procedural_instance_count as u64)];
-    // let procedural_instances_write = ash::vk::WriteDescriptorSet::default()
-    //     .dst_set(model_data_set)
-    //     .dst_binding(3)
-    //     .descriptor_type(ash::vk::DescriptorType::STORAGE_BUFFER)
-    //     .buffer_info(&procedural_instances_info);
-
     // Set the update data for each output image.
     let image_info = output_images
         .iter()
@@ -2076,6 +2064,13 @@ impl ExampleRayTracing {
         extent: ash::vk::Extent2D,
         properties: &ash::vk::PhysicalDeviceRayTracingPipelinePropertiesKHR,
     ) -> Self {
+        #[cfg(debug_assertions)]
+        assert!(
+            MAX_RAY_RECURSION_DEPTH <= properties.max_ray_recursion_depth,
+            "The device does not support the required ray recursion depth"
+        );
+
+        // Load the mesh data into host and device memory.
         let mesh = create_mesh_data(
             device,
             pageable_device_local_memory,
@@ -2138,17 +2133,19 @@ impl ExampleRayTracing {
         let procedural_instance = create_acceleration_instance(
             procedural_bottom_acceleration.device_address(),
             ash::vk::TransformMatrixKHR {
-                matrix: [0.6, 0., 0., -1.2, 0., 0.6, 0., -0.5, 0., 0., 0.6, -1.2],
+                matrix: [0.2, 0., 0., -6., 0., 0.2, 0., 1.5, 0., 0., 0.2, 4.5],
+                // matrix: [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0.],
             },
             1,
             1,
         );
 
+        // Define the instances that will be included in the top-level acceleration structure.
         let (acceleration_instances, instance_geometries) = (
             [
                 mesh_instance,
-                mesh_instance_1,
-                mesh_instance_2,
+                // mesh_instance_1,
+                // mesh_instance_2,
                 procedural_instance,
             ],
             [mesh.geometry_node_address, procedural_geometries_address],
@@ -2159,6 +2156,10 @@ impl ExampleRayTracing {
         // );
         // let (acceleration_instances, instance_geometries) =
         //     ([mesh_instance], [mesh.geometry_node_address]);
+        /*let (acceleration_instances, instance_geometries) = (
+            [procedural_instance],
+            [mesh.geometry_node_address, procedural_geometries_address],
+        );*/
 
         // Create a buffer pointing to the geometry nodes of each instance in the top-level acceleration structure.
         let mesh_instances_buffer = create_instances_buffer(
@@ -2338,7 +2339,7 @@ impl ExampleRayTracing {
             device.cmd_push_constants(
                 command_buffer,
                 self.pipeline.layout,
-                ash::vk::ShaderStageFlags::RAYGEN_KHR,
+                ash::vk::ShaderStageFlags::RAYGEN_KHR | ash::vk::ShaderStageFlags::INTERSECTION_KHR,
                 0,
                 utils::data_byte_slice(push_constants),
             );
