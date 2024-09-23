@@ -7,6 +7,7 @@ use smallvec::SmallVec;
 use strum::EnumCount as _;
 
 pub mod buffers;
+pub mod cmd;
 pub mod fxaa_pass;
 pub mod ray_tracing;
 pub mod swapchain;

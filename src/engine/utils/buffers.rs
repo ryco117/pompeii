@@ -191,42 +191,22 @@ pub fn new_data_buffer(
         name,
     )?;
 
-    // Allocate and begin a new command buffer for a one-time copy operation.
-    let command_buffer = unsafe {
-        device.allocate_command_buffers(&ash::vk::CommandBufferAllocateInfo {
-            command_pool,
-            level: ash::vk::CommandBufferLevel::PRIMARY,
-            command_buffer_count: 1,
-            ..Default::default()
-        })?
-    }[0];
-    unsafe {
-        device.begin_command_buffer(
-            command_buffer,
-            &ash::vk::CommandBufferBeginInfo::default()
-                .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )?;
-    }
-
     // Copy the data from the staging buffer to the device-local buffer.
-    unsafe {
-        device.cmd_copy_buffer(
-            command_buffer,
-            staging_buffer.buffer(),
-            device_buffer.buffer,
-            &[ash::vk::BufferCopy {
-                src_offset: staging_offset as u64,
-                dst_offset: 0,
-                size: data.len() as u64,
-            }],
-        );
+    let (command_buffer, fence) =
+        super::cmd::submit_single_shot(device, command_pool, queue, |command_buffer| unsafe {
+            device.cmd_copy_buffer(
+                command_buffer,
+                staging_buffer.buffer(),
+                device_buffer.buffer,
+                &[ash::vk::BufferCopy {
+                    src_offset: staging_offset as u64,
+                    dst_offset: 0,
+                    size: data.len() as u64,
+                }],
+            );
+        })?;
 
-        // End the command buffer.
-        device.end_command_buffer(command_buffer)?;
-    }
-
-    // Create a fence so that the caller can wait for the copy operation to finish.
-    let fence = unsafe { device.create_fence(&ash::vk::FenceCreateInfo::default(), None)? };
+    // Create a `CleanableFence` so that the caller can free the command buffer when available.
     let cleanable_fence = super::CleanableFence::new(
         fence,
         Some(Box::new(move |device, _| unsafe {
@@ -234,23 +214,12 @@ pub fn new_data_buffer(
         })),
     );
 
-    // Submit the copy command buffer.
-    unsafe {
-        device.queue_submit(
-            queue,
-            &[ash::vk::SubmitInfo::default().command_buffers(&[command_buffer])],
-            fence,
-        )?;
-    }
-
     Ok((device_buffer, cleanable_fence))
 }
 
 /// Update the contents of a device-local buffer with the given data.
 /// # Note
 /// The caller is responsible for ensuring that the fence is waited on and destroyed.
-/// # Safety
-/// If a `pageable_device_local_memory` is provided, the `f32` value must be in the range [0, 1] representing a priority with `1` being the greatest.
 pub fn update_device_local(
     device: &ash::Device,
     command_pool: ash::vk::CommandPool,
@@ -260,6 +229,40 @@ pub fn update_device_local(
     staging_buffer: &mut StagingBuffer,
     staging_offset: Option<usize>,
 ) -> Result<super::CleanableFence, ash::vk::Result> {
+    let (command_buffer, fence) =
+        super::cmd::submit_single_shot(device, command_pool, queue, |command_buffer| {
+            // Copy the data from the staging buffer to the device-local buffer.
+            record_device_local_update(
+                device,
+                command_buffer,
+                buffer,
+                data,
+                staging_buffer,
+                staging_offset,
+            );
+        })?;
+
+    // Create a `CleanableFence` so that the caller can free this command buffer when available.
+    let cleanable_fence = super::CleanableFence::new(
+        fence,
+        Some(Box::new(move |device, _| unsafe {
+            device.free_command_buffers(command_pool, &[command_buffer]);
+        })),
+    );
+
+    Ok(cleanable_fence)
+}
+
+/// Record the commands to update a device-local buffer with the given data and host-visible
+/// staging buffer.
+pub fn record_device_local_update(
+    device: &ash::Device,
+    command_buffer: ash::vk::CommandBuffer,
+    buffer: &BufferAllocation,
+    data: &[u8],
+    staging_buffer: &mut StagingBuffer,
+    staging_offset: Option<usize>,
+) {
     // Copy the data into the staging buffer.
     let staging_slice = staging_buffer
         .allocation_mut()
@@ -269,23 +272,6 @@ pub fn update_device_local(
     // Use the caller provided offset into the staging buffer if one was provided.
     let staging_offset = staging_offset.unwrap_or(0);
     staging_slice[staging_offset..(staging_offset + data.len())].copy_from_slice(data);
-
-    // Allocate and begin a new command buffer for a one-time copy operation.
-    let command_buffer = unsafe {
-        device.allocate_command_buffers(&ash::vk::CommandBufferAllocateInfo {
-            command_pool,
-            level: ash::vk::CommandBufferLevel::PRIMARY,
-            command_buffer_count: 1,
-            ..Default::default()
-        })?
-    }[0];
-    unsafe {
-        device.begin_command_buffer(
-            command_buffer,
-            &ash::vk::CommandBufferBeginInfo::default()
-                .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )?;
-    }
 
     // Copy the data from the staging buffer to the device-local buffer.
     unsafe {
@@ -299,28 +285,5 @@ pub fn update_device_local(
                 size: data.len() as u64,
             }],
         );
-
-        // End the command buffer.
-        device.end_command_buffer(command_buffer)?;
     }
-
-    // Create a fence so that the caller can wait for the copy operation to finish.
-    let fence = unsafe { device.create_fence(&ash::vk::FenceCreateInfo::default(), None)? };
-    let cleanable_fence = super::CleanableFence::new(
-        fence,
-        Some(Box::new(move |device, _| unsafe {
-            device.free_command_buffers(command_pool, &[command_buffer]);
-        })),
-    );
-
-    // Submit the copy command buffer.
-    unsafe {
-        device.queue_submit(
-            queue,
-            &[ash::vk::SubmitInfo::default().command_buffers(&[command_buffer])],
-            fence,
-        )?;
-    }
-
-    Ok(cleanable_fence)
 }

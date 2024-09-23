@@ -934,7 +934,7 @@ fn create_bottom_level_acceleration_structure(
         .unzip::<_, _, Vec<_>, Vec<_>>();
 
     // Describe the total geometry of the acceleration structure to be built.
-    let build_info = ash::vk::AccelerationStructureBuildGeometryInfoKHR::default()
+    let build_geometry_info = ash::vk::AccelerationStructureBuildGeometryInfoKHR::default()
         .ty(ash::vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
         .flags(ash::vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
         .mode(ash::vk::BuildAccelerationStructureModeKHR::BUILD)
@@ -952,7 +952,7 @@ fn create_bottom_level_acceleration_structure(
     unsafe {
         acceleration_device.get_acceleration_structure_build_sizes(
             ash::vk::AccelerationStructureBuildTypeKHR::DEVICE,
-            &build_info,
+            &build_geometry_info,
             &geometry_counts,
             &mut acceleration_build_size,
         );
@@ -1055,9 +1055,12 @@ fn create_top_level_acceleration_structure(
     };
 
     // Describe the total geometry of the acceleration structure to be built.
-    let geometry_info = ash::vk::AccelerationStructureBuildGeometryInfoKHR::default()
+    let build_geometry_info = ash::vk::AccelerationStructureBuildGeometryInfoKHR::default()
         .ty(ash::vk::AccelerationStructureTypeKHR::TOP_LEVEL)
-        .flags(ash::vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+        .flags(
+            ash::vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE
+                | ash::vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE,
+        )
         .mode(ash::vk::BuildAccelerationStructureModeKHR::BUILD)
         .geometries(std::slice::from_ref(&acceleration_geometry_instances));
 
@@ -1066,7 +1069,7 @@ fn create_top_level_acceleration_structure(
         let mut build_sizes = ash::vk::AccelerationStructureBuildSizesInfoKHR::default();
         acceleration_device.get_acceleration_structure_build_sizes(
             ash::vk::AccelerationStructureBuildTypeKHR::DEVICE,
-            &geometry_info,
+            &build_geometry_info,
             &[instance_count],
             &mut build_sizes,
         );
@@ -1089,7 +1092,7 @@ fn create_top_level_acceleration_structure(
         allocator,
         &acceleration_build_sizes,
         &scratch_buffer,
-        &acceleration_geometry_instances,
+        build_geometry_info,
         instance_count,
         command_pool,
         queue,

@@ -246,45 +246,20 @@ impl AccelerationStructure {
             })
             .collect::<Vec<_>>();
 
-        // Create a one-time command buffer to build the acceleration structure.
-        let command_buffer = unsafe {
-            device.allocate_command_buffers(
-                &ash::vk::CommandBufferAllocateInfo::default()
-                    .command_pool(command_pool)
-                    .level(ash::vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }
-        .expect("Unable to allocate command buffer")[0];
-        unsafe {
-            device.begin_command_buffer(
-                command_buffer,
-                &ash::vk::CommandBufferBeginInfo::default()
-                    .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            ).expect("Failed to begin command buffer for building bottom-level acceleration structure");
-        }
-
         // Build the acceleration structure.
-        unsafe {
-            acceleration_device.cmd_build_acceleration_structures(
-                command_buffer,
-                &[build_geometry_info],
-                &[&build_range_infos],
-            );
-            device.end_command_buffer(command_buffer).expect(
-                "Failed to end command buffer for building bottom-level acceleration structure",
-            );
-        }
-        let fence = unsafe { device.create_fence(&ash::vk::FenceCreateInfo::default(), None) }
-            .expect("Failed to create acceleration structure build fence");
-        unsafe {
-            device.queue_submit(
-                queue,
-                &[ash::vk::SubmitInfo::default().command_buffers(&[command_buffer])],
-                fence,
-            )
-        }
-        .expect("Failed to submit acceleration structure build command buffer");
+        let (command_buffer, fence) = super::cmd::submit_single_shot(
+            device,
+            command_pool,
+            queue,
+            move |command_buffer| unsafe {
+                acceleration_device.cmd_build_acceleration_structures(
+                    command_buffer,
+                    &[build_geometry_info],
+                    &[&build_range_infos],
+                );
+            },
+        )
+        .expect("Failed to build bottom-level acceleration structure");
 
         // Wait for the build to complete.
         // TODO: Allow the caller to wait for the build to complete as needed.
@@ -316,7 +291,7 @@ impl AccelerationStructure {
         allocator: &mut gpu_allocator::vulkan::Allocator,
         build_size: &ash::vk::AccelerationStructureBuildSizesInfoKHR,
         scratch_buffer: &ScratchBuffer,
-        instance_geometry: &ash::vk::AccelerationStructureGeometryKHR,
+        mut build_geometry_info: ash::vk::AccelerationStructureBuildGeometryInfoKHR,
         instance_count: u32,
         command_pool: ash::vk::CommandPool,
         queue: ash::vk::Queue,
@@ -348,12 +323,9 @@ impl AccelerationStructure {
             )
         };
 
-        let build_geometry_info = ash::vk::AccelerationStructureBuildGeometryInfoKHR::default()
-            .ty(ash::vk::AccelerationStructureTypeKHR::TOP_LEVEL)
-            .flags(ash::vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
-            .mode(ash::vk::BuildAccelerationStructureModeKHR::BUILD)
+        // Update the build info to point to the newly created acceleration and scratch buffers.
+        build_geometry_info = build_geometry_info
             .dst_acceleration_structure(acceleration_structure)
-            .geometries(std::slice::from_ref(instance_geometry))
             .scratch_data(ash::vk::DeviceOrHostAddressKHR {
                 device_address: scratch_buffer.device_address(),
             });
@@ -364,50 +336,20 @@ impl AccelerationStructure {
         let build_range_info = ash::vk::AccelerationStructureBuildRangeInfoKHR::default()
             .primitive_count(instance_count);
 
-        // Create a one-time command buffer to build the acceleration structure.
-        // TODO: Create a utils function or type for single-shot command buffers.
-        let command_buffer = unsafe {
-            device.allocate_command_buffers(
-                &ash::vk::CommandBufferAllocateInfo::default()
-                    .command_pool(command_pool)
-                    .level(ash::vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }
-        .expect("Unable to allocate command buffer")[0];
-        unsafe {
-            device
-                .begin_command_buffer(
-                    command_buffer,
-                    &ash::vk::CommandBufferBeginInfo::default()
-                        .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
-                .expect(
-                    "Failed to begin command buffer for building top-level acceleration structure",
-                );
-        }
-
         // Build the acceleration structure.
-        unsafe {
-            acceleration_device.cmd_build_acceleration_structures(
-                command_buffer,
-                &[build_geometry_info],
-                &[std::slice::from_ref(&build_range_info)],
-            );
-            device.end_command_buffer(command_buffer).expect(
-                "Failed to end command buffer for building top-level acceleration structure",
-            );
-        }
-        let fence = unsafe { device.create_fence(&ash::vk::FenceCreateInfo::default(), None) }
-            .expect("Failed to create acceleration structure build fence");
-        unsafe {
-            device.queue_submit(
-                queue,
-                &[ash::vk::SubmitInfo::default().command_buffers(&[command_buffer])],
-                fence,
-            )
-        }
-        .expect("Failed to submit acceleration structure build command buffer");
+        let (command_buffer, fence) = super::cmd::submit_single_shot(
+            device,
+            command_pool,
+            queue,
+            move |command_buffer| unsafe {
+                acceleration_device.cmd_build_acceleration_structures(
+                    command_buffer,
+                    &[build_geometry_info],
+                    &[std::slice::from_ref(&build_range_info)],
+                );
+            },
+        )
+        .expect("Failed to build top-level acceleration structure");
 
         // Wait for the build to complete.
         // TODO: Allow the caller to wait for the build to complete as needed.
@@ -422,6 +364,50 @@ impl AccelerationStructure {
             handle: acceleration_structure,
             device_address,
             buffer: acceleration_buffer,
+        }
+    }
+
+    /// Record a command to update a top-level acceleration structure with new instance data.
+    pub fn record_top_level_update(
+        &self,
+        acceleration_device: &ash::khr::acceleration_structure::Device,
+        scratch_buffer: &ScratchBuffer,
+        instance_geometry_data: ash::vk::AccelerationStructureGeometryInstancesDataKHR,
+        instance_count: u32,
+        command_buffer: ash::vk::CommandBuffer,
+        geometry_flags: ash::vk::GeometryFlagsKHR,
+        build_preferences: ash::vk::BuildAccelerationStructureFlagsKHR,
+    ) {
+        // Describe the instance geometry data.
+        let instance_geometry_data = ash::vk::AccelerationStructureGeometryDataKHR {
+            instances: instance_geometry_data,
+        };
+        let instance_geometry = ash::vk::AccelerationStructureGeometryKHR::default()
+            .geometry_type(ash::vk::GeometryTypeKHR::INSTANCES)
+            .geometry(instance_geometry_data)
+            .flags(geometry_flags);
+
+        // Update the acceleration structure.
+        let build_geometry_info = ash::vk::AccelerationStructureBuildGeometryInfoKHR::default()
+            .ty(ash::vk::AccelerationStructureTypeKHR::TOP_LEVEL)
+            .flags(build_preferences)
+            .mode(ash::vk::BuildAccelerationStructureModeKHR::UPDATE)
+            .src_acceleration_structure(self.handle)
+            .dst_acceleration_structure(self.handle) // NOTE: The destination may be the same or different. In this simplification, they are always equal.
+            .geometries(std::slice::from_ref(&instance_geometry))
+            .scratch_data(ash::vk::DeviceOrHostAddressKHR {
+                device_address: scratch_buffer.device_address(),
+            });
+
+        unsafe {
+            acceleration_device.cmd_build_acceleration_structures(
+                command_buffer,
+                &[build_geometry_info],
+                &[std::slice::from_ref(
+                    &ash::vk::AccelerationStructureBuildRangeInfoKHR::default()
+                        .primitive_count(instance_count),
+                )],
+            );
         }
     }
 

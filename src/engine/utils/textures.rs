@@ -78,96 +78,61 @@ pub fn copy_buffer_to_image(
     let staging_offset = staging_offset.unwrap_or(0);
     staging_slice[staging_offset..(staging_offset + data.len())].copy_from_slice(data);
 
-    // Allocate and begin a new command buffer for a one-time copy operation.
-    let command_buffer = unsafe {
-        device.allocate_command_buffers(&ash::vk::CommandBufferAllocateInfo {
-            command_pool,
-            level: ash::vk::CommandBufferLevel::PRIMARY,
-            command_buffer_count: 1,
-            ..Default::default()
-        })?
-    }[0];
-    unsafe {
-        device.begin_command_buffer(
-            command_buffer,
-            &ash::vk::CommandBufferBeginInfo::default()
-                .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )?;
+    let (command_buffer, fence) =
+        super::cmd::submit_single_shot(device, command_pool, queue, |command_buffer| {
+            unsafe {
+                // Transition the image layout to `TRANSFER_DST_OPTIMAL`.
+                record_image_layout_transition(
+                    device,
+                    command_buffer,
+                    image,
+                    ash::vk::ImageLayout::UNDEFINED,
+                    ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    ash::vk::PipelineStageFlags2::NONE,
+                    ash::vk::AccessFlags2::NONE,
+                    ash::vk::PipelineStageFlags2::TRANSFER,
+                    ash::vk::AccessFlags2::TRANSFER_WRITE,
+                    ash::vk::DependencyFlags::BY_REGION,
+                );
 
-        // Transition the image layout to `TRANSFER_DST_OPTIMAL`.
-        let image_barrier = ash::vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(ash::vk::PipelineStageFlags2::NONE)
-            .src_access_mask(ash::vk::AccessFlags2::NONE)
-            .dst_stage_mask(ash::vk::PipelineStageFlags2::TRANSFER)
-            .dst_access_mask(ash::vk::AccessFlags2::TRANSFER_WRITE)
-            .old_layout(ash::vk::ImageLayout::UNDEFINED)
-            .new_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
-            .image(image)
-            .subresource_range(ash::vk::ImageSubresourceRange {
-                aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-        device.cmd_pipeline_barrier2(
-            command_buffer,
-            &ash::vk::DependencyInfo::default()
-                .dependency_flags(ash::vk::DependencyFlags::BY_REGION)
-                .image_memory_barriers(&[image_barrier]),
-        );
+                // Copy the data from the staging buffer to the image.
+                device.cmd_copy_buffer_to_image(
+                    command_buffer,
+                    staging_buffer.buffer(),
+                    image,
+                    ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[ash::vk::BufferImageCopy::default()
+                        .buffer_offset(staging_offset as u64)
+                        .image_subresource(ash::vk::ImageSubresourceLayers {
+                            aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .image_extent(ash::vk::Extent3D {
+                            width: extent.width,
+                            height: extent.height,
+                            depth: 1,
+                        })],
+                );
 
-        // Copy the data from the staging buffer to the image.
-        device.cmd_copy_buffer_to_image(
-            command_buffer,
-            staging_buffer.buffer(),
-            image,
-            ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &[ash::vk::BufferImageCopy::default()
-                .buffer_offset(staging_offset as u64)
-                .image_subresource(ash::vk::ImageSubresourceLayers {
-                    aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .image_extent(ash::vk::Extent3D {
-                    width: extent.width,
-                    height: extent.height,
-                    depth: 1,
-                })],
-        );
+                // Transition the image layout to the provided layout.
+                record_image_layout_transition(
+                    device,
+                    command_buffer,
+                    image,
+                    ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    desired_image_layout,
+                    ash::vk::PipelineStageFlags2::TRANSFER,
+                    ash::vk::AccessFlags2::TRANSFER_WRITE,
+                    ash::vk::PipelineStageFlags2::NONE,
+                    ash::vk::AccessFlags2::NONE,
+                    ash::vk::DependencyFlags::empty(),
+                );
+            }
+        })?;
 
-        // Transition the image layout to the provided layout.
-        let image_barrier = ash::vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(ash::vk::PipelineStageFlags2::TRANSFER)
-            .src_access_mask(ash::vk::AccessFlags2::TRANSFER_WRITE)
-            .dst_stage_mask(ash::vk::PipelineStageFlags2::NONE)
-            .dst_access_mask(ash::vk::AccessFlags2::NONE)
-            .old_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(desired_image_layout)
-            .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
-            .image(image)
-            .subresource_range(ash::vk::ImageSubresourceRange {
-                aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-        device.cmd_pipeline_barrier2(
-            command_buffer,
-            &ash::vk::DependencyInfo::default().image_memory_barriers(&[image_barrier]),
-        );
-
-        device.end_command_buffer(command_buffer)?;
-    }
-
-    // Create a fence so that the caller can wait for the copy operation to finish.
-    let fence = unsafe { device.create_fence(&ash::vk::FenceCreateInfo::default(), None)? };
+    // Create a `CleanableFence` so that the caller can free the command buffer when available.
     let cleanable_fence = super::CleanableFence::new(
         fence,
         Some(Box::new(move |device, _| unsafe {
@@ -175,14 +140,45 @@ pub fn copy_buffer_to_image(
         })),
     );
 
-    // Submit the copy command buffer.
-    unsafe {
-        device.queue_submit(
-            queue,
-            &[ash::vk::SubmitInfo::default().command_buffers(&[command_buffer])],
-            fence,
-        )?;
-    }
-
     Ok(cleanable_fence)
+}
+
+/// Helper to record an image layout transition in a command buffer.
+pub fn record_image_layout_transition(
+    device: &ash::Device,
+    command_buffer: ash::vk::CommandBuffer,
+    image: ash::vk::Image,
+    old_layout: ash::vk::ImageLayout,
+    new_layout: ash::vk::ImageLayout,
+    src_stage_mask: ash::vk::PipelineStageFlags2,
+    src_access_mask: ash::vk::AccessFlags2,
+    dst_stage_mask: ash::vk::PipelineStageFlags2,
+    dst_access_mask: ash::vk::AccessFlags2,
+    dependency_flags: ash::vk::DependencyFlags,
+) {
+    let image_barrier = ash::vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(src_stage_mask)
+        .src_access_mask(src_access_mask)
+        .dst_stage_mask(dst_stage_mask)
+        .dst_access_mask(dst_access_mask)
+        .old_layout(old_layout)
+        .new_layout(new_layout)
+        .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(ash::vk::ImageSubresourceRange {
+            aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    unsafe {
+        device.cmd_pipeline_barrier2(
+            command_buffer,
+            &ash::vk::DependencyInfo::default()
+                .dependency_flags(dependency_flags)
+                .image_memory_barriers(&[image_barrier]),
+        );
+    }
 }

@@ -151,8 +151,8 @@ void main() {
   float light_intensity = 1.0;
 
   // Trace a ray to determine if this point is in the direct light's shadow.
-  in_shadow = true; // Set to true because the miss shader wil set it to `false` if the ray hits the direct light source.
-  uint trace_flags = gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT;
+  in_shadow = true; // Set to true because the miss shader will set it to `false` if the ray hits the direct light source.
+  const uint trace_flags = gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT;
   const uint miss_shader_index = 1;
   const int payload_index = 1;
   traceRayEXT(
