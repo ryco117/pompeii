@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use super::shaders::ENTRY_POINT_MAIN;
 
 /// Shader for texture-mapping the entire screen. Useful for post-processing and fullscreen effects.
@@ -179,7 +181,7 @@ impl FxaaPass {
     /// Create a new FXAA render pass and associated resources.
     pub fn new(
         device: &ash::Device,
-        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+        memory_allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
         extent: ash::vk::Extent2D,
         swapchain_format: ash::vk::Format,
         destination_views: &[ash::vk::ImageView],
@@ -250,7 +252,7 @@ impl FxaaPass {
     pub fn destroy(
         &mut self,
         device: &ash::Device,
-        allocator: &mut gpu_allocator::vulkan::Allocator,
+        allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     ) {
         // Destroy the descriptor pool and descriptor sets.
         unsafe {
@@ -268,6 +270,8 @@ impl FxaaPass {
             unsafe { device.destroy_image_view(image_view, None) };
             unsafe { device.destroy_image(image, None) };
             allocator
+                .lock()
+                .expect("Failed to lock allocator in `FxaaPass::destroy`")
                 .free(allocation)
                 .expect("Failed to free FXAA image allocation");
         }
@@ -335,7 +339,7 @@ impl FxaaPass {
     /// Create new framebuffers that will be used during the FXAA render.
     fn create_framebuffers(
         device: &ash::Device,
-        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+        memory_allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
         extent: ash::vk::Extent2D,
         swapchain_format: ash::vk::Format,
         destination_views: &[ash::vk::ImageView],
@@ -554,7 +558,7 @@ impl FxaaPass {
     pub fn recreate_framebuffers(
         &mut self,
         device: &ash::Device,
-        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+        memory_allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
         extent: ash::vk::Extent2D,
         image_format: ash::vk::Format,
         destination_views: &[ash::vk::ImageView],
@@ -574,6 +578,8 @@ impl FxaaPass {
             unsafe { device.destroy_image_view(image_view, None) };
             unsafe { device.destroy_image(image, None) };
             memory_allocator
+                .lock()
+                .expect("Failed to lock allocator in `FxaaPass::recreate_framebuffers`")
                 .free(allocation)
                 .expect("Failed to free FXAA image allocation");
         }

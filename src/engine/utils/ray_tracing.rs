@@ -1,4 +1,4 @@
-use std::ffi::c_void;
+use std::{ffi::c_void, sync::Mutex};
 
 use super::{buffers, EnginePhysicalDeviceFeatures, FIVE_SECONDS_IN_NANOSECONDS};
 
@@ -45,7 +45,7 @@ impl ScratchBuffer {
     pub fn new(
         device: &ash::Device,
         pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
-        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+        memory_allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
         build_scratch_size: u64,
     ) -> Self {
         let buffer_allocation = buffers::new_device_local(
@@ -80,7 +80,7 @@ impl ScratchBuffer {
     pub fn destroy(
         self,
         device: &ash::Device,
-        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+        memory_allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     ) {
         self.buffer_allocation.destroy(device, memory_allocator);
     }
@@ -97,42 +97,41 @@ impl ScratchBuffer {
     }
 }
 
-/// A struct ensuring that the `geometries` slice and the `geometry_counts` slice that describes it are the same length.
-/// This is necessary for building both top and bottom level acceleration structures.
-pub struct InstancedGeometries<'a, 'b> {
-    geometries: &'a [ash::vk::AccelerationStructureGeometryKHR<'b>],
+/// A struct ensuring that the `geometries` slice of the `build_info` and the `geometry_counts` slice that describes it are the same length.
+pub struct InstancedGeometries<'a> {
+    build_info: ash::vk::AccelerationStructureBuildGeometryInfoKHR<'a>,
     geometry_counts: &'a [u32],
 }
 #[derive(Debug)]
 pub enum InstancedGeometriesError {
     MismatchedSliceLengths,
 }
-impl<'a, 'b> InstancedGeometries<'a, 'b> {
+impl<'a> InstancedGeometries<'a> {
     /// Create a new list of instanced geometries.
     /// Returns an error if the slices are not the same length.
     pub fn new(
-        geometries: &'a [ash::vk::AccelerationStructureGeometryKHR<'b>],
+        build_info: ash::vk::AccelerationStructureBuildGeometryInfoKHR<'a>,
         geometry_counts: &'a [u32],
     ) -> Result<Self, InstancedGeometriesError> {
-        if geometries.len() != geometry_counts.len() {
+        if build_info.geometry_count as usize != geometry_counts.len() {
             return Err(InstancedGeometriesError::MismatchedSliceLengths);
         }
 
         Ok(Self {
-            geometries,
+            build_info,
             geometry_counts,
         })
     }
 
     // Getters.
-    pub fn geometries(&self) -> &'a [ash::vk::AccelerationStructureGeometryKHR<'b>] {
-        self.geometries
+    pub fn build_info(&self) -> &ash::vk::AccelerationStructureBuildGeometryInfoKHR {
+        &self.build_info
     }
     pub fn geometry_counts(&self) -> &'a [u32] {
         self.geometry_counts
     }
     pub fn len(&self) -> usize {
-        self.geometries.len()
+        self.geometry_counts.len()
     }
 }
 
@@ -143,7 +142,7 @@ impl AccelerationBuffer {
     pub fn new(
         device: &ash::Device,
         pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
-        allocator: &mut gpu_allocator::vulkan::Allocator,
+        allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
         build_sizes: &ash::vk::AccelerationStructureBuildSizesInfoKHR,
     ) -> Self {
         // Create the acceleration structure buffer.
@@ -166,7 +165,11 @@ impl AccelerationBuffer {
     }
 
     /// Destroy the acceleration buffer and memory.
-    pub fn destroy(self, device: &ash::Device, allocator: &mut gpu_allocator::vulkan::Allocator) {
+    pub fn destroy(
+        self,
+        device: &ash::Device,
+        allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
+    ) {
         self.0.destroy(device, allocator);
     }
 
@@ -193,7 +196,7 @@ impl AccelerationStructure {
         device: &ash::Device,
         acceleration_device: &ash::khr::acceleration_structure::Device,
         pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
-        allocator: &mut gpu_allocator::vulkan::Allocator,
+        allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
         build_size: &ash::vk::AccelerationStructureBuildSizesInfoKHR,
         scratch_buffer: &ScratchBuffer,
         geometry: InstancedGeometries,
@@ -227,12 +230,10 @@ impl AccelerationStructure {
             )
         };
 
-        let build_geometry_info = ash::vk::AccelerationStructureBuildGeometryInfoKHR::default()
-            .ty(ash::vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-            .flags(ash::vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
-            .mode(ash::vk::BuildAccelerationStructureModeKHR::BUILD)
+        // Update the build info to point to the newly created acceleration and scratch buffers.
+        let build_geometry_info = geometry
+            .build_info()
             .dst_acceleration_structure(acceleration_structure)
-            .geometries(geometry.geometries())
             .scratch_data(ash::vk::DeviceOrHostAddressKHR {
                 device_address: scratch_buffer.device_address(),
             });
@@ -288,7 +289,7 @@ impl AccelerationStructure {
         device: &ash::Device,
         acceleration_device: &ash::khr::acceleration_structure::Device,
         pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
-        allocator: &mut gpu_allocator::vulkan::Allocator,
+        allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
         build_size: &ash::vk::AccelerationStructureBuildSizesInfoKHR,
         scratch_buffer: &ScratchBuffer,
         mut build_geometry_info: ash::vk::AccelerationStructureBuildGeometryInfoKHR,
@@ -424,7 +425,7 @@ impl AccelerationStructure {
         self,
         device: &ash::Device,
         acceleration_device: &ash::khr::acceleration_structure::Device,
-        allocator: &mut gpu_allocator::vulkan::Allocator,
+        allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     ) {
         unsafe {
             acceleration_device.destroy_acceleration_structure(self.handle, None);

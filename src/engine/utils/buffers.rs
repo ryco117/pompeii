@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 /// A helper type for managing a buffer and its associated memory allocation.
 pub struct BufferAllocation {
     pub buffer: ash::vk::Buffer,
@@ -13,12 +15,14 @@ impl BufferAllocation {
     pub fn destroy(
         self,
         device: &ash::Device,
-        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+        memory_allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     ) {
         unsafe {
             device.destroy_buffer(self.buffer, None);
         }
         memory_allocator
+            .lock()
+            .expect("Failed to lock allocator in `BufferAllocation::destroy`")
             .free(self.allocation)
             .expect("Failed to free buffer memory");
     }
@@ -30,7 +34,7 @@ impl BufferAllocation {
 pub fn new_device_local(
     device: &ash::Device,
     pageable_device_local_memory: Option<(&ash::ext::pageable_device_local_memory::Device, f32)>,
-    allocator: &mut gpu_allocator::vulkan::Allocator,
+    allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     buffer_info: &ash::vk::BufferCreateInfo,
     alignment: Option<u64>,
     name: &str,
@@ -52,6 +56,8 @@ pub fn new_device_local(
 
     // Allocate memory for the buffer in a `GpuOnly` location.
     let allocation = allocator
+        .lock()
+        .expect("Failed to lock allocator in `new_device_local`")
         .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
             name,
             requirements,
@@ -85,7 +91,7 @@ impl StagingBuffer {
     pub fn new(
         device: &ash::Device,
         pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
-        allocator: &mut gpu_allocator::vulkan::Allocator,
+        allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
         size: u64,
     ) -> Result<Self, ash::vk::Result> {
         // Create a new buffer on the device with the necessary size and usage flags.
@@ -100,15 +106,21 @@ impl StagingBuffer {
 
         // Allocate memory for the buffer.
         let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let allocation = allocator
-            .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
-                name: "Staging buffer",
-                requirements,
-                location: gpu_allocator::MemoryLocation::CpuToGpu,
-                linear: true, // "Buffers are always linear" as per README.
-                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::DedicatedBuffer(buffer),
-            })
-            .expect("Unable to allocate memory for staging buffer");
+        let allocation = {
+            allocator
+                .lock()
+                .expect("Failed to lock allocator in `StagingBuffer::new`")
+                .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
+                    name: "Staging buffer",
+                    requirements,
+                    location: gpu_allocator::MemoryLocation::CpuToGpu,
+                    linear: true, // "Buffers are always linear" as per README.
+                    allocation_scheme: gpu_allocator::vulkan::AllocationScheme::DedicatedBuffer(
+                        buffer,
+                    ),
+                })
+                .expect("Unable to allocate memory for staging buffer")
+        };
         let memory = unsafe { allocation.memory() };
 
         // Optionally, set the memory priority to allow the driver to optimize the memory usage.
@@ -130,7 +142,7 @@ impl StagingBuffer {
     pub fn destroy(
         self,
         device: &ash::Device,
-        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+        memory_allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     ) {
         self.0.destroy(device, memory_allocator);
     }
@@ -160,7 +172,7 @@ impl StagingBuffer {
 pub fn new_data_buffer(
     device: &ash::Device,
     pageable_device_local_memory: Option<(&ash::ext::pageable_device_local_memory::Device, f32)>,
-    allocator: &mut gpu_allocator::vulkan::Allocator,
+    allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     command_pool: ash::vk::CommandPool,
     queue: ash::vk::Queue,
     data: &[u8],

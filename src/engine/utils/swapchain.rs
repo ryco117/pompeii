@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, sync::Mutex};
 
 use smallvec::SmallVec;
 
@@ -73,7 +73,7 @@ impl Swapchain {
         physical_device: ash::vk::PhysicalDevice,
         logical_device: &ash::Device,
         surface: ash::vk::SurfaceKHR,
-        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+        memory_allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
         image_usage: Option<ash::vk::ImageUsageFlags>,
         preferences: SwapchainPreferences,
         enabled_swapchain_maintenance1: bool,
@@ -316,7 +316,7 @@ impl Swapchain {
     pub fn destroy(
         self,
         logical_device: &ash::Device,
-        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+        memory_allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     ) {
         // Destroy resources in the reverse order they were created.
         unsafe {
@@ -339,6 +339,8 @@ impl Swapchain {
                 for (image, allocation) in multisample.images {
                     logical_device.destroy_image(image, None);
                     memory_allocator
+                        .lock()
+                        .expect("Failed to lock allocator in `Swapchain::destroy`")
                         .free(allocation)
                         .expect("Unable to free multisample image allocation");
                 }
@@ -452,7 +454,7 @@ impl Swapchain {
         physical_device: ash::vk::PhysicalDevice,
         logical_device: &ash::Device,
         surface: ash::vk::SurfaceKHR,
-        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+        memory_allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
         image_usage: Option<ash::vk::ImageUsageFlags>,
         preferences: SwapchainPreferences,
     ) {

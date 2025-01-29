@@ -7,12 +7,12 @@ edition = "2021"
 [dependencies]
 ash = "0.38"
 ash-window = "0.13"
-bytemuck = { version = "1.16", features = ["derive"] }
+bytemuck = { version = "1.19", features = ["derive"] }
 clap = { version = "4.5", features = ["derive"] }
 gltf = "1.4"
 gpu-allocator = "0.27"
 inline-spirv = "0.2"
-itertools = "0.13"
+itertools = "0.14"
 nalgebra-glm = { version = "0.19", features = ["convert-bytemuck"] }
 num-traits = "0.2"
 smallvec = "1.13"

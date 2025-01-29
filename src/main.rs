@@ -151,9 +151,9 @@ impl PompeiiApp {
                 })
             }
 
-            engine::DemoPipeline::Fluid(fluid) => {
+            engine::DemoPipeline::Fluid(_) => {
                 let dye_cycle = 12. * time;
-                let push_constants = fluid.new_push_constants(
+                let push_constants = engine::example_fluid::FluidSimulation::new_push_constants(
                     extent,
                     self.last_mouse_position.map_or([-1024.; 2], |m| m.0.into()),
                     self.mouse_velocity,
@@ -443,7 +443,7 @@ impl winit::application::ApplicationHandler<PompeiiEvent> for PompeiiApp {
                     };
                     if window_size != extent {
                         eprintln!(
-                            "ERROR: Swapchain is out of date at window-size check, needs to be recreated."
+                            "ERROR: Swapchain is out of date at window-size check, needs to be recreated"
                         );
 
                         renderer.swapchain_recreation_required(Some(window_size));
@@ -524,6 +524,6 @@ impl Drop for PompeiiApp {
         }
 
         #[cfg(debug_assertions)]
-        println!("Freed all Vulkan resources used during the application's lifetime.");
+        println!("Freed all Vulkan resources used during the application's lifetime");
     }
 }

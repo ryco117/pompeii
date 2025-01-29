@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use crate::engine::utils::{
     self,
     shaders::{ENTRY_POINT_MAIN, FULLSCREEN_VERTEX},
@@ -235,7 +237,7 @@ fn initialize_image_layouts(
 /// Create a framebuffer that can be used with this render pass.
 fn create_framebuffers(
     device: &ash::Device,
-    memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+    memory_allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     command_pool: ash::vk::CommandPool,
     queue: ash::vk::Queue,
     extent: ash::vk::Extent2D,
@@ -714,9 +716,7 @@ fn update_descriptor_sets(
             .image_info(std::slice::from_ref(image_infos.get(3).unwrap())),
     ];
 
-    let writes = compute_writes
-        .chain(graphics_writes.into_iter())
-        .collect::<Vec<_>>();
+    let writes = compute_writes.chain(graphics_writes).collect::<Vec<_>>();
 
     unsafe {
         device.update_descriptor_sets(&writes, &[]);
@@ -772,7 +772,7 @@ impl FluidSimulation {
     /// Create a new fluid simulation renderer from the swapchain image properties.
     pub fn new(
         device: &ash::Device,
-        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+        memory_allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
         extent: ash::vk::Extent2D,
         image_format: ash::vk::Format,
         destination_layout: ash::vk::ImageLayout,
@@ -860,7 +860,7 @@ impl FluidSimulation {
     pub fn destroy(
         &mut self,
         device: &ash::Device,
-        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+        memory_allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     ) {
         unsafe {
             device.destroy_descriptor_pool(self.descriptor_pool, None);
@@ -988,7 +988,7 @@ impl FluidSimulation {
     pub fn recreate_framebuffers(
         &mut self,
         device: &ash::Device,
-        memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+        memory_allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
         compute_command_pool: ash::vk::CommandPool,
         compute_queue: ash::vk::Queue,
         extent: ash::vk::Extent2D,
@@ -1301,7 +1301,6 @@ impl FluidSimulation {
             let push_constants = FragmentPushConstants {
                 screen_size: [extent.width, extent.height],
                 display_texture: self.current_display_texture,
-                ..Default::default()
             };
             device.cmd_push_constants(
                 graphics_command_buffer,
@@ -1379,7 +1378,6 @@ impl FluidSimulation {
 
     /// Helper for creating new push constants with the given information and buffer addresses.
     pub fn new_push_constants(
-        &mut self,
         extent: ash::vk::Extent2D,
         cursor_position: [f32; 2],
         cursor_velocity: [f32; 2],

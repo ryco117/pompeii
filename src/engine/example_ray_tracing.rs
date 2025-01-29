@@ -1,5 +1,7 @@
+use std::sync::{Arc, Mutex};
+
 use crate::engine::utils::{
-    self, create_shader_module, shaders::ENTRY_POINT_MAIN, FIVE_SECONDS_IN_NANOSECONDS,
+    self, create_shader_module, shaders::ENTRY_POINT_MAIN, textures, FIVE_SECONDS_IN_NANOSECONDS,
 };
 
 use nalgebra_glm as glm;
@@ -12,7 +14,7 @@ const MAX_RAY_RECURSION_DEPTH: u32 = 3;
 const MAX_TEXTURES: u32 = 1024;
 
 /// Special index to indicate that a resource is not used.
-const MISSING_INDEX: u32 = 0xFFFFFFFF;
+const MISSING_INDEX: u32 = 0xFFFF_FFFF;
 
 /// The push constants to be used with the ray tracing pipeline.
 #[repr(C)]
@@ -39,80 +41,59 @@ struct RayTracingShaders {
     intersection: ash::vk::ShaderModule,
     closest_hit_procedural: ash::vk::ShaderModule,
 }
+
+// Inline all compiled SPIR-V shaders to static memory.
+const RAY_GEN_CODE: &[u32] =
+    inline_spirv::include_spirv!("src/shaders/raytracing/raygen.rgen", rgen, glsl, vulkan1_2);
+const MISS_CODE: &[u32] =
+    inline_spirv::include_spirv!("src/shaders/raytracing/miss.rmiss", rmiss, glsl, vulkan1_2);
+const SHADOW_MISS_CODE: &[u32] = inline_spirv::include_spirv!(
+    "src/shaders/raytracing/shadow.rmiss",
+    rmiss,
+    glsl,
+    vulkan1_2
+);
+const CLOSEST_HIT_CODE: &[u32] = inline_spirv::include_spirv!(
+    "src/shaders/raytracing/closest_hit.rchit",
+    rchit,
+    glsl,
+    vulkan1_2
+);
+const ANY_HIT_CODE: &[u32] = inline_spirv::include_spirv!(
+    "src/shaders/raytracing/transparency.rahit",
+    rahit,
+    glsl,
+    vulkan1_2
+);
+const INTERSECTION_PROTOPHORE_CODE: &[u32] = inline_spirv::include_spirv!(
+    "src/shaders/raytracing/intersection_protophore.rint",
+    rint,
+    glsl,
+    vulkan1_2
+);
+const CLOSEST_HIT_PROCEDURAL: &[u32] = inline_spirv::include_spirv!(
+    "src/shaders/raytracing/closest_hit_procedural.rchit",
+    rchit,
+    glsl,
+    vulkan1_2
+);
 impl RayTracingShaders {
     /// Create a new instance of `RayTracingShaders`.
     pub fn new(device: &ash::Device) -> Self {
         // Only one ray generation shader is needed.
-        let ray_gen = create_shader_module(
-            device,
-            inline_spirv::include_spirv!(
-                "src/shaders/raytracing/raygen.rgen",
-                rgen,
-                glsl,
-                vulkan1_2
-            ),
-        );
+        let ray_gen = create_shader_module(device, RAY_GEN_CODE);
 
         // Two miss shaders are needed: one for the primary rays and one for shadow rays.
-        let miss = create_shader_module(
-            device,
-            inline_spirv::include_spirv!(
-                "src/shaders/raytracing/miss.rmiss",
-                rmiss,
-                glsl,
-                vulkan1_2
-            ),
-        );
-        let shadow_miss = create_shader_module(
-            device,
-            inline_spirv::include_spirv!(
-                "src/shaders/raytracing/shadow.rmiss",
-                rmiss,
-                glsl,
-                vulkan1_2
-            ),
-        );
+        let miss = create_shader_module(device, MISS_CODE);
+        let shadow_miss = create_shader_module(device, SHADOW_MISS_CODE);
 
         // Two hit shaders are needed for mesh geometry: one for the closest hit and one for any hit (alpha filtering).
-        let closest_hit_mesh = create_shader_module(
-            device,
-            inline_spirv::include_spirv!(
-                "src/shaders/raytracing/closest_hit.rchit",
-                rchit,
-                glsl,
-                vulkan1_2
-            ),
-        );
-        let any_hit_mesh = create_shader_module(
-            device,
-            inline_spirv::include_spirv!(
-                "src/shaders/raytracing/transparency.rahit",
-                rahit,
-                glsl,
-                vulkan1_2
-            ),
-        );
+        let closest_hit_mesh = create_shader_module(device, CLOSEST_HIT_CODE);
+        let any_hit_mesh = create_shader_module(device, ANY_HIT_CODE);
 
-        // Two hit shaders are needed for procedural geometry: one for determining the intersection
-        // and one for the closest hit.
-        let intersection = create_shader_module(
-            device,
-            inline_spirv::include_spirv!(
-                "src/shaders/raytracing/intersection_protophore.rint",
-                rint,
-                glsl,
-                vulkan1_2
-            ),
-        );
-        let closest_hit_procedural = create_shader_module(
-            device,
-            inline_spirv::include_spirv!(
-                "src/shaders/raytracing/closest_hit_procedural.rchit",
-                rchit,
-                glsl,
-                vulkan1_2
-            ),
-        );
+        // Two hit shaders are needed for procedural geometry: one for determining the intersection and one for the closest hit.
+        let intersection = create_shader_module(device, INTERSECTION_PROTOPHORE_CODE);
+        let closest_hit_procedural = create_shader_module(device, CLOSEST_HIT_PROCEDURAL);
 
         Self {
             ray_gen,
@@ -137,132 +118,20 @@ impl RayTracingShaders {
     }
 }
 
-/// Minimal helper type for consistent texture pixel representations.
-#[repr(C)]
-struct TexturePixel {
-    p: [u8; 4],
-}
-impl TexturePixel {
-    pub fn new(p: [u8; 4]) -> Self {
-        Self { p }
-    }
-}
-
-/// Helper to allocate a texture on the GPU for each texture in a model.
-fn allocate_gltf_textures(
+/// Helper to upload multiple glTF textures on the GPU synchronously.
+/// This function will be slow when given more than a couple textures.
+fn upload_all_textures_synchronously(
     device: &ash::Device,
     pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
-    allocator: &mut gpu_allocator::vulkan::Allocator,
+    allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     command_pool: ash::vk::CommandPool,
-    queue: ash::vk::Queue,
+    queue: &Mutex<ash::vk::Queue>,
     gltf_images: &[gltf::image::Data],
 ) -> Vec<utils::textures::AllocatedImage> {
-    /// Determine the number of bytes in each glTF texture pixel given the input format.
-    fn pixel_format_length(format: gltf::image::Format) -> usize {
-        use gltf::image::Format;
-        match format {
-            // 8 bits per channel.
-            Format::R8 => 1,
-            Format::R8G8 => 2,
-            Format::R8G8B8 => 3,
-            Format::R8G8B8A8 => 4,
-
-            // 16 bits per channel.
-            Format::R16 => 2,
-            Format::R16G16 => 4,
-            Format::R16G16B16 => 6,
-            Format::R16G16B16A16 => 8,
-
-            // 32 bits per channel.
-            Format::R32G32B32FLOAT => 12,
-            Format::R32G32B32A32FLOAT => 16,
-        }
-    }
-
-    /// Convert a byte-slice to a pixel based on the glTF format.
-    fn bytes_to_pixel(bytes: &[u8], source_format: gltf::image::Format) -> TexturePixel {
-        use gltf::image::Format;
-
-        #[cfg(debug_assertions)]
-        assert_eq!(
-            bytes.len(),
-            pixel_format_length(source_format),
-            "Invalid number of bytes for pixel format"
-        );
-
-        let mut pixel = [0; 4];
-        match source_format {
-            // 8 bits per channel.
-            Format::R8 => {
-                pixel[0] = bytes[0];
-            }
-            Format::R8G8 => {
-                pixel[0] = bytes[0];
-                pixel[1] = bytes[1];
-            }
-            Format::R8G8B8 => {
-                pixel[0] = bytes[0];
-                pixel[1] = bytes[1];
-                pixel[2] = bytes[2];
-            }
-            Format::R8G8B8A8 => {
-                pixel[0] = bytes[0];
-                pixel[1] = bytes[1];
-                pixel[2] = bytes[2];
-                pixel[3] = bytes[3];
-            }
-
-            // 16 bits per channel.
-            Format::R16 => {
-                // Ignore the low order bits.
-                pixel[0] = bytes[1];
-            }
-            Format::R16G16 => {
-                // Ignore the low order bits.
-                pixel[0] = bytes[1];
-                pixel[1] = bytes[3];
-            }
-            Format::R16G16B16 => {
-                // Ignore the low order bits.
-                pixel[0] = bytes[1];
-                pixel[1] = bytes[3];
-                pixel[2] = bytes[5];
-            }
-            Format::R16G16B16A16 => {
-                // Ignore the low order bits.
-                pixel[0] = bytes[1];
-                pixel[1] = bytes[3];
-                pixel[2] = bytes[5];
-                pixel[3] = bytes[7];
-            }
-
-            // 32 bits per channel.
-            Format::R32G32B32FLOAT => {
-                pixel[0] =
-                    (255. * f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])) as u8;
-                pixel[1] =
-                    (255. * f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])) as u8;
-                pixel[2] =
-                    (255. * f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]])) as u8;
-            }
-            Format::R32G32B32A32FLOAT => {
-                pixel[0] =
-                    (255. * f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])) as u8;
-                pixel[1] =
-                    (255. * f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])) as u8;
-                pixel[2] =
-                    (255. * f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]])) as u8;
-                pixel[3] =
-                    (255. * f32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]])) as u8;
-            }
-        }
-        TexturePixel::new(pixel)
-    }
-
     // Determine the total number of bytes that are required to upload all the textures.
     let total_pixel_count: usize = gltf_images
         .iter()
-        .map(|image| image.pixels.len() / pixel_format_length(image.format))
+        .map(|image| image.pixels.len() / textures::pixel_format_length(image.format))
         .sum();
 
     #[cfg(debug_assertions)]
@@ -277,7 +146,7 @@ fn allocate_gltf_textures(
         device,
         pageable_device_local_memory,
         allocator,
-        total_pixel_count as u64 * std::mem::size_of::<TexturePixel>() as u64,
+        total_pixel_count as u64 * std::mem::size_of::<textures::TexturePixel>() as u64,
     )
     .expect("Failed to create staging buffer for glTF textures");
 
@@ -285,11 +154,13 @@ fn allocate_gltf_textures(
     let mut staging_offset = 0;
     let (textures, fences, cleanup): (Vec<_>, Vec<_>, Vec<_>) =
         itertools::multiunzip(gltf_images.iter().map(|image| {
-            // Ensure the image is converted into the approprite pixel format for the image.
+            // Ensure the image is converted into the appropriate pixel format for the image.
             // NOTE: Here, we assume that the image is in the R8G8B8A8 format.
-            let pixel_iter = image.pixels.chunks_exact(pixel_format_length(image.format));
+            let pixel_iter = image
+                .pixels
+                .chunks_exact(textures::pixel_format_length(image.format));
             let pixels = pixel_iter
-                .map(|chunk| bytes_to_pixel(chunk, image.format))
+                .map(|chunk| textures::bytes_to_pixel(chunk, image.format))
                 .collect::<Vec<_>>();
 
             // Create a new (empty) image on the GPU with the appropriate size and usage flags.
@@ -317,7 +188,7 @@ fn allocate_gltf_textures(
             );
 
             // Copy the image data to the GPU.
-            let utils::CleanableFence { fence, cleanup } = utils::textures::copy_buffer_to_image(
+            let utils::CleanableFence { fence, cleanup } = textures::copy_buffer_to_image(
                 device,
                 command_pool,
                 queue,
@@ -348,12 +219,90 @@ fn allocate_gltf_textures(
             device.destroy_fence(fence, None);
         }
     }
-    for cleanup in cleanup.into_iter().filter_map(std::convert::identity) {
+    for cleanup in cleanup.into_iter().flatten() {
         cleanup(device, allocator);
     }
     staging_buffer.destroy(device, allocator);
 
     textures
+}
+
+/// Helper to upload multiple glTF textures onto the GPU with host parallelism.
+fn upload_all_textures_parallel(
+    device: &ash::Device,
+    pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
+    allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+    command_pool: ash::vk::CommandPool,
+    compute_queue: &utils::IndexedQueue,
+    gltf_images: &Arc<Vec<gltf::image::Data>>,
+) -> Vec<utils::textures::AllocatedImage> {
+    // Determine a sane number of threads to use for texture uploads. Default to `1` if unknown.
+    let thread_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+
+    if thread_count == 1 {
+        #[cfg(debug_assertions)]
+        println!("WARN: Using single-threaded texture upload");
+
+        // Default to using the existing command pool and upload all textures in the current thread.
+        upload_all_textures_synchronously(
+            device,
+            pageable_device_local_memory,
+            allocator,
+            command_pool,
+            &Mutex::new(compute_queue.queue),
+            gltf_images,
+        )
+    } else {
+        let image_count = gltf_images.len();
+        let group_count = image_count.div_ceil(thread_count);
+        let queue = Arc::new(Mutex::new(compute_queue.queue));
+        let queue_family = compute_queue.family_index;
+
+        let handles: Vec<_> = (0..thread_count)
+            .map(|i| {
+                let device = device.clone();
+                let allocator = allocator.clone();
+                let pageable_device_local_memory = pageable_device_local_memory.cloned();
+                let images = gltf_images.clone();
+                let command_pool = unsafe {
+                    device
+                        .create_command_pool(
+                            &ash::vk::CommandPoolCreateInfo::default()
+                                .queue_family_index(queue_family),
+                            None,
+                        )
+                        .expect("Failed to create command pool for texture upload thread")
+                };
+                let queue = queue.clone();
+
+                // Spawn a new thread to upload the subset of textures.
+                let handle = std::thread::spawn(move || {
+                    let start_index = i * group_count;
+                    let textures = upload_all_textures_synchronously(
+                        &device,
+                        pageable_device_local_memory.as_ref(),
+                        &allocator,
+                        command_pool,
+                        &queue,
+                        &images[start_index..image_count.min(start_index + group_count)],
+                    );
+
+                    // Clean up the command pool.
+                    unsafe { device.destroy_command_pool(command_pool, None) };
+
+                    textures
+                });
+
+                handle
+            })
+            .collect();
+
+        // Wait for all the threads to finish uploading the textures and join the results.
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("Failed to join texture upload thread"))
+            .collect()
+    }
 }
 
 /// Create a sampler from a glTF sampler's description.
@@ -385,12 +334,12 @@ fn create_sampler_from_glft(
             sampler_info
                 .min_filter()
                 .map_or(ash::vk::Filter::LINEAR, |f| match f {
-                    gltf::texture::MinFilter::Nearest => ash::vk::Filter::NEAREST,
-                    gltf::texture::MinFilter::Linear => ash::vk::Filter::LINEAR,
-                    gltf::texture::MinFilter::NearestMipmapNearest => ash::vk::Filter::NEAREST,
-                    gltf::texture::MinFilter::LinearMipmapNearest => ash::vk::Filter::LINEAR,
-                    gltf::texture::MinFilter::NearestMipmapLinear => ash::vk::Filter::NEAREST,
-                    gltf::texture::MinFilter::LinearMipmapLinear => ash::vk::Filter::LINEAR,
+                    gltf::texture::MinFilter::Nearest
+                    | gltf::texture::MinFilter::NearestMipmapNearest
+                    | gltf::texture::MinFilter::NearestMipmapLinear => ash::vk::Filter::NEAREST,
+                    gltf::texture::MinFilter::Linear
+                    | gltf::texture::MinFilter::LinearMipmapNearest
+                    | gltf::texture::MinFilter::LinearMipmapLinear => ash::vk::Filter::LINEAR,
                 }),
         )
         .address_mode_u(address_mode(sampler_info.wrap_s()))
@@ -448,12 +397,16 @@ struct MeshGpuData {
     pub geometry_node_lengths: Vec<u64>,
 
     // Textures.
-    pub textures: Vec<utils::textures::AllocatedImage>,
+    pub textures: Vec<textures::AllocatedImage>,
     pub samplers: Vec<ash::vk::Sampler>,
 }
 impl MeshGpuData {
     /// Destroy the mesh data.
-    pub fn destroy(self, device: &ash::Device, allocator: &mut gpu_allocator::vulkan::Allocator) {
+    pub fn destroy(
+        self,
+        device: &ash::Device,
+        allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
+    ) {
         // Destroy the geometry buffers.
         self.geometry_node_buffer.destroy(device, allocator);
         self.index_buffer.destroy(device, allocator);
@@ -609,7 +562,7 @@ fn traverse_scene_nodes(
         let mut tangents = reader.read_tangents();
         let mut uvs = color_texture
             .and_then(|(_, uv_set, _)| reader.read_tex_coords(uv_set))
-            .map(|uv| uv.into_f32());
+            .map(gltf::mesh::util::ReadTexCoords::into_f32);
         let read_indices = reader.read_indices().expect("Failed to read indices");
 
         // Determine the number of new vertices and append them to the list.
@@ -622,13 +575,13 @@ fn traverse_scene_nodes(
             let normal = (t * glm::Vec4::new(norm[0], norm[1], norm[2], 0.))
                 .xyz()
                 .normalize();
-            let tangent = if let Some(tans) = tangents.as_mut().and_then(|t| t.next()) {
+            let tangent = if let Some(tans) = tangents.as_mut().and_then(Iterator::next) {
                 t * glm::Vec4::new(tans[0], tans[1], tans[2], tans[3])
             } else {
                 glm::Vec4::zeros()
             };
 
-            let uv = if let Some(uv) = uvs.as_mut().and_then(|u| u.next()) {
+            let uv = if let Some(uv) = uvs.as_mut().and_then(Iterator::next) {
                 uv.into()
             } else {
                 glm::Vec2::zeros()
@@ -636,8 +589,8 @@ fn traverse_scene_nodes(
             vertices.push(Vertex {
                 position,
                 normal,
-                tangent,
                 uv,
+                tangent,
             });
         }
 
@@ -658,9 +611,9 @@ fn traverse_scene_nodes(
 fn create_mesh_data(
     device: &ash::Device,
     pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
-    allocator: &mut gpu_allocator::vulkan::Allocator,
+    allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
     command_pool: ash::vk::CommandPool,
-    queue: ash::vk::Queue,
+    queue: &utils::IndexedQueue,
 ) -> MeshGpuData {
     // Load the test model from memory.
     // static DUCK_BYTES: &[u8] = include_bytes!("../../assets/Duck.glb");
@@ -672,6 +625,13 @@ fn create_mesh_data(
         gltf::import_slice(bistro_bytes).expect("Failed to load test GLB model")
     };
 
+    #[cfg(debug_assertions)]
+    println!(
+        "INFO: Loaded glTF model with {} buffers and {} images",
+        gltf_buffers.len(),
+        gltf_images.len()
+    );
+
     // Create a sampler for each sampler description in the model.
     let mut samplers = test_gltf
         .samplers()
@@ -682,13 +642,13 @@ fn create_mesh_data(
     let textures = if gltf_images.is_empty() {
         Vec::new()
     } else {
-        allocate_gltf_textures(
+        upload_all_textures_parallel(
             device,
             pageable_device_local_memory,
             allocator,
             command_pool,
             queue,
-            &gltf_images,
+            &Arc::new(gltf_images),
         )
     };
 
@@ -762,7 +722,7 @@ fn create_mesh_data(
         pageable_device_local_memory.map(|d| (d, 1.)),
         allocator,
         command_pool,
-        queue,
+        queue.queue,
         vertex_data,
         required_buffer_usage,
         "Vertex Buffer",
@@ -782,7 +742,7 @@ fn create_mesh_data(
         pageable_device_local_memory.map(|d| (d, 1.)),
         allocator,
         command_pool,
-        queue,
+        queue.queue,
         index_data,
         required_buffer_usage,
         "Index Buffer",
@@ -814,7 +774,7 @@ fn create_mesh_data(
             pageable_device_local_memory.map(|d| (d, 1.)),
             allocator,
             command_pool,
-            queue,
+            queue.queue,
             &gltf_instance_bytes,
             ash::vk::BufferUsageFlags::STORAGE_BUFFER
                 | ash::vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
@@ -893,11 +853,17 @@ fn create_bottom_level_acceleration_structure(
     device: &ash::Device,
     acceleration_device: &ash::khr::acceleration_structure::Device,
     pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
-    allocator: &mut gpu_allocator::vulkan::Allocator,
+    allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     command_pool: ash::vk::CommandPool,
     queue: ash::vk::Queue,
     mesh: &MeshGpuData,
 ) -> utils::ray_tracing::AccelerationStructure {
+    #[cfg(debug_assertions)]
+    println!(
+        "INFO: Creating bottom-level acceleration structure for mesh with {} geometry nodes",
+        mesh.geometry_nodes.len()
+    );
+
     // Define the triangle geometry for the bottom-level acceleration structure.
     let (acceleration_geometries, geometry_counts) = mesh
         .geometry_nodes
@@ -976,7 +942,7 @@ fn create_bottom_level_acceleration_structure(
         allocator,
         &acceleration_build_size,
         &scratch_buffer,
-        utils::ray_tracing::InstancedGeometries::new(&acceleration_geometries, &geometry_counts)
+        utils::ray_tracing::InstancedGeometries::new(build_geometry_info, &geometry_counts)
             .unwrap(),
         command_pool,
         queue,
@@ -993,13 +959,16 @@ fn create_top_level_acceleration_structure(
     device: &ash::Device,
     acceleration_device: &ash::khr::acceleration_structure::Device,
     pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
-    allocator: &mut gpu_allocator::vulkan::Allocator,
+    allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     command_pool: ash::vk::CommandPool,
     queue: ash::vk::Queue,
     instances: &[ash::vk::AccelerationStructureInstanceKHR],
 ) -> utils::ray_tracing::AccelerationStructure {
     // Determine the number of acceleration instances to create.
     let instance_count = instances.len() as u32;
+
+    #[cfg(debug_assertions)]
+    println!("INFO: Creating top-level acceleration structure for {instance_count} instances");
 
     // Create a staging buffer to upload the data for each instance.
     let mut staging_buffer = utils::buffers::StagingBuffer::new(
@@ -1018,7 +987,7 @@ fn create_top_level_acceleration_structure(
         allocator,
         command_pool,
         queue,
-        utils::data_slice_byte_slice(&instances),
+        utils::data_slice_byte_slice(instances),
         ash::vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
             | ash::vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
         "Instance Buffer",
@@ -1120,13 +1089,16 @@ fn create_procedural_bottom_acceleration_structure(
     device: &ash::Device,
     acceleration_device: &ash::khr::acceleration_structure::Device,
     pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
-    allocator: &mut gpu_allocator::vulkan::Allocator,
+    allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     command_pool: ash::vk::CommandPool,
     queue: ash::vk::Queue,
 ) -> (
     utils::ray_tracing::AccelerationStructure,
     utils::buffers::BufferAllocation,
 ) {
+    #[cfg(debug_assertions)]
+    println!("INFO: Creating bottom-level acceleration structure for procedural geometry");
+
     // Define the position data of our axis-aligned bounding box.
     // TODO: Consider using stride to merge the procedural data buffer with this buffer.
     let bounding_boxes = [ash::vk::AabbPositionsKHR {
@@ -1253,11 +1225,8 @@ fn create_procedural_bottom_acceleration_structure(
         allocator,
         &build_sizes,
         &scratch_buffer,
-        utils::ray_tracing::InstancedGeometries::new(
-            &procedural_geometries,
-            &procedural_geometry_counts,
-        )
-        .unwrap(),
+        utils::ray_tracing::InstancedGeometries::new(build_info, &procedural_geometry_counts)
+            .unwrap(),
         command_pool,
         queue,
     );
@@ -1426,7 +1395,7 @@ impl ShaderBindingTables {
         device: &ash::Device,
         ray_device: &ash::khr::ray_tracing_pipeline::Device,
         pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
-        allocator: &mut gpu_allocator::vulkan::Allocator,
+        allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
         ray_pipeline: ash::vk::Pipeline,
         properties: &ash::vk::PhysicalDeviceRayTracingPipelinePropertiesKHR,
         command_pool: ash::vk::CommandPool,
@@ -1561,7 +1530,11 @@ impl ShaderBindingTables {
         }
     }
 
-    pub fn destroy(self, device: &ash::Device, allocator: &mut gpu_allocator::vulkan::Allocator) {
+    pub fn destroy(
+        self,
+        device: &ash::Device,
+        allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
+    ) {
         self.raygen.destroy(device, allocator);
         self.miss.destroy(device, allocator);
         self.hit.destroy(device, allocator);
@@ -1710,7 +1683,7 @@ impl Pipeline {
 fn create_lens_buffer(
     device: &ash::Device,
     pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
-    allocator: &mut gpu_allocator::vulkan::Allocator,
+    allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     command_pool: ash::vk::CommandPool,
     queue: ash::vk::Queue,
     extent: ash::vk::Extent2D,
@@ -1757,7 +1730,7 @@ fn create_lens_buffer(
 fn create_instances_buffer(
     device: &ash::Device,
     pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
-    allocator: &mut gpu_allocator::vulkan::Allocator,
+    allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     command_pool: ash::vk::CommandPool,
     queue: ash::vk::Queue,
     instances: &[ash::vk::DeviceAddress],
@@ -1810,7 +1783,11 @@ struct Descriptors {
 }
 impl Descriptors {
     /// Destroy the descriptor pool and descriptor sets.
-    pub fn destroy(self, device: &ash::Device, allocator: &mut gpu_allocator::vulkan::Allocator) {
+    pub fn destroy(
+        self,
+        device: &ash::Device,
+        allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
+    ) {
         unsafe {
             device.destroy_descriptor_pool(self.descriptor_pool, None);
         }
@@ -1846,7 +1823,7 @@ fn create_descriptor_sets<'a, I>(
     samplers: &[ash::vk::Sampler],
 ) -> Descriptors
 where
-    I: IntoIterator<Item = &'a utils::textures::AllocatedImage>,
+    I: IntoIterator<Item = &'a textures::AllocatedImage>,
 {
     let image_count = output_images.len() as u32;
 
@@ -1877,11 +1854,11 @@ where
                     },
                     ash::vk::DescriptorPoolSize {
                         ty: ash::vk::DescriptorType::SAMPLED_IMAGE,
-                        descriptor_count: MAX_TEXTURES as u32,
+                        descriptor_count: MAX_TEXTURES,
                     },
                     ash::vk::DescriptorPoolSize {
                         ty: ash::vk::DescriptorType::SAMPLER,
-                        descriptor_count: MAX_TEXTURES as u32,
+                        descriptor_count: MAX_TEXTURES,
                     },
                 ]),
             None,
@@ -2060,9 +2037,9 @@ impl ExampleRayTracing {
         acceleration_device: &ash::khr::acceleration_structure::Device,
         ray_device: &ash::khr::ray_tracing_pipeline::Device,
         pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
-        allocator: &mut gpu_allocator::vulkan::Allocator,
+        allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
         command_pool: ash::vk::CommandPool,
-        queue: ash::vk::Queue,
+        queue: &utils::IndexedQueue,
         output_images: &[ash::vk::ImageView],
         extent: ash::vk::Extent2D,
         properties: &ash::vk::PhysicalDeviceRayTracingPipelinePropertiesKHR,
@@ -2089,7 +2066,7 @@ impl ExampleRayTracing {
             pageable_device_local_memory,
             allocator,
             command_pool,
-            queue,
+            queue.queue,
             &mesh,
         );
 
@@ -2101,7 +2078,7 @@ impl ExampleRayTracing {
                 pageable_device_local_memory,
                 allocator,
                 command_pool,
-                queue,
+                queue.queue,
             );
         let procedural_geometries_address = unsafe {
             device.get_buffer_device_address(
@@ -2117,22 +2094,22 @@ impl ExampleRayTracing {
             0,
             0,
         );
-        let mesh_instance_1 = create_acceleration_instance(
-            mesh_bottom_acceleration.device_address(),
-            ash::vk::TransformMatrixKHR {
-                matrix: [0., 0.3, 0., 2., -0.3, 0., 0., 0., 0., 0., 0.3, 2.],
-            },
-            0,
-            0,
-        );
-        let mesh_instance_2 = create_acceleration_instance(
-            mesh_bottom_acceleration.device_address(),
-            ash::vk::TransformMatrixKHR {
-                matrix: [0., 0., 0.4, -3., 0., 0.4, 0., 0., -0.4, 0., 0., -3.],
-            },
-            0,
-            0,
-        );
+        // let mesh_instance_1 = create_acceleration_instance(
+        //     mesh_bottom_acceleration.device_address(),
+        //     ash::vk::TransformMatrixKHR {
+        //         matrix: [0., 0.3, 0., 2., -0.3, 0., 0., 0., 0., 0., 0.3, 2.],
+        //     },
+        //     0,
+        //     0,
+        // );
+        // let mesh_instance_2 = create_acceleration_instance(
+        //     mesh_bottom_acceleration.device_address(),
+        //     ash::vk::TransformMatrixKHR {
+        //         matrix: [0., 0., 0.4, -3., 0., 0.4, 0., 0., -0.4, 0., 0., -3.],
+        //     },
+        //     0,
+        //     0,
+        // );
         let procedural_instance = create_acceleration_instance(
             procedural_bottom_acceleration.device_address(),
             ash::vk::TransformMatrixKHR {
@@ -2170,7 +2147,7 @@ impl ExampleRayTracing {
             pageable_device_local_memory,
             allocator,
             command_pool,
-            queue,
+            queue.queue,
             &instance_geometries,
         );
 
@@ -2181,7 +2158,7 @@ impl ExampleRayTracing {
             pageable_device_local_memory,
             allocator,
             command_pool,
-            queue,
+            queue.queue,
             &acceleration_instances,
         );
 
@@ -2199,7 +2176,7 @@ impl ExampleRayTracing {
             pipeline.pipeline,
             properties,
             command_pool,
-            queue,
+            queue.queue,
         );
 
         // Create the uniform buffer storing the camera projection matrix.
@@ -2209,7 +2186,7 @@ impl ExampleRayTracing {
             pageable_device_local_memory,
             allocator,
             command_pool,
-            queue,
+            queue.queue,
             extent,
         );
 
@@ -2243,7 +2220,7 @@ impl ExampleRayTracing {
         self,
         device: &ash::Device,
         acceleration_device: &ash::khr::acceleration_structure::Device,
-        allocator: &mut gpu_allocator::vulkan::Allocator,
+        allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     ) {
         // Destroy the pipeline and its associated resources.
         self.descriptors.destroy(device, allocator);
@@ -2393,7 +2370,7 @@ impl ExampleRayTracing {
         &mut self,
         device: &ash::Device,
         pageable_device_local_memory: Option<&ash::ext::pageable_device_local_memory::Device>,
-        allocator: &mut gpu_allocator::vulkan::Allocator,
+        allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
         command_pool: ash::vk::CommandPool,
         queue: ash::vk::Queue,
         output_images: &[ash::vk::ImageView],
@@ -2438,7 +2415,7 @@ impl ExampleRayTracing {
         let update_fence = utils::CleanableFence::new(
             camera_update_fence,
             Some(Box::new(
-                move |device: &ash::Device, allocator: &mut gpu_allocator::vulkan::Allocator| {
+                move |device: &ash::Device, allocator: &Mutex<gpu_allocator::vulkan::Allocator>| {
                     staging.destroy(device, allocator);
                     if let Some(cleanup) = camera_cmd_buffer_cleanup {
                         cleanup(device, allocator);

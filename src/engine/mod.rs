@@ -1,4 +1,8 @@
-use std::{collections::HashSet, ffi::CStr};
+use std::{
+    collections::HashSet,
+    ffi::CStr,
+    sync::{Arc, Mutex},
+};
 
 use smallvec::{smallvec, SmallVec};
 use utils::{fxaa_pass::FxaaPass, EXPECTED_MAX_FRAMES_IN_FLIGHT, FIVE_SECONDS_IN_NANOSECONDS};
@@ -11,8 +15,8 @@ pub mod utils;
 /// The demos the application is capable of rendering.
 pub enum DemoPipeline {
     Triangle(example_triangle::Pipeline),
-    Fluid(example_fluid::FluidSimulation),
-    RayTracing(example_ray_tracing::ExampleRayTracing),
+    Fluid(Box<example_fluid::FluidSimulation>),
+    RayTracing(Box<example_ray_tracing::ExampleRayTracing>),
 }
 
 /// The push constants necessary to render the active demo.
@@ -43,7 +47,9 @@ pub struct Renderer {
         ash::khr::ray_tracing_pipeline::Device,
         ash::vk::PhysicalDeviceRayTracingPipelinePropertiesKHR<'static>,
     )>,
-    memory_allocator: gpu_allocator::vulkan::Allocator,
+
+    // Manage GPU memory with an efficient allocation strategy.
+    memory_allocator: Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
 
     surface: ash::vk::SurfaceKHR,
     swapchain: utils::Swapchain,
@@ -75,7 +81,6 @@ pub struct Renderer {
 pub enum DemoSpecializationConstants {
     Triangle(example_triangle::SpecializationConstants),
 
-    #[allow(dead_code)]
     Fluid,
 }
 
@@ -290,7 +295,7 @@ impl Renderer {
                 *queue_families
                     .present
                     .first()
-                    .expect("Unable to find a present queue family")
+                    .expect("Unable to find a queue family supporting presentation")
             };
 
             // NOTE: Prefer that the graphics and compute queues are equivalent because the `example_fluid` module will benefit from shared resources.
@@ -300,7 +305,7 @@ impl Renderer {
                 *queue_families
                     .compute
                     .first()
-                    .expect("Unable to find a compute queue family")
+                    .expect("Unable to find a queue family supporting compute")
             };
 
             (graphics, compute, present)
@@ -315,7 +320,8 @@ impl Renderer {
         // Get a handle to a presentation queue for use with swapchain presentation.
         let presentation_queue = utils::IndexedQueue::get(&logical_device, present_index, 0);
 
-        let mut memory_allocator =
+        // Use a memory allocator to manage GPU memory with an efficient allocation strategy.
+        let memory_allocator = Mutex::new(
             gpu_allocator::vulkan::Allocator::new(&gpu_allocator::vulkan::AllocatorCreateDesc {
                 instance: vulkan.instance.clone(),
                 device: logical_device.clone(),
@@ -324,7 +330,8 @@ impl Renderer {
                 buffer_device_address: true,
                 allocation_sizes: gpu_allocator::AllocationSizes::default(),
             })
-            .expect("Unable to create memory allocator (GPU Allocator)");
+            .expect("Unable to create memory allocator (GPU Allocator)"),
+        );
 
         // Create an object to manage the swapchain, its images, and synchronization primitives.
         let swapchain = utils::Swapchain::new(
@@ -332,7 +339,7 @@ impl Renderer {
             physical_device,
             &logical_device,
             surface,
-            &mut memory_allocator,
+            &memory_allocator,
             Some(ash::vk::ImageUsageFlags::COLOR_ATTACHMENT | ash::vk::ImageUsageFlags::STORAGE),
             swapchain_preferences,
             enabled_swapchain_maintenance,
@@ -343,18 +350,18 @@ impl Renderer {
         let image_format = swapchain.image_format();
 
         // Create a pool for allocating new commands.
-        // NOTE: https://developer.nvidia.com/blog/vulkan-dos-donts/ Recommends `image_count * recording_thread_count` many command pools for optimal command buffer allocation.
+        // NOTE: https://developer.nvidia.com/blog/vulkan-dos-donts/ Recommends `frame_count * recording_thread_count` many command pools for optimal command buffer allocation.
         //       However, we currently only reuse existing command buffers and do not need to allocate new ones.
         // NOTE: The `RESET_COMMAND_BUFFER` flag allows for resetting individual buffers. If many command buffers are used per frame, setting an entire pool may be more efficient.
         let command_pool = unsafe {
             logical_device
                 .create_command_pool(
-                    &ash::vk::CommandPoolCreateInfo {
-                        flags: ash::vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER
-                            | ash::vk::CommandPoolCreateFlags::TRANSIENT,
-                        queue_family_index: graphics_index,
-                        ..Default::default()
-                    },
+                    &ash::vk::CommandPoolCreateInfo::default()
+                        .flags(
+                            ash::vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER
+                                | ash::vk::CommandPoolCreateFlags::TRANSIENT,
+                        )
+                        .queue_family_index(graphics_index),
                     None,
                 )
                 .expect("Unable to create command pool")
@@ -368,12 +375,12 @@ impl Renderer {
 
             let pool = unsafe {
                 logical_device.create_command_pool(
-                    &ash::vk::CommandPoolCreateInfo {
-                        flags: ash::vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER
-                            | ash::vk::CommandPoolCreateFlags::TRANSIENT,
-                        queue_family_index: compute_index,
-                        ..Default::default()
-                    },
+                    &ash::vk::CommandPoolCreateInfo::default()
+                        .flags(
+                            ash::vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER
+                                | ash::vk::CommandPoolCreateFlags::TRANSIENT,
+                        )
+                        .queue_family_index(compute_index),
                     None,
                 )
             }
@@ -393,7 +400,7 @@ impl Renderer {
         let fxaa_pass = if enable_fxaa {
             Some(FxaaPass::new(
                 &logical_device,
-                &mut memory_allocator,
+                &memory_allocator,
                 extent,
                 image_format,
                 swapchain.image_views(),
@@ -428,7 +435,7 @@ impl Renderer {
             DemoSpecializationConstants::Fluid => {
                 let demo = example_fluid::FluidSimulation::new(
                     &logical_device,
-                    &mut memory_allocator,
+                    &memory_allocator,
                     extent,
                     image_format,
                     ash::vk::ImageLayout::PRESENT_SRC_KHR,
@@ -436,7 +443,7 @@ impl Renderer {
                     compute_queue_extra.map_or(command_pool, |(pool, _)| pool),
                     compute_queue.queue,
                 );
-                DemoPipeline::Fluid(demo)
+                DemoPipeline::Fluid(Box::new(demo))
             }
         };
 
@@ -478,7 +485,8 @@ impl Renderer {
             logical_device,
             pageable_device_local_memory,
             ray_tracing,
-            memory_allocator,
+
+            memory_allocator: Arc::new(memory_allocator),
 
             surface,
             swapchain,
@@ -521,19 +529,19 @@ impl Renderer {
                     pipeline.destroy(&self.logical_device, true, true);
                 }
                 DemoPipeline::Fluid(mut simulation) => {
-                    simulation.destroy(&self.logical_device, &mut self.memory_allocator);
+                    simulation.destroy(&self.logical_device, &self.memory_allocator);
                 }
                 DemoPipeline::RayTracing(ray_tracing) => {
                     ray_tracing.destroy(
                         &self.logical_device,
                         &self.ray_tracing.as_ref().unwrap().0,
-                        &mut self.memory_allocator,
+                        &self.memory_allocator,
                     );
                 }
             }
 
             if let Some(mut fxaa_pass) = self.fxaa_pass.take() {
-                fxaa_pass.destroy(&self.logical_device, &mut self.memory_allocator);
+                fxaa_pass.destroy(&self.logical_device, &self.memory_allocator);
             }
 
             // Destroy additional compute resources if the exist.
@@ -544,7 +552,7 @@ impl Renderer {
 
             // Destroy the swapchain and its dependent resources.
             self.swapchain
-                .destroy(&self.logical_device, &mut self.memory_allocator);
+                .destroy(&self.logical_device, &self.memory_allocator);
 
             // Destroy the logical device itself.
             self.logical_device.destroy_device(None);
@@ -592,7 +600,7 @@ impl Renderer {
             self.physical_device,
             &self.logical_device,
             self.surface,
-            &mut self.memory_allocator,
+            &self.memory_allocator,
             Some(ash::vk::ImageUsageFlags::COLOR_ATTACHMENT | ash::vk::ImageUsageFlags::STORAGE),
             self.swapchain_preferences,
         );
@@ -606,7 +614,7 @@ impl Renderer {
             if new_swapchain_format == old_format {
                 fxaa_pass.recreate_framebuffers(
                     &self.logical_device,
-                    &mut self.memory_allocator,
+                    &self.memory_allocator,
                     extent,
                     new_swapchain_format,
                     self.swapchain.image_views(),
@@ -614,7 +622,7 @@ impl Renderer {
             } else {
                 let new_fxaa_pass = FxaaPass::new(
                     &self.logical_device,
-                    &mut self.memory_allocator,
+                    &self.memory_allocator,
                     extent,
                     new_swapchain_format,
                     self.swapchain.image_views(),
@@ -622,7 +630,7 @@ impl Renderer {
                 );
 
                 // Destroy the old FXAA pass and replace it with the new one.
-                fxaa_pass.destroy(&self.logical_device, &mut self.memory_allocator);
+                fxaa_pass.destroy(&self.logical_device, &self.memory_allocator);
 
                 *fxaa_pass = new_fxaa_pass;
             }
@@ -641,7 +649,7 @@ impl Renderer {
                 DemoPipeline::Fluid(simulation) => {
                     simulation.recreate_framebuffers(
                         &self.logical_device,
-                        &mut self.memory_allocator,
+                        &self.memory_allocator,
                         self.compute_command_pool
                             .map_or(self.command_pool, |(pool, _)| pool),
                         self.compute_queue.queue,
@@ -653,7 +661,7 @@ impl Renderer {
                     tracer.recreate_view_sets(
                         &self.logical_device,
                         self.pageable_device_local_memory.as_ref(),
-                        &mut self.memory_allocator,
+                        &self.memory_allocator,
                         self.compute_command_pool
                             .map_or(self.command_pool, |(pool, _)| pool),
                         self.compute_queue.queue,
@@ -687,7 +695,7 @@ impl Renderer {
                 DemoPipeline::Fluid(simulation) => {
                     let new_sim = example_fluid::FluidSimulation::new(
                         &self.logical_device,
-                        &mut self.memory_allocator,
+                        &self.memory_allocator,
                         extent,
                         new_swapchain_format,
                         ash::vk::ImageLayout::PRESENT_SRC_KHR,
@@ -696,14 +704,14 @@ impl Renderer {
                             .map_or(self.command_pool, |(pool, _)| pool),
                         self.compute_queue.queue,
                     );
-                    simulation.destroy(&self.logical_device, &mut self.memory_allocator);
-                    *simulation = new_sim;
+                    simulation.destroy(&self.logical_device, &self.memory_allocator);
+                    *simulation = Box::new(new_sim);
                 }
                 DemoPipeline::RayTracing(tracer) => self.blocking_fences.push(
                     tracer.recreate_view_sets(
                         &self.logical_device,
                         self.pageable_device_local_memory.as_ref(),
-                        &mut self.memory_allocator,
+                        &self.memory_allocator,
                         self.compute_command_pool
                             .map_or(self.command_pool, |(pool, _)| pool),
                         self.compute_queue.queue,
@@ -722,7 +730,7 @@ impl Renderer {
     /// # Panics
     /// * The `utils::VulkanCore` struct must have a `khr` field that is not `None`.
     pub fn render_frame(&mut self, vulkan: &utils::VulkanCore, push_constants: &DemoPushConstants) {
-        // Synchronize the CPU with the GPU for the resources previously used for this frame in flight.
+        // Synchronize the CPU with the GPU for the resources previously used for this frame index.
         // Specifically, the command buffer cannot be reused until the fence is signaled.
         let current_frame = self.swapchain.current_frame();
         let frame_graphics_fence = self.frame_fences[current_frame];
@@ -735,7 +743,7 @@ impl Renderer {
                 .unzip();
             let blocking_fences: SmallVec<[_; EXPECTED_MAX_FENCES_IN_FLIGHT + 1]> =
                 std::iter::once(frame_graphics_fence)
-                    .chain(blocking_fences.into_iter())
+                    .chain(blocking_fences)
                     .collect();
             self.logical_device
                 .wait_for_fences(&blocking_fences, true, FIVE_SECONDS_IN_NANOSECONDS)
@@ -745,11 +753,9 @@ impl Renderer {
             for fence in &blocking_fences[1..] {
                 self.logical_device.destroy_fence(*fence, None);
             }
-            for cleanup in blocking_fence_cleanup
-                .into_iter()
-                .filter_map(std::convert::identity)
-            {
-                cleanup(&self.logical_device, &mut self.memory_allocator);
+
+            for cleanup in blocking_fence_cleanup.into_iter().flatten() {
+                cleanup(&self.logical_device, &self.memory_allocator);
             }
         }
 
@@ -782,7 +788,7 @@ impl Renderer {
                     return;
                 }
 
-                println!("WARN: Swapchain is out of date at image acquire, needs to be recreated.");
+                println!("WARN: Swapchain is out of date at image acquire, needs to be recreated");
                 self.swapchain_recreation_required(
                     if surface_capabilities.current_extent == utils::SPECIAL_SURFACE_EXTENT {
                         None
@@ -956,7 +962,7 @@ impl Renderer {
                 }
 
                 println!(
-                    "WARN: Swapchain is out of date at image presentation, needs to be recreated."
+                    "WARN: Swapchain is out of date at image presentation, needs to be recreated"
                 );
                 self.swapchain_recreation_required(
                     if surface_capabilities.current_extent == utils::SPECIAL_SURFACE_EXTENT {
@@ -1053,9 +1059,9 @@ impl Renderer {
                     return;
                 }
 
-                DemoPipeline::Fluid(example_fluid::FluidSimulation::new(
+                DemoPipeline::Fluid(Box::new(example_fluid::FluidSimulation::new(
                     &self.logical_device,
-                    &mut self.memory_allocator,
+                    &self.memory_allocator,
                     self.swapchain.extent(),
                     self.swapchain.image_format(),
                     ash::vk::ImageLayout::PRESENT_SRC_KHR,
@@ -1063,29 +1069,30 @@ impl Renderer {
                     self.compute_command_pool
                         .map_or(self.command_pool, |(pool, _)| pool),
                     self.compute_queue.queue,
-                ))
+                )))
             }
             NewDemo::RayTracing => {
                 if let DemoPipeline::RayTracing(_) = &self.active_demo {
                     return;
                 }
 
-                let (command_pool, queue) = self.compute_command_pool.map_or(
-                    (self.command_pool, self.graphics_queue.queue),
-                    |(pool, _)| (pool, self.compute_queue.queue),
-                );
-                DemoPipeline::RayTracing(example_ray_tracing::ExampleRayTracing::new(
+                let (command_pool, queue) = self
+                    .compute_command_pool
+                    .map_or((self.command_pool, &self.graphics_queue), |(pool, _)| {
+                        (pool, &self.compute_queue)
+                    });
+                DemoPipeline::RayTracing(Box::new(example_ray_tracing::ExampleRayTracing::new(
                     &self.logical_device,
                     &self.ray_tracing.as_ref().unwrap().0,
                     &self.ray_tracing.as_ref().unwrap().1,
                     self.pageable_device_local_memory.as_ref(),
-                    &mut self.memory_allocator,
+                    &self.memory_allocator,
                     command_pool,
                     queue,
                     self.swapchain.image_views(),
                     self.swapchain.extent(),
                     &self.ray_tracing.as_ref().unwrap().2,
-                ))
+                )))
             }
         };
 
@@ -1099,13 +1106,13 @@ impl Renderer {
                 triangle.destroy(&self.logical_device, true, true);
             }
             DemoPipeline::Fluid(mut simulation) => {
-                simulation.destroy(&self.logical_device, &mut self.memory_allocator);
+                simulation.destroy(&self.logical_device, &self.memory_allocator);
             }
             DemoPipeline::RayTracing(ray_tracing) => {
                 ray_tracing.destroy(
                     &self.logical_device,
                     &self.ray_tracing.as_ref().unwrap().0,
-                    &mut self.memory_allocator,
+                    &self.memory_allocator,
                 );
             }
         }

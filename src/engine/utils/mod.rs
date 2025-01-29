@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     ffi::{c_void, CStr},
+    sync::Mutex,
 };
 
 use smallvec::SmallVec;
@@ -29,10 +30,6 @@ pub mod shaders {
 /// Target Vulkan API version 1.3 for compatibility with the latest Vulkan features and **reduced fragmentation of extension support**.
 const VULKAN_API_VERSION: u32 = ash::vk::API_VERSION_1_3;
 
-/// Set a sane value for the maximum expected number of queue families.
-/// A heap allocation is required if the number of queue families exceeds this value.
-pub const EXPECTED_MAX_QUEUE_FAMILIES: usize = 8;
-
 /// Set a sane value for the maximum expected number of instance extensions.
 /// A heap allocation is required if the number of instance extensions exceeds this value.
 pub const EXPECTED_MAX_ENABLED_INSTANCE_EXTENSIONS: usize = 8;
@@ -56,24 +53,28 @@ pub fn extensions_list_contains(list: &[ash::vk::ExtensionProperties], ext: &CSt
     })
 }
 
+/// The type of function capable of cleaning resources after a `CleanableFence` is ready to drop.
+pub type CleanupFunction = Box<dyn FnOnce(&ash::Device, &Mutex<gpu_allocator::vulkan::Allocator>)>;
+
 /// Helper for returning a fence with the necessary cleanup.
 pub struct CleanableFence {
     pub fence: ash::vk::Fence,
-    pub cleanup: Option<Box<dyn FnOnce(&ash::Device, &mut gpu_allocator::vulkan::Allocator)>>,
+    pub cleanup: Option<CleanupFunction>,
 }
 impl CleanableFence {
     /// Create a new `CleanableFence` with the specified fence and cleanup function.
     /// # Safety
     /// Do not destroy the fence from within the `cleanup` function. This will be done automatically.
-    pub fn new(
-        fence: ash::vk::Fence,
-        cleanup: Option<Box<dyn FnOnce(&ash::Device, &mut gpu_allocator::vulkan::Allocator)>>,
-    ) -> Self {
+    pub fn new(fence: ash::vk::Fence, cleanup: Option<CleanupFunction>) -> Self {
         Self { fence, cleanup }
     }
 
     /// Destroy the fence and invoke the `cleanup` function before dropping the instance.
-    pub fn cleanup(self, device: &ash::Device, allocator: &mut gpu_allocator::vulkan::Allocator) {
+    pub fn cleanup(
+        self,
+        device: &ash::Device,
+        allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
+    ) {
         unsafe {
             device.destroy_fence(self.fence, None);
         }
@@ -657,11 +658,11 @@ pub fn get_sorted_physical_devices(
 /// Available queue family types and their indices.
 /// Also, a map of queue family indices to the number of queues that may be and are currently allocated.
 pub struct QueueFamilies {
+    pub all_properties: Vec<ash::vk::QueueFamilyProperties>,
     pub graphics: Vec<u32>,
     pub compute: Vec<u32>,
     pub transfer: Vec<u32>,
     pub present: Vec<u32>,
-    pub queue_families: Vec<ash::vk::QueueFamilyProperties>,
 }
 
 #[derive(strum::EnumCount)]
@@ -692,7 +693,23 @@ pub fn get_queue_families(
     // Find the queue families for each desired queue type.
     // Use an array with indices to allow compile-time guarantees about the number of queue types.
     let mut type_indices = [const { Vec::<u32>::new() }; QueueType::COUNT];
-    for (family_index, queue_family) in queue_families.iter().enumerate() {
+    for (family_index, family_properties) in queue_families.iter().enumerate() {
+        // Get as a graphics queue family.
+        if family_properties
+            .queue_flags
+            .contains(ash::vk::QueueFlags::GRAPHICS)
+        {
+            type_indices[QueueType::Graphics as usize].push(family_index as u32);
+        }
+
+        // Get as a compute queue family.
+        if family_properties
+            .queue_flags
+            .contains(ash::vk::QueueFlags::COMPUTE)
+        {
+            type_indices[QueueType::Compute as usize].push(family_index as u32);
+        }
+
         // Get as a present queue family.
         if let Some(surface_instance) = vulkan.surface_instance.as_ref() {
             if unsafe {
@@ -702,30 +719,14 @@ pub fn get_queue_families(
                     surface,
                 )
             }
-            .expect("Unable to check if 'present' is supported")
+            .expect("Unable to check if 'present' queue family is supported")
             {
                 type_indices[QueueType::Present as usize].push(family_index as u32);
             }
         }
 
-        // Get as a graphics queue family.
-        if queue_family
-            .queue_flags
-            .contains(ash::vk::QueueFlags::GRAPHICS)
-        {
-            type_indices[QueueType::Graphics as usize].push(family_index as u32);
-        }
-
-        // Get as a compute queue family.
-        if queue_family
-            .queue_flags
-            .contains(ash::vk::QueueFlags::COMPUTE)
-        {
-            type_indices[QueueType::Compute as usize].push(family_index as u32);
-        }
-
         // Get as a transfer queue family.
-        if queue_family
+        if family_properties
             .queue_flags
             .contains(ash::vk::QueueFlags::TRANSFER)
         {
@@ -735,15 +736,15 @@ pub fn get_queue_families(
 
     let graphics = std::mem::take(&mut type_indices[QueueType::Graphics as usize]);
     let compute = std::mem::take(&mut type_indices[QueueType::Compute as usize]);
-    let transfer = std::mem::take(&mut type_indices[QueueType::Transfer as usize]);
     let present = std::mem::take(&mut type_indices[QueueType::Present as usize]);
+    let transfer = std::mem::take(&mut type_indices[QueueType::Transfer as usize]);
 
     QueueFamilies {
         graphics,
         compute,
         transfer,
         present,
-        queue_families,
+        all_properties: queue_families,
     }
 }
 
@@ -761,72 +762,40 @@ pub fn new_device(
     // Get the necessary queue family indices for the logical device.
     let queue_families = get_queue_families(vulkan, physical_device, surface);
 
-    // Aggregate queue family indices and count the number of queues each family may need allocated.
-    let mut family_map = SmallVec::<[u32; EXPECTED_MAX_QUEUE_FAMILIES]>::from_elem(
-        0,
-        queue_families.queue_families.len(),
-    );
-    let all_family_types = [
-        &queue_families.graphics,
-        &queue_families.compute,
-        &queue_families.present,
-    ];
-    for family in all_family_types {
-        for index in family {
-            family_map[*index as usize] += 1;
-        }
-    }
-
     // Allocate a vector of queue priorities capable of handling the largest queue count among all families.
     let priorities = vec![
         1.;
         queue_families
-            .queue_families
+            .all_properties
             .iter()
             .fold(0, |acc, f| acc.max(f.queue_count as usize))
     ];
 
-    // Print a message if the queue family map has spilled over to the heap.
-    #[cfg(debug_assertions)]
-    if family_map.spilled() {
-        println!(
-            "INFO: Queue family map has spilled over to the heap. Family count {} greater than inline size {}",
-            queue_families.queue_families.len(),
-            family_map.inline_size(),
-        );
-    }
-
     // Describe the queue families that will be used with the new logical device.
-    let queue_info = family_map
+    let queue_info = queue_families
+        .all_properties
         .iter()
+        .map(|p| p.queue_count)
         .enumerate()
-        .filter_map(|(index, &count)| {
-            if count == 0 {
+        .filter_map(|(index, queue_count)| {
+            if queue_count == 0 {
                 return None;
             }
 
-            // Limit to the number of available queues. Guaranteed to be non-zero.
-            let queue_count = count.min(queue_families.queue_families[index].queue_count);
             let priorities = &priorities[..queue_count as usize];
-
-            Some(ash::vk::DeviceQueueCreateInfo {
-                queue_family_index: index as u32,
-                queue_count,
-                p_queue_priorities: priorities.as_ptr(),
-                ..Default::default()
-            })
+            Some(
+                ash::vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(index as u32)
+                    .queue_priorities(priorities),
+            )
         })
         .collect::<Vec<_>>();
 
     // Create the logical device with the desired queue families and extensions.
     let device = unsafe {
-        let mut device_info = ash::vk::DeviceCreateInfo {
-            queue_create_info_count: queue_info.len() as u32,
-            p_queue_create_infos: queue_info.as_ptr(),
-            enabled_extension_count: device_extensions.len() as u32,
-            pp_enabled_extension_names: device_extensions.as_ptr(),
-            ..Default::default()
-        };
+        let mut device_info = ash::vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queue_info)
+            .enabled_extension_names(device_extensions);
 
         // Optionally, add additional features to the device creation info.
         if let Some(feature_chain) = feature_chain {
@@ -904,7 +873,7 @@ pub fn is_stencil_format(format: ash::vk::Format) -> bool {
 /// Helper for creating a new image allocated by a `gpu_allocator::vulkan::Allocator`.
 pub fn create_image(
     device: &ash::Device,
-    memory_allocator: &mut gpu_allocator::vulkan::Allocator,
+    memory_allocator: &Mutex<gpu_allocator::vulkan::Allocator>,
     image_create_info: &ash::vk::ImageCreateInfo,
     image_name: &str,
 ) -> (ash::vk::Image, gpu_allocator::vulkan::Allocation) {
@@ -913,6 +882,8 @@ pub fn create_image(
 
     let requirements = unsafe { device.get_image_memory_requirements(image) };
     let allocation = memory_allocator
+        .lock()
+        .expect("Failed to lock allocator in `create_image`")
         .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
             name: image_name,
             requirements,
@@ -945,20 +916,18 @@ pub fn create_image_view(
 
     // Create the image view with the specified parameters.
     // NOTE: More parameters will be needed when supporting XR and 3D images.
-    let view_info = ash::vk::ImageViewCreateInfo {
-        image,
-        view_type: ash::vk::ImageViewType::TYPE_2D, // 2D image. Use 2D array for multi-view/XR.
-        format,
-        components: ash::vk::ComponentMapping::default(),
-        subresource_range: ash::vk::ImageSubresourceRange {
+    let view_info = ash::vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(ash::vk::ImageViewType::TYPE_2D) // 2D image. Use 2D array for multi-view/XR.
+        .format(format)
+        .components(ash::vk::ComponentMapping::default())
+        .subresource_range(ash::vk::ImageSubresourceRange {
             aspect_mask,
             base_mip_level: 0,
             level_count: mip_levels,
             base_array_layer: 0,
             layer_count: ash::vk::REMAINING_ARRAY_LAYERS, // In case of 3D images, `VK_REMAINING_ARRAY_LAYERS` will consider all remaining layers.
-        },
-        ..Default::default()
-    };
+        });
     unsafe {
         device
             .create_image_view(&view_info, None)
@@ -1070,7 +1039,7 @@ pub fn get_queue_family_index(
     queue_families: &QueueFamilies,
 ) -> u32 {
     queue_families
-        .queue_families
+        .all_properties
         .iter()
         .enumerate()
         .filter_map(|(i, f)| {
